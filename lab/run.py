@@ -1895,6 +1895,317 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
+    if experiment in {"e13", "e14"}:
+        # Kernel learning: linear model on raw patch pixels to predict y=(gx_high,gy_high) under LOFO.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from sklearn.linear_model import SGDRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 128))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 20_000))
+        if n_fields <= 1:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        sgd_alpha = float(cfg.get("sgd_alpha", 1e-4))
+        sgd_max_iter = int(cfg.get("sgd_max_iter", 10))
+
+        k0_list = [float(cfg.get("k0_frac", 0.15))]
+        w_list = [int(patch_size)]
+        if experiment == "e14":
+            k0_list = [float(x) for x in cfg.get("k0_list", [0.10, 0.15, 0.25])]
+            w_list = [int(x) for x in cfg.get("w_list", [9, 17, 33])]
+
+        pixel_field = str(cfg.get("pixel_field", "rho_high")).lower()  # rho|rho_high
+        baseline_field = str(cfg.get("baseline_field", pixel_field)).lower()
+        placebo_mode = str(cfg.get("placebo_mode", "permute_y_train")).lower()
+
+        def vec_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+            from .models import rmse, safe_pearson
+
+            out = {}
+            for i, name in enumerate(["gx", "gy"]):
+                yt = y_true[:, i]
+                yp = y_pred[:, i]
+                out[f"pearson_{name}"] = float(safe_pearson(yt, yp))
+                rm = float(rmse(yt, yp))
+                std = float(np.std(yt))
+                out[f"relRMSE_{name}"] = float(rm / std) if std > 0 else float("nan")
+            out["pearson_mean"] = float(np.mean([out["pearson_gx"], out["pearson_gy"]]))
+            out["relRMSE_mean"] = float(np.mean([out["relRMSE_gx"], out["relRMSE_gy"]]))
+            return out
+
+        def fit_pixel_model(Xtr: np.ndarray, ytr: np.ndarray) -> Any:
+            base = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(sgd_alpha),
+                max_iter=int(sgd_max_iter),
+                tol=1e-3,
+                random_state=int(placebo_seed),
+            )
+            model = MultiOutputRegressor(base)
+            model.fit(Xtr, ytr)
+            return model
+
+        sweep_rows: list[dict[str, Any]] = []
+        kernel_artifacts: dict[str, Any] = {}
+
+        for k0_frac in k0_list:
+            for w in w_list:
+                ps = _require_odd("window_size", w)
+                r = ps // 2
+
+                # generate per-field datasets (kept in memory per config point)
+                Xpix_by_field: list[np.ndarray] = []
+                Xb_by_field: list[np.ndarray] = []
+                y_by_field: list[np.ndarray] = []
+                split_checks: list[dict[str, float]] = []
+
+                for field_id in range(n_fields):
+                    rng_field = np.random.default_rng(seed + field_id)
+                    rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+                    split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+                    split_checks.append({"field_id": float(field_id), "rel_err_gx": split.rel_err_gx, "rel_err_gy": split.rel_err_gy})
+
+                    def select(name: str) -> np.ndarray:
+                        if name == "rho":
+                            return rho01
+                        if name == "rho_high":
+                            return split.rho_high
+                        raise ValueError("field must be rho or rho_high")
+
+                    field_pix = select(pixel_field)
+                    field_b = select(baseline_field)
+
+                    # z-score per field (requested)
+                    field_pix = _zscore_field(field_pix)
+                    field_b = _zscore_field(field_b)
+
+                    gx = split.high.gx
+                    gy = split.high.gy
+                    yfield = np.stack([gx, gy], axis=2)
+
+                    if any(s < ps for s in field_pix.shape):
+                        raise ValueError("grid too small for window")
+
+                    # sample centers
+                    cx = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+                    cy = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+
+                    # pixel patches (fast sliding window view)
+                    win = sliding_window_view(field_pix, (ps, ps))  # (nx-ps+1, ny-ps+1, ps, ps)
+                    patches = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
+
+                    # baseline B features on field_b
+                    pref1 = _prefix_sum_2d(field_b)
+                    pref2 = _prefix_sum_2d(field_b * field_b)
+                    x0 = (cx - r).astype(np.int64)
+                    x1 = (cx + r + 1).astype(np.int64)
+                    y0 = (cy - r).astype(np.int64)
+                    y1 = (cy + r + 1).astype(np.int64)
+                    mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+                    nvox = float(ps * ps)
+                    mean = mass / nvox
+                    sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+                    var = np.maximum(0.0, sumsq / nvox - mean * mean)
+                    mass2 = mass * mass
+                    from scipy import ndimage
+
+                    max_grid = ndimage.maximum_filter(field_b, size=ps, mode="constant", cval=-np.inf)
+                    mx = max_grid[cx, cy]
+                    gx_f, gy_f = np.gradient(field_b)
+                    egrid = gx_f * gx_f + gy_f * gy_f
+                    eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+                    ge = eavg[cx, cy]
+                    Xb = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+
+                    yv = yfield[cx, cy].reshape(patches_per_field, 2).astype(np.float64, copy=False)
+
+                    Xpix_by_field.append(patches)
+                    Xb_by_field.append(Xb)
+                    y_by_field.append(yv)
+
+                # LOFO evaluation
+                fold_rows: list[dict[str, Any]] = []
+                kernels_gx: list[np.ndarray] = []
+                kernels_gy: list[np.ndarray] = []
+                for test_field in range(n_fields):
+                    train_fields = [i for i in range(n_fields) if i != test_field]
+                    Xpix_tr = np.concatenate([Xpix_by_field[i] for i in train_fields], axis=0)
+                    Xb_tr = np.concatenate([Xb_by_field[i] for i in train_fields], axis=0)
+                    y_tr = np.concatenate([y_by_field[i] for i in train_fields], axis=0)
+
+                    Xpix_te = Xpix_by_field[test_field]
+                    Xb_te = Xb_by_field[test_field]
+                    y_te = y_by_field[test_field]
+
+                    # baseline B (ridge closed-form)
+                    _, yB_te_pred, _, _, _, _ = _ridge_fit_predict_multi(Xb_tr, y_tr, Xb_te, ridge_alpha)
+                    mB = vec_metrics(y_te, yB_te_pred)
+
+                    # pixel model P
+                    modelP = fit_pixel_model(Xpix_tr, y_tr)
+                    yP_te_pred = modelP.predict(Xpix_te)
+                    mP = vec_metrics(y_te, yP_te_pred)
+
+                    dp = float(mP["pearson_mean"] - mB["pearson_mean"])
+                    dr = float(mP["relRMSE_mean"] - mB["relRMSE_mean"])
+
+                    # placebo
+                    if placebo_mode == "permute_y_train":
+                        perm = rng_placebo.permutation(y_tr.shape[0])
+                        y_tr_p = y_tr[perm]
+                        modelPl = fit_pixel_model(Xpix_tr, y_tr_p)
+                        yPl_pred = modelPl.predict(Xpix_te)
+                    elif placebo_mode == "permute_pixels":
+                        perm = rng_placebo.permutation(Xpix_tr.shape[1])
+                        modelPl = fit_pixel_model(Xpix_tr[:, perm], y_tr)
+                        yPl_pred = modelPl.predict(Xpix_te[:, perm])
+                    else:
+                        raise ValueError("placebo_mode must be permute_y_train or permute_pixels")
+                    mPl = vec_metrics(y_te, yPl_pred)
+                    dp_pl = float(mPl["pearson_mean"] - mB["pearson_mean"])
+                    dr_pl = float(mPl["relRMSE_mean"] - mB["relRMSE_mean"])
+
+                    fold_rows.append(
+                        {
+                            "field_id": int(test_field),
+                            "pearson_B_mean": float(mB["pearson_mean"]),
+                            "relRMSE_B_mean": float(mB["relRMSE_mean"]),
+                            "pearson_P_mean": float(mP["pearson_mean"]),
+                            "relRMSE_P_mean": float(mP["relRMSE_mean"]),
+                            "delta_pearson_P_minus_B": dp,
+                            "delta_relRMSE_P_minus_B": dr,
+                            "delta_pearson_placebo_minus_B": dp_pl,
+                            "delta_relRMSE_placebo_minus_B": dr_pl,
+                        }
+                    )
+
+                    # kernel weights for w=17 fixed experiment (E13 only)
+                    if experiment == "e13":
+                        coef_gx = np.asarray(modelP.estimators_[0].coef_, dtype=np.float64)
+                        coef_gy = np.asarray(modelP.estimators_[1].coef_, dtype=np.float64)
+                        kernels_gx.append(coef_gx.reshape(ps, ps))
+                        kernels_gy.append(coef_gy.reshape(ps, ps))
+
+                # aggregate per config point
+                dp_vals = np.asarray([r["delta_pearson_P_minus_B"] for r in fold_rows], dtype=np.float64)
+                dr_vals = np.asarray([r["delta_relRMSE_P_minus_B"] for r in fold_rows], dtype=np.float64)
+                dp_pl_vals = np.asarray([r["delta_pearson_placebo_minus_B"] for r in fold_rows], dtype=np.float64)
+                dr_pl_vals = np.asarray([r["delta_relRMSE_placebo_minus_B"] for r in fold_rows], dtype=np.float64)
+                sweep_rows.append(
+                    {
+                        "w": int(ps),
+                        "k0_frac": float(k0_frac),
+                        "pixel_field": pixel_field,
+                        "baseline_field": baseline_field,
+                        "delta_pearson_mean": float(dp_vals.mean()),
+                        "delta_pearson_std": float(dp_vals.std(ddof=1)),
+                        "delta_relRMSE_mean": float(dr_vals.mean()),
+                        "delta_relRMSE_std": float(dr_vals.std(ddof=1)),
+                        "pearson_P_mean": float(np.mean([r["pearson_P_mean"] for r in fold_rows])),
+                        "relRMSE_P_mean": float(np.mean([r["relRMSE_P_mean"] for r in fold_rows])),
+                        "pearson_B_mean": float(np.mean([r["pearson_B_mean"] for r in fold_rows])),
+                        "relRMSE_B_mean": float(np.mean([r["relRMSE_B_mean"] for r in fold_rows])),
+                        "delta_pearson_placebo_mean": float(dp_pl_vals.mean()),
+                        "delta_relRMSE_placebo_mean": float(dr_pl_vals.mean()),
+                        "n_pos_delta_pearson": int(np.sum(dp_vals > 0)),
+                    }
+                )
+
+                # write per-fold CSV per config point
+                tag = f"w{ps}_k0{int(round(k0_frac*100)):02d}"
+                header = list(fold_rows[0].keys()) if fold_rows else []
+                write_csv(paths.run_dir / f"lofo_by_field_{tag}.csv", header, [[r[h] for h in header] for r in fold_rows])
+
+                if experiment == "e13":
+                    kgx = np.mean(np.stack(kernels_gx, axis=0), axis=0)
+                    kgy = np.mean(np.stack(kernels_gy, axis=0), axis=0)
+                    # symmetry checks
+                    def corr(a: np.ndarray, b: np.ndarray) -> float:
+                        a = a.reshape(-1)
+                        b = b.reshape(-1)
+                        a = a - a.mean()
+                        b = b - b.mean()
+                        denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+                        return float((a @ b) / denom)
+
+                    gx_antisym_x = corr(kgx, -kgx[::-1, :])
+                    gy_antisym_y = corr(kgy, -kgy[:, ::-1])
+
+                    for arr, name in [(kgx, "kernel_gx.png"), (kgy, "kernel_gy.png")]:
+                        vmax = float(np.max(np.abs(arr))) + 1e-12
+                        plt.figure(figsize=(4, 4))
+                        plt.imshow(arr, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                        plt.colorbar()
+                        plt.title(name.replace(".png", ""))
+                        plt.tight_layout()
+                        plt.savefig(paths.run_dir / name, dpi=150)
+                        plt.close()
+
+                    kernel_artifacts = {
+                        "gx_antisym_x_corr": gx_antisym_x,
+                        "gy_antisym_y_corr": gy_antisym_y,
+                    }
+
+        # write sweep results
+        header = list(sweep_rows[0].keys()) if sweep_rows else []
+        write_csv(paths.run_dir / "sweep_results.csv", header, [[r[h] for h in header] for r in sweep_rows])
+
+        metrics = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "split_seed": split_seed,
+            "placebo_seed": placebo_seed,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "patches_per_field": patches_per_field,
+            "n_fields": n_fields,
+            "ridge_alpha": ridge_alpha,
+            "sgd_alpha": sgd_alpha,
+            "sgd_max_iter": sgd_max_iter,
+            "placebo_mode": placebo_mode,
+            "sweep_rows": sweep_rows,
+            "kernel_artifacts": kernel_artifacts,
+        }
+
+        # simple heatmap for E14
+        if experiment == "e14" and sweep_rows:
+            ws = sorted({int(r["w"]) for r in sweep_rows})
+            ks = sorted({float(r["k0_frac"]) for r in sweep_rows})
+            pear = np.full((len(ws), len(ks)), np.nan)
+            rel = np.full((len(ws), len(ks)), np.nan)
+            for r in sweep_rows:
+                i = ws.index(int(r["w"]))
+                j = ks.index(float(r["k0_frac"]))
+                pear[i, j] = float(r["pearson_P_mean"])
+                rel[i, j] = float(r["relRMSE_P_mean"])
+
+            def plot_grid(mat: np.ndarray, title: str, fname: str) -> None:
+                plt.figure(figsize=(6, 3))
+                plt.imshow(mat, aspect="auto", cmap="viridis")
+                plt.xticks(range(len(ks)), [f\"{k:.2f}\" for k in ks])
+                plt.yticks(range(len(ws)), [str(w) for w in ws])
+                plt.xlabel("k0_frac")
+                plt.ylabel("w")
+                plt.title(title)
+                plt.colorbar()
+                plt.tight_layout()
+                plt.savefig(paths.run_dir / fname, dpi=150)
+                plt.close()
+
+            plot_grid(pear, "mean Pearson agg (P)", "heatmap_pearson.png")
+            plot_grid(rel, "mean relRMSE agg (P)", "heatmap_relRMSE.png")
+
+        write_json(paths.metrics_json, metrics)
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -1976,7 +2287,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
-    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11/e12)")
+    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11/e12/e13/e14)")
 
 
 def main() -> None:

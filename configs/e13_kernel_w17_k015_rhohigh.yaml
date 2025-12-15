@@ -1,0 +1,21 @@
+experiment: e13
+exp_name: e13_kernel_w17_k015_rhohigh
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+k0_frac: 0.15
+
+n_fields: 10
+patches_per_field: 20000
+window_size: 17
+
+pixel_field: rho_high
+baseline_field: rho_high
+
+ridge_alpha: 1.0
+sgd_alpha: 1.0e-4
+sgd_max_iter: 10
+
+placebo_mode: permute_y_train
+

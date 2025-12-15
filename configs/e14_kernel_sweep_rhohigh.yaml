@@ -1,0 +1,22 @@
+experiment: e14
+exp_name: e14_kernel_sweep_rhohigh
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+
+n_fields: 10
+patches_per_field: 20000
+
+pixel_field: rho_high
+baseline_field: rho_high
+
+w_list: [9, 17, 33]
+k0_list: [0.10, 0.15, 0.25]
+
+ridge_alpha: 1.0
+sgd_alpha: 1.0e-4
+sgd_max_iter: 10
+
+placebo_mode: permute_y_train
+
