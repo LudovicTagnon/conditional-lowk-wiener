@@ -1,0 +1,18 @@
+experiment: e17
+exp_name: e17_moments_lofo_full_w33
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+patches_per_field: 20000
+window_size: 33
+
+feature_field: rho
+target_field: full
+
+include_pixels: true
+pixel_solver: ridge
+ridge_alpha: 1.0
+ridge_max_iter: 2000

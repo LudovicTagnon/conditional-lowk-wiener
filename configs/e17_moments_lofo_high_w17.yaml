@@ -1,0 +1,20 @@
+experiment: e17
+exp_name: e17_moments_lofo_high_w17
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+patches_per_field: 20000
+window_size: 17
+
+feature_field: rho_high
+target_field: high
+
+include_pixels: true
+pixel_solver: sgd
+sgd_alpha: 1.0e-4
+sgd_max_iter: 10
+
+ridge_alpha: 1.0

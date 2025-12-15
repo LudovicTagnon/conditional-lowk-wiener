@@ -1,0 +1,16 @@
+experiment: e15b
+exp_name: e15b_kernel_diag
+
+# Existing E15 run folders (w=17 and w=33)
+kernel_run_dirs:
+  - outputs/runs/20251215_203249_e15_kernel_theory_compare_w17
+  - outputs/runs/20251215_203200_e15_kernel_theory_compare_w33
+
+# Ridge sweep (train on all 10 fields, w=33)
+grid_size: 128
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+patches_per_field: 20000
+sweep_w: 33
+ridge_alphas: [1.0e-6, 1.0e-4, 1.0e-2, 1.0, 1.0e2]
