@@ -2382,9 +2382,9 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
     if experiment == "e16":
         # LOFO pixels-only on full gx/gy (no bandpass target) to probe non-locality.
         from numpy.lib.stride_tricks import sliding_window_view
-        from sklearn.linear_model import SGDRegressor
-        from sklearn.multioutput import MultiOutputRegressor
         import matplotlib.pyplot as plt
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
 
         grid_size = int(cfg.get("grid_size", 128))
         alpha = float(cfg.get("alpha", 2.0))
@@ -2398,8 +2398,8 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         w_list = [int(x) for x in cfg.get("w_list", [17, 33])]
         k0_frac = float(cfg.get("k0_frac", 0.15))  # used only to compute split/full consistently
         pixel_field = str(cfg.get("pixel_field", "rho")).lower()
-        sgd_alpha = float(cfg.get("sgd_alpha", 1e-4))
-        sgd_max_iter = int(cfg.get("sgd_max_iter", 10))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        ridge_max_iter = int(cfg.get("ridge_max_iter", 500))
 
         from .models import rmse, safe_pearson
 
@@ -2443,17 +2443,13 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 ytr = np.concatenate([y_by_field[i] for i in train_fields], axis=0)
                 Xte = X_by_field[test_field]
                 yte = y_by_field[test_field]
-                base = SGDRegressor(
-                    loss="squared_error",
-                    penalty="l2",
-                    alpha=float(sgd_alpha),
-                    max_iter=int(sgd_max_iter),
-                    tol=1e-3,
-                    random_state=int(placebo_seed),
-                )
-                model = MultiOutputRegressor(base)
-                model.fit(Xtr, ytr)
-                ypred = model.predict(Xte)
+
+                scaler = StandardScaler(with_mean=True, with_std=True)
+                Xtr_s = scaler.fit_transform(Xtr)
+                Xte_s = scaler.transform(Xte)
+                model = Ridge(alpha=float(ridge_alpha), solver="sag", max_iter=int(ridge_max_iter), random_state=int(placebo_seed))
+                model.fit(Xtr_s, ytr)
+                ypred = model.predict(Xte_s)
                 p, rrm = vec_metrics(yte, ypred)
                 fold_pears.append(p)
                 fold_rels.append(rrm)
@@ -2504,8 +2500,8 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             "patches_per_field": patches_per_field,
             "k0_frac": k0_frac,
             "pixel_field": pixel_field,
-            "sgd_alpha": sgd_alpha,
-            "sgd_max_iter": sgd_max_iter,
+            "ridge_alpha": ridge_alpha,
+            "ridge_max_iter": ridge_max_iter,
             "rows": rows,
         }
         write_json(paths.metrics_json, metrics)
