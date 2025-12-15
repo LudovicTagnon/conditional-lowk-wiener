@@ -3344,6 +3344,270 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e18":
+        # Identify the discrete kernel via cross-spectra (Wiener filter) and compare to impulse/theory kernels.
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 256))
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        alpha = float(cfg.get("alpha", 2.0))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        n_fields = int(cfg.get("n_fields", 10))
+        if n_fields <= 0:
+            raise ValueError("n_fields must be > 0")
+
+        ws = [int(x) for x in cfg.get("ws", [17, 33])]
+        mode = str(cfg.get("mode", "rho_high")).lower()
+        if mode != "rho_high":
+            raise ValueError("E18 currently supports mode=rho_high only (to match E15c rho_high)")
+
+        impulse_run_dir = Path(str(cfg.get("impulse_run_dir", "")))
+        if not impulse_run_dir.exists():
+            raise FileNotFoundError(f"impulse_run_dir not found: {impulse_run_dir}")
+        theory_run_dirs = [Path(p) for p in cfg.get("theory_run_dirs", [])]
+        if not theory_run_dirs:
+            raise ValueError("theory_run_dirs must list e15 run folders containing kernel_theoretical_*.npy")
+
+        # Load impulse kernels (already extracted in regression convention) from E15c.
+        impulse_by_w: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for w in ws:
+            gx_path = impulse_run_dir / f"kernel_impulse_rho_high_w{w}_gx.npy"
+            gy_path = impulse_run_dir / f"kernel_impulse_rho_high_w{w}_gy.npy"
+            if not gx_path.exists() or not gy_path.exists():
+                raise FileNotFoundError(f"Impulse kernel missing for w={w} in {impulse_run_dir}")
+            impulse_by_w[w] = (np.load(gx_path).astype(np.float64), np.load(gy_path).astype(np.float64))
+
+        # Load theory kernels (regression convention) from E15 run dirs (keyed by w).
+        theory_by_w: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for rd in theory_run_dirs:
+            kth_gx = np.load(rd / "kernel_theoretical_gx.npy").astype(np.float64)
+            kth_gy = np.load(rd / "kernel_theoretical_gy.npy").astype(np.float64)
+            w = int(kth_gx.shape[0])
+            theory_by_w[w] = (kth_gx, kth_gy)
+
+        def corr(a: np.ndarray, b: np.ndarray) -> float:
+            a = a.reshape(-1).astype(np.float64)
+            b = b.reshape(-1).astype(np.float64)
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+            return float((a @ b) / denom)
+
+        def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+            return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+
+        def scale_best(klearn: np.ndarray, kth: np.ndarray) -> tuple[float, np.ndarray]:
+            num = float(np.sum(klearn * kth))
+            den = float(np.sum(klearn * klearn)) + 1e-12
+            a = num / den
+            return a, a * klearn
+
+        def extract_periodic_kernel(field: np.ndarray, w: int) -> np.ndarray:
+            ps = _require_odd("w", w)
+            r = ps // 2
+            idx = (np.arange(-r, r + 1, dtype=np.int64) % field.shape[0]).astype(np.int64)
+            patch = field[np.ix_(idx, idx)]
+            return patch[::-1, ::-1].astype(np.float64, copy=False)
+
+        def save_kernel_png(arr: np.ndarray, name: str) -> None:
+            vmax = float(np.max(np.abs(arr))) + 1e-12
+            plt.figure(figsize=(4, 4))
+            plt.imshow(arr, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.colorbar()
+            plt.title(name.replace(".png", ""))
+            plt.tight_layout()
+            plt.savefig(paths.run_dir / name, dpi=150)
+            plt.close()
+
+        def save_triplet(a: np.ndarray, b: np.ndarray, name: str, title_a: str, title_b: str) -> None:
+            vmax = float(np.max(np.abs(a))) + 1e-12
+            plt.figure(figsize=(9, 3))
+            plt.subplot(1, 3, 1)
+            plt.imshow(a, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title(title_a)
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 2)
+            plt.imshow(b, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title(title_b)
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 3)
+            plt.imshow(b - a, cmap="coolwarm")
+            plt.title("diff")
+            plt.colorbar(fraction=0.046)
+            plt.tight_layout()
+            plt.savefig(paths.run_dir / name, dpi=150)
+            plt.close()
+
+        # Wiener identification in Fourier space: H = E[G*conj(R)] / (E[|R|^2] + eps).
+        num_x = np.zeros((grid_size, grid_size), dtype=np.complex128)
+        num_y = np.zeros((grid_size, grid_size), dtype=np.complex128)
+        den = np.zeros((grid_size, grid_size), dtype=np.float64)
+        den_means: list[float] = []
+
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+
+            rho_high = split.rho_high
+            gx_high = split.high.gx
+            gy_high = split.high.gy
+            assert_finite("rho_high", rho_high)
+            assert_finite("gx_high", gx_high)
+            assert_finite("gy_high", gy_high)
+
+            R = np.fft.fftn(rho_high)
+            Gx = np.fft.fftn(gx_high)
+            Gy = np.fft.fftn(gy_high)
+
+            p = np.abs(R) ** 2
+            den_means.append(float(np.mean(p)))
+            den += p
+            num_x += Gx * np.conj(R)
+            num_y += Gy * np.conj(R)
+
+        num_x /= float(n_fields)
+        num_y /= float(n_fields)
+        den /= float(n_fields)
+
+        med = float(np.median(np.asarray(den_means, dtype=np.float64))) if den_means else 0.0
+        eps = float(cfg.get("eps", 1e-12 * med if med > 0 else 1e-12))
+        Hx = num_x / (den + eps)
+        Hy = num_y / (den + eps)
+
+        Kx_full = np.fft.ifftn(Hx).real
+        Ky_full = np.fft.ifftn(Hy).real
+        assert_finite("Kx_full", Kx_full)
+        assert_finite("Ky_full", Ky_full)
+
+        results: list[dict[str, Any]] = []
+        md_rows: list[dict[str, str]] = []
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        # Store full-grid kernels too (for inspection).
+        np.save(paths.run_dir / "kernel_wiener_gx_full.npy", Kx_full.astype(np.float64, copy=False))
+        np.save(paths.run_dir / "kernel_wiener_gy_full.npy", Ky_full.astype(np.float64, copy=False))
+
+        for w in ws:
+            Kx = extract_periodic_kernel(Kx_full, w)
+            Ky = extract_periodic_kernel(Ky_full, w)
+            np.save(paths.run_dir / f"kernel_wiener_rho_high_w{w}_gx.npy", Kx)
+            np.save(paths.run_dir / f"kernel_wiener_rho_high_w{w}_gy.npy", Ky)
+            save_kernel_png(Kx, f"kernel_wiener_rho_high_w{w}_gx.png")
+            save_kernel_png(Ky, f"kernel_wiener_rho_high_w{w}_gy.png")
+
+            # Also write generic filenames for w=max(ws) for convenience.
+            if w == max(ws):
+                save_kernel_png(Kx, "kernel_wiener_gx.png")
+                save_kernel_png(Ky, "kernel_wiener_gy.png")
+
+            imp_gx, imp_gy = impulse_by_w[w]
+            th_gx, th_gy = theory_by_w[w]
+
+            # Save copies (requested: arrays for wiener/impulse/theory in the run dir).
+            np.save(paths.run_dir / f"kernel_impulse_rho_high_w{w}_gx.npy", imp_gx)
+            np.save(paths.run_dir / f"kernel_impulse_rho_high_w{w}_gy.npy", imp_gy)
+            np.save(paths.run_dir / f"kernel_theory_rho_high_w{w}_gx.npy", th_gx)
+            np.save(paths.run_dir / f"kernel_theory_rho_high_w{w}_gy.npy", th_gy)
+
+            # Compare Wiener vs impulse
+            ax_imp, Kx_s_imp = scale_best(Kx, imp_gx)
+            ay_imp, Ky_s_imp = scale_best(Ky, imp_gy)
+            corr_imp_mean = 0.5 * (corr(Kx, imp_gx) + corr(Ky, imp_gy))
+            rel_imp_scaled_mean = 0.5 * (rel_l2(Kx_s_imp, imp_gx) + rel_l2(Ky_s_imp, imp_gy))
+
+            save_triplet(imp_gx, Kx, f"kernel_compare_wiener_vs_impulse_rho_high_w{w}_gx.png", "impulse", "wiener")
+            save_triplet(imp_gy, Ky, f"kernel_compare_wiener_vs_impulse_rho_high_w{w}_gy.png", "impulse", "wiener")
+
+            # Compare Wiener vs theory
+            ax_th, Kx_s_th = scale_best(Kx, th_gx)
+            ay_th, Ky_s_th = scale_best(Ky, th_gy)
+            corr_th_mean = 0.5 * (corr(Kx, th_gx) + corr(Ky, th_gy))
+            rel_th_scaled_mean = 0.5 * (rel_l2(Kx_s_th, th_gx) + rel_l2(Ky_s_th, th_gy))
+
+            save_triplet(th_gx, Kx, f"kernel_compare_wiener_vs_theory_rho_high_w{w}_gx.png", "theory", "wiener")
+            save_triplet(th_gy, Ky, f"kernel_compare_wiener_vs_theory_rho_high_w{w}_gy.png", "theory", "wiener")
+
+            results.append(
+                {
+                    "w": int(w),
+                    "corr_mean_wiener_impulse": float(corr_imp_mean),
+                    "relL2_scaled_mean_wiener_impulse": float(rel_imp_scaled_mean),
+                    "corr_mean_wiener_theory": float(corr_th_mean),
+                    "relL2_scaled_mean_wiener_theory": float(rel_th_scaled_mean),
+                    "scale_a_imp_gx": float(ax_imp),
+                    "scale_a_imp_gy": float(ay_imp),
+                    "scale_a_th_gx": float(ax_th),
+                    "scale_a_th_gy": float(ay_th),
+                }
+            )
+            md_rows.append(
+                {
+                    "w": str(int(w)),
+                    "corr_mean(wiener,imp)": fmt(float(corr_imp_mean)),
+                    "relL2_scaled_mean(wiener,imp)": fmt(float(rel_imp_scaled_mean)),
+                    "corr_mean(wiener,theory)": fmt(float(corr_th_mean)),
+                    "relL2_scaled_mean(wiener,theory)": fmt(float(rel_th_scaled_mean)),
+                }
+            )
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r in rows:
+                out.append("| " + " | ".join(r.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        summary_md = (
+            "# Wiener-identified kernel (E18)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size: `{grid_size}`  alpha: `{alpha}`  k0_frac: `{k0_frac}`  n_fields: `{n_fields}`\n"
+            f"- impulse_run_dir: `{impulse_run_dir}`\n"
+            f"- theory_run_dirs: {', '.join(f'`{p}`' for p in theory_run_dirs)}\n\n"
+            "## Table\n"
+            + md_table(
+                md_rows,
+                [
+                    "w",
+                    "corr_mean(wiener,imp)",
+                    "relL2_scaled_mean(wiener,imp)",
+                    "corr_mean(wiener,theory)",
+                    "relL2_scaled_mean(wiener,theory)",
+                ],
+            )
+            + "\n"
+        )
+        (paths.run_dir / "summary_e18_wiener_kernel.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "mode": mode,
+                "ws": ws,
+                "eps": eps,
+                "impulse_run_dir": str(impulse_run_dir),
+                "theory_run_dirs": [str(p) for p in theory_run_dirs],
+                "results": results,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))

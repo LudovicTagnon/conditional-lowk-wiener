@@ -1,0 +1,18 @@
+experiment: e18
+exp_name: e18_wiener_kernel
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+mode: rho_high
+ws: [17, 33]
+
+# Must point at an E15c run folder containing:
+# kernel_impulse_rho_high_w17_gx.npy / ..._gy.npy and w33 equivalents.
+impulse_run_dir: ""
+
+# Must point at E15 run folders containing kernel_theoretical_{gx,gy}.npy
+theory_run_dirs: []
+
