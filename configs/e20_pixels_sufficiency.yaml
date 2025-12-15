@@ -1,0 +1,23 @@
+experiment: e20
+exp_name: e20_pixels_sufficiency_n256
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+patches_per_field: 20000
+ws: [17, 33]
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 3
+pixel_batch_size: 4096
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# Residual models + topo
+ridge_alpha: 1.0
+quantiles_b0: [0.6, 0.7, 0.8, 0.9]
+n_perms: 200
+
