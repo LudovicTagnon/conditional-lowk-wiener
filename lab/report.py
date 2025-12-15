@@ -180,7 +180,11 @@ def main() -> None:
         run_dirs = _iter_latest_runs(Path(args.runs), int(args.latest))
 
     for rd in run_dirs:
-        summary = _summarize_run(rd)
+        try:
+            summary = _summarize_run(rd)
+        except Exception as e:
+            print(f"\n## {rd.name}\n- error: {e}")
+            continue
         _print_model_table(summary)
         if summary.metrics_by_mass_bin is not None:
             print(f"- {_mass_bin_summary(summary.metrics_by_mass_bin)}")
