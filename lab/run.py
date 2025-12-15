@@ -6,7 +6,12 @@ from typing import Any
 
 import numpy as np
 
-from .data_synth import generate_1overf_field_3d, solve_poisson_periodic_fft
+from .data_synth import (
+    band_split_poisson_2d,
+    generate_1overf_field_2d,
+    generate_1overf_field_3d,
+    solve_poisson_periodic_fft,
+)
 from .features import b0_counts, grad_energy, patch_basic_stats
 from .models import deltas_vs_baseline, fit_eval_ridge, fit_predict_ridge, residual_test
 from .utils import (
@@ -151,6 +156,177 @@ def _prefix_sum_3d(x: np.ndarray) -> np.ndarray:
     out = np.zeros((x.shape[0] + 1, x.shape[1] + 1, x.shape[2] + 1), dtype=np.float64)
     out[1:, 1:, 1:] = ps
     return out
+
+
+def _prefix_sum_2d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    ps = x.cumsum(axis=0).cumsum(axis=1)
+    out = np.zeros((x.shape[0] + 1, x.shape[1] + 1), dtype=np.float64)
+    out[1:, 1:] = ps
+    return out
+
+
+def _box_sum_2d(pref: np.ndarray, x0: np.ndarray, x1: np.ndarray, y0: np.ndarray, y1: np.ndarray) -> np.ndarray:
+    return pref[x1, y1] - pref[x0, y1] - pref[x1, y0] + pref[x0, y0]
+
+
+def _sample_features_2d_fast_topo(
+    field: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    n_patches: int,
+    patch_size: int,
+    topo_mode: str,
+    topo_thresholds: list[float] | None,
+    thresholds_pos_sigma: list[float] | None,
+    thresholds_neg_sigma: list[float] | None,
+    rng: np.random.Generator,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """
+    Sample patches from a 2D field (float), compute B features on that field,
+    and topo features according to:
+      - topo_mode='quantile_per_field': topo_thresholds must be provided (counts patch > t)
+      - topo_mode='sigma': thresholds_pos_sigma / thresholds_neg_sigma are used on z-scored field
+    Returns feats dict, y (n,2) (gx,gy), and centers (n,2) int.
+    """
+    from scipy import ndimage
+
+    field = np.asarray(field, dtype=np.float64)
+    gx = np.asarray(gx, dtype=np.float64)
+    gy = np.asarray(gy, dtype=np.float64)
+    assert field.shape == gx.shape == gy.shape
+    assert field.ndim == 2
+    assert_finite("field", field)
+    assert_finite("gx", gx)
+    assert_finite("gy", gy)
+
+    ps = _require_odd("patch_size", patch_size)
+    r = ps // 2
+    nx, ny = field.shape
+    if any(s < ps for s in (nx, ny)):
+        raise ValueError(f"grid too small for patch_size={ps}: {field.shape}")
+
+    cx = rng.integers(r, nx - r, size=n_patches, dtype=np.int64)
+    cy = rng.integers(r, ny - r, size=n_patches, dtype=np.int64)
+
+    pref1 = _prefix_sum_2d(field)
+    pref2 = _prefix_sum_2d(field * field)
+    x0 = (cx - r).astype(np.int64)
+    x1 = (cx + r + 1).astype(np.int64)
+    y0 = (cy - r).astype(np.int64)
+    y1 = (cy + r + 1).astype(np.int64)
+
+    mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+    nvox = float(ps * ps)
+    mean = mass / nvox
+    sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+    var = np.maximum(0.0, sumsq / nvox - mean * mean)
+    mass2 = mass * mass
+
+    max_grid = ndimage.maximum_filter(field, size=ps, mode="constant", cval=-np.inf)
+    mx = max_grid[cx, cy]
+
+    gx_f, gy_f = np.gradient(field)
+    egrid = gx_f * gx_f + gy_f * gy_f
+    eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+    ge = eavg[cx, cy]
+
+    feats: dict[str, np.ndarray] = {
+        "mass": mass.astype(np.float64, copy=False),
+        "mass2": mass2.astype(np.float64, copy=False),
+        "var": var.astype(np.float64, copy=False),
+        "max": mx.astype(np.float64, copy=False),
+        "grad_energy": ge.astype(np.float64, copy=False),
+    }
+
+    structure = ndimage.generate_binary_structure(2, 1)  # 4-neigh
+    topo_mode = str(topo_mode).lower()
+    if topo_mode == "quantile_per_field":
+        if topo_thresholds is None:
+            raise ValueError("topo_thresholds required for quantile_per_field")
+        thresholds = [float(t) for t in topo_thresholds]
+        names = [f"q{int(round(q * 100)):02d}" for q in [0.6, 0.7, 0.8, 0.9]][: len(thresholds)]
+        b0 = np.empty((n_patches, len(thresholds)), dtype=np.float64)
+        for i in range(n_patches):
+            patch = field[cx[i] - r : cx[i] + r + 1, cy[i] - r : cy[i] + r + 1]
+            for j, t in enumerate(thresholds):
+                binary = patch > t
+                if not binary.any():
+                    b0[i, j] = 0.0
+                else:
+                    _, num = ndimage.label(binary, structure=structure)
+                    b0[i, j] = float(num)
+        for j, nm in enumerate(names):
+            feats[f"b0_{nm}"] = b0[:, j]
+    elif topo_mode == "sigma":
+        if thresholds_pos_sigma is None or thresholds_neg_sigma is None:
+            raise ValueError("thresholds_pos_sigma and thresholds_neg_sigma required for sigma")
+        # z-score the whole field for topo thresholding
+        mu = float(field.mean())
+        sd = float(field.std())
+        field_z = (field - mu) / sd if sd > 0 else (field - mu)
+        tpos = [float(t) for t in thresholds_pos_sigma]
+        tneg = [float(t) for t in thresholds_neg_sigma]
+        b0p = np.empty((n_patches, len(tpos)), dtype=np.float64)
+        b0n = np.empty((n_patches, len(tneg)), dtype=np.float64)
+        names_p = [f"t{int(round(t * 10)):02d}" for t in tpos]
+        names_n = [f"t{int(round(t * 10)):02d}" for t in tneg]
+        for i in range(n_patches):
+            patch = field_z[cx[i] - r : cx[i] + r + 1, cy[i] - r : cy[i] + r + 1]
+            for j, t in enumerate(tpos):
+                binary = patch > t
+                if not binary.any():
+                    b0p[i, j] = 0.0
+                else:
+                    _, num = ndimage.label(binary, structure=structure)
+                    b0p[i, j] = float(num)
+            for j, t in enumerate(tneg):
+                binary = patch < (-t)
+                if not binary.any():
+                    b0n[i, j] = 0.0
+                else:
+                    _, num = ndimage.label(binary, structure=structure)
+                    b0n[i, j] = float(num)
+        for j, nm in enumerate(names_p):
+            feats[f"b0_pos_{nm}"] = b0p[:, j]
+        for j, nm in enumerate(names_n):
+            feats[f"b0_neg_{nm}"] = b0n[:, j]
+    else:
+        raise ValueError("topo_mode must be quantile_per_field or sigma")
+
+    y = np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+    centers = np.column_stack([cx, cy]).astype(np.int64, copy=False)
+    return feats, y, centers
+
+
+def _ridge_fit_predict_multi(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Standardize X using train stats, center y, solve ridge for multi-output.
+    Returns (y_pred_train, y_pred_test, w, x_mu, x_sd, y_mean).
+    """
+    X_train = np.asarray(X_train, dtype=np.float64)
+    X_test = np.asarray(X_test, dtype=np.float64)
+    y_train = np.asarray(y_train, dtype=np.float64)
+    if y_train.ndim != 2:
+        raise ValueError("y_train must be (n,2)")
+    x_mu = X_train.mean(axis=0)
+    x_sd = X_train.std(axis=0)
+    x_sd = np.where(x_sd > 0, x_sd, 1.0)
+    Xtr = (X_train - x_mu) / x_sd
+    Xte = (X_test - x_mu) / x_sd
+    y_mean = y_train.mean(axis=0)
+    yc = y_train - y_mean
+    XtX = Xtr.T @ Xtr
+    Xty = Xtr.T @ yc
+    w = np.linalg.solve(XtX + float(alpha) * np.eye(XtX.shape[0]), Xty)
+    y_pred_train = Xtr @ w + y_mean
+    y_pred_test = Xte @ w + y_mean
+    return y_pred_train, y_pred_test, w, x_mu, x_sd, y_mean
 
 
 def _box_sum_3d(
@@ -1474,6 +1650,251 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
+    if experiment == "e12":
+        # 2D LOFO with band-splitting and vector target y=(gx,gy) (high-k by default).
+        grid_size = int(cfg.get("grid_size", 128))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 20_000))
+        if n_fields <= 1:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        P = int(cfg.get("placebo_permutations", 200))
+        if P <= 0:
+            raise ValueError("placebo_permutations must be > 0")
+
+        feature_field = str(cfg.get("feature_field", "rho_high")).lower()  # rho or rho_high
+        target_field = str(cfg.get("target_field", "high")).lower()  # high or full
+        topo_mode = str(cfg.get("topo_mode", "quantile_per_field")).lower()  # quantile_per_field or sigma
+
+        quantiles = [float(x) for x in cfg.get("quantiles_b0", [0.6, 0.7, 0.8, 0.9])]
+        thresholds_pos_sigma = [float(x) for x in cfg.get("thresholds_pos_sigma", [0.0, 0.5, 1.0, 1.5])]
+        thresholds_neg_sigma = [float(x) for x in cfg.get("thresholds_neg_sigma", [0.5, 1.0, 1.5])]
+
+        # build dataset per field
+        feats_lists: dict[str, list[np.ndarray]] = {}
+        ys: list[np.ndarray] = []
+        field_ids: list[np.ndarray] = []
+        split_checks: list[dict[str, float]] = []
+        topo_thr_per_field: dict[int, list[float]] = {}
+
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+            split_checks.append({"field_id": float(field_id), "rel_err_gx": split.rel_err_gx, "rel_err_gy": split.rel_err_gy})
+
+            if feature_field == "rho":
+                field_feat = rho01
+            elif feature_field == "rho_high":
+                field_feat = split.rho_high
+            else:
+                raise ValueError("feature_field must be 'rho' or 'rho_high'")
+
+            if target_field == "high":
+                gx = split.high.gx
+                gy = split.high.gy
+            elif target_field == "full":
+                gx = split.full.gx
+                gy = split.full.gy
+            else:
+                raise ValueError("target_field must be 'high' or 'full'")
+
+            topo_thresholds: list[float] | None = None
+            if topo_mode == "quantile_per_field":
+                topo_thresholds = [float(np.quantile(field_feat.reshape(-1), q)) for q in quantiles]
+                topo_thr_per_field[field_id] = topo_thresholds
+
+            feats_f, y_f, _ = _sample_features_2d_fast_topo(
+                field=field_feat,
+                gx=gx,
+                gy=gy,
+                n_patches=patches_per_field,
+                patch_size=patch_size,
+                topo_mode=topo_mode,
+                topo_thresholds=topo_thresholds,
+                thresholds_pos_sigma=thresholds_pos_sigma if topo_mode == "sigma" else None,
+                thresholds_neg_sigma=thresholds_neg_sigma if topo_mode == "sigma" else None,
+                rng=rng,
+            )
+            for k, v in feats_f.items():
+                feats_lists.setdefault(k, []).append(np.asarray(v, dtype=np.float64))
+            ys.append(np.asarray(y_f, dtype=np.float64))
+            field_ids.append(np.full((patches_per_field,), field_id, dtype=np.int32))
+
+        feats = {k: np.concatenate(vs, axis=0) for k, vs in feats_lists.items()}
+        y = np.concatenate(ys, axis=0)
+        fid = np.concatenate(field_ids, axis=0)
+        n_total = int(n_fields * patches_per_field)
+        if y.shape != (n_total, 2):
+            raise RuntimeError(f"y shape mismatch: {y.shape}")
+
+        keys_B = ["mass", "mass2", "var", "max", "grad_energy"]
+        topo_keys = sorted([k for k in feats.keys() if k.startswith("b0_")])
+        if not topo_keys:
+            raise RuntimeError("no topo features found")
+        X_B = _build_feature_matrix(feats, keys_B)
+        X_T = _build_feature_matrix(feats, topo_keys)
+
+        def metrics_vec(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+            from .models import rmse, safe_pearson
+
+            out = {}
+            for i, name in enumerate(["gx", "gy"]):
+                yt = y_true[:, i]
+                yp = y_pred[:, i]
+                out[f"pearson_{name}"] = float(safe_pearson(yt, yp))
+                rm = float(rmse(yt, yp))
+                std = float(np.std(yt))
+                out[f"relRMSE_{name}"] = float(rm / std) if std > 0 else float("nan")
+            out["pearson_mean"] = float(np.mean([out["pearson_gx"], out["pearson_gy"]]))
+            out["relRMSE_mean"] = float(np.mean([out["relRMSE_gx"], out["relRMSE_gy"]]))
+            return out
+
+        from scipy.stats import chi2
+
+        fold_rows: list[dict[str, Any]] = []
+        deltas_p: list[float] = []
+        deltas_r: list[float] = []
+        pvals: list[float] = []
+        n_pos = 0
+
+        for field_id in range(n_fields):
+            test_idx = np.nonzero(fid == field_id)[0]
+            train_idx = np.nonzero(fid != field_id)[0]
+            Btr = X_B[train_idx]
+            Bte = X_B[test_idx]
+            Ttr = X_T[train_idx]
+            Tte = X_T[test_idx]
+            ytr = y[train_idx]
+            yte = y[test_idx]
+
+            # Fit B once
+            yB_tr_pred, yB_te_pred, wB, muB, sdB, yB_mean = _ridge_fit_predict_multi(Btr, ytr, Bte, ridge_alpha)
+            mB = metrics_vec(yte, yB_te_pred)
+            rtr = ytr - yB_tr_pred
+            # residual model uses topo only
+            muT = Ttr.mean(axis=0)
+            sdT = Ttr.std(axis=0)
+            sdT = np.where(sdT > 0, sdT, 1.0)
+            Ttr_s = (Ttr - muT) / sdT
+            Tte_s = (Tte - muT) / sdT
+
+            # Fit residual ridge (real)
+            r_mean = rtr.mean(axis=0)
+            rc = rtr - r_mean
+            TT = Ttr_s.T @ Ttr_s
+            Tr = Ttr_s.T @ rc
+            wR = np.linalg.solve(TT + float(ridge_alpha) * np.eye(TT.shape[0]), Tr)
+            r_te_pred = Tte_s @ wR + r_mean
+            yC_te_pred = yB_te_pred + r_te_pred
+            mC = metrics_vec(yte, yC_te_pred)
+
+            dp = float(mC["pearson_mean"] - mB["pearson_mean"])
+            dr = float(mC["relRMSE_mean"] - mB["relRMSE_mean"])
+            deltas_p.append(dp)
+            deltas_r.append(dr)
+            if dp > 0:
+                n_pos += 1
+
+            # placebo permutations: permute topo in train and test, refit residual model
+            null_dp: list[float] = []
+            null_dr: list[float] = []
+            for _ in range(P):
+                perm_tr = rng_placebo.permutation(train_idx.size)
+                perm_te = rng_placebo.permutation(test_idx.size)
+                Ttr_p = Ttr_s[perm_tr]
+                Tte_p = Tte_s[perm_te]
+                Tr_p = Ttr_p.T @ rc
+                wR_p = np.linalg.solve(TT + float(ridge_alpha) * np.eye(TT.shape[0]), Tr_p)
+                r_te_p = Tte_p @ wR_p + r_mean
+                yC_p = yB_te_pred + r_te_p
+                mp = metrics_vec(yte, yC_p)
+                null_dp.append(float(mp["pearson_mean"] - mB["pearson_mean"]))
+                null_dr.append(float(mp["relRMSE_mean"] - mB["relRMSE_mean"]))
+
+            null_dp_a = np.asarray(null_dp, dtype=np.float64)
+            null_dr_a = np.asarray(null_dr, dtype=np.float64)
+            ndp_mean = float(null_dp_a.mean())
+            ndp_std = float(null_dp_a.std(ddof=1)) if null_dp_a.size > 1 else 0.0
+            ndr_mean = float(null_dr_a.mean())
+            ndr_std = float(null_dr_a.std(ddof=1)) if null_dr_a.size > 1 else 0.0
+            z = float((dp - ndp_mean) / ndp_std) if ndp_std > 0 else float("inf")
+            # empirical one-sided p for Pearson improvement
+            p_emp = float((np.sum(null_dp_a >= dp) + 1) / (P + 1))
+            pvals.append(p_emp)
+
+            fold_rows.append(
+                {
+                    "field_id": int(field_id),
+                    "n_test": int(test_idx.size),
+                    "pearson_B_mean": float(mB["pearson_mean"]),
+                    "relRMSE_B_mean": float(mB["relRMSE_mean"]),
+                    "pearson_C_mean": float(mC["pearson_mean"]),
+                    "relRMSE_C_mean": float(mC["relRMSE_mean"]),
+                    "delta_pearson_mean": dp,
+                    "delta_relRMSE_mean": dr,
+                    "null_delta_pearson_mean": ndp_mean,
+                    "null_delta_pearson_std": ndp_std,
+                    "null_delta_relRMSE_mean": ndr_mean,
+                    "null_delta_relRMSE_std": ndr_std,
+                    "zscore_delta_pearson": z,
+                    "p_emp_delta_pearson": p_emp,
+                }
+            )
+
+        deltas_p = np.asarray(deltas_p, dtype=np.float64)
+        deltas_r = np.asarray(deltas_r, dtype=np.float64)
+        pvals = np.asarray(pvals, dtype=np.float64)
+
+        eps = 1e-12
+        fisher_stat = float(-2.0 * np.sum(np.log(np.clip(pvals, eps, 1.0))))
+        fisher_p = float(chi2.sf(fisher_stat, 2 * n_fields))
+        verdict = bool((float(deltas_p.mean()) > 0.0) and (float(deltas_r.mean()) < 0.0) and (fisher_p < 0.01) and (n_pos >= 7))
+
+        metrics: dict[str, Any] = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "split_seed": split_seed,
+            "placebo_seed": placebo_seed,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "k0_frac": k0_frac,
+            "band_split_check": split_checks,
+            "n_fields": n_fields,
+            "patches_per_field": patches_per_field,
+            "patch_size": patch_size,
+            "feature_field": feature_field,
+            "target_field": target_field,
+            "topo_mode": topo_mode,
+            "topo_keys": topo_keys,
+            "quantiles_b0": quantiles,
+            "topo_thresholds_per_field": topo_thr_per_field if topo_mode == "quantile_per_field" else {},
+            "thresholds_pos_sigma": thresholds_pos_sigma,
+            "thresholds_neg_sigma": thresholds_neg_sigma,
+            "ridge_alpha": ridge_alpha,
+            "placebo_permutations": P,
+            "lofo_folds": fold_rows,
+            "lofo_agg": {
+                "delta_pearson_mean": float(deltas_p.mean()),
+                "delta_pearson_std": float(deltas_p.std(ddof=1)),
+                "delta_relRMSE_mean": float(deltas_r.mean()),
+                "delta_relRMSE_std": float(deltas_r.std(ddof=1)),
+                "fisher_p_delta_pearson": fisher_p,
+                "n_pos_delta_pearson": int(n_pos),
+                "verdict_pass": verdict,
+            },
+        }
+
+        header = list(fold_rows[0].keys()) if fold_rows else []
+        rows = [[r[h] for h in header] for r in fold_rows]
+        write_csv(paths.run_dir / "lofo_by_field.csv", header, rows)
+        write_json(paths.metrics_json, metrics)
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -1555,7 +1976,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
-    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11)")
+    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11/e12)")
 
 
 def main() -> None:

@@ -14,6 +14,151 @@ class PoissonResult3D:
     g: np.ndarray  # (nx, ny, nz) = ||grad(phi)||
 
 
+@dataclass(frozen=True)
+class PoissonResult2D:
+    rho: np.ndarray  # (nx, ny) real (not necessarily [0,1] if preprocessed)
+    phi: np.ndarray  # (nx, ny) real
+    gx: np.ndarray  # (nx, ny)
+    gy: np.ndarray  # (nx, ny)
+    gmag: np.ndarray  # (nx, ny)
+
+
+@dataclass(frozen=True)
+class BandSplit2D:
+    rho: np.ndarray
+    rho_low: np.ndarray
+    rho_high: np.ndarray
+    low: PoissonResult2D
+    high: PoissonResult2D
+    full: PoissonResult2D
+    rel_err_gx: float
+    rel_err_gy: float
+
+
+def generate_1overf_field_2d(
+    shape: tuple[int, int],
+    alpha: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Generate a real 2D field with power spectrum ~ 1/|k|^alpha using rFFT.
+    Returns rho normalized to [0,1].
+    """
+    if len(shape) != 2:
+        raise ValueError(f"shape must be 2D, got {shape}")
+    if any(s <= 0 for s in shape):
+        raise ValueError(f"invalid shape: {shape}")
+    if alpha <= 0:
+        raise ValueError("alpha must be > 0")
+
+    nx, ny = shape
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
+    ky = 2.0 * np.pi * np.fft.rfftfreq(ny)[None, :]
+    k2 = kx * kx + ky * ky
+    k = np.sqrt(k2, dtype=np.float64)
+    scale = np.zeros_like(k, dtype=np.float64)
+    nonzero = k > 0
+    scale[nonzero] = k[nonzero] ** (-alpha / 2.0)
+
+    real = rng.normal(size=(nx, ny // 2 + 1))
+    imag = rng.normal(size=(nx, ny // 2 + 1))
+    coeff = (real + 1j * imag) * scale
+    coeff[0, 0] = 0.0 + 0.0j
+
+    field = np.fft.irfftn(coeff, s=shape).real
+    assert_finite("rho_raw_2d", field)
+    rho = normalize_01(field)
+    if (rho.min() < -1e-9) or (rho.max() > 1.0 + 1e-9):
+        raise RuntimeError("normalize_01 returned values outside [0,1]")
+    return rho
+
+
+def solve_poisson_periodic_fft_2d(rho: np.ndarray) -> PoissonResult2D:
+    """
+    Periodic 2D Poisson via FFT, with mean subtraction of rho.
+    phi_k = -rho_k/k^2 (k=0 -> 0), gradients via spectral derivatives.
+    """
+    rho = np.asarray(rho, dtype=np.float64)
+    if rho.ndim != 2:
+        raise ValueError(f"rho must be 2D, got {rho.shape}")
+    assert_finite("rho", rho)
+
+    nx, ny = rho.shape
+    rho0 = rho - float(rho.mean())
+    rho_k = np.fft.fftn(rho0)
+
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny)[None, :]
+    k2 = kx * kx + ky * ky
+
+    phi_k = np.zeros_like(rho_k)
+    nonzero = k2 > 0
+    phi_k[nonzero] = -rho_k[nonzero] / k2[nonzero]
+    phi_k[0, 0] = 0.0 + 0.0j
+
+    phi = np.fft.ifftn(phi_k).real
+    gx = np.fft.ifftn(1j * kx * phi_k).real
+    gy = np.fft.ifftn(1j * ky * phi_k).real
+    assert_finite("phi", phi)
+    assert_finite("gx", gx)
+    assert_finite("gy", gy)
+    gmag = np.sqrt(gx * gx + gy * gy, dtype=np.float64)
+    assert_finite("gmag", gmag)
+    return PoissonResult2D(rho=rho, phi=phi, gx=gx, gy=gy, gmag=gmag)
+
+
+def band_split_poisson_2d(
+    rho01: np.ndarray,
+    *,
+    k0_frac: float = 0.15,
+) -> BandSplit2D:
+    """
+    Split rho into low/high-k components in Fourier space, solve Poisson for each,
+    and verify gx ~= gx_low + gx_high (same for gy).
+    """
+    rho01 = np.asarray(rho01, dtype=np.float64)
+    if rho01.ndim != 2:
+        raise ValueError("rho01 must be 2D")
+    if (rho01.min() < -1e-6) or (rho01.max() > 1.0 + 1e-6):
+        raise ValueError("rho01 must be in [0,1]")
+    if not (0.0 < float(k0_frac) < 0.5):
+        raise ValueError("k0_frac must be in (0,0.5)")
+
+    nx, ny = rho01.shape
+    rho_k = np.fft.fftn(rho01 - float(rho01.mean()))
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny)[None, :]
+    k = np.sqrt(kx * kx + ky * ky, dtype=np.float64)
+    k_ny = np.pi  # in our 2*pi*fftfreq convention with unit spacing
+    k0 = float(k0_frac) * k_ny
+    mask_low = k <= k0
+
+    rho_low_k = rho_k * mask_low
+    rho_high_k = rho_k * (~mask_low)
+    rho_low = np.fft.ifftn(rho_low_k).real
+    rho_high = np.fft.ifftn(rho_high_k).real
+    assert_finite("rho_low", rho_low)
+    assert_finite("rho_high", rho_high)
+
+    low = solve_poisson_periodic_fft_2d(rho_low)
+    high = solve_poisson_periodic_fft_2d(rho_high)
+    full = solve_poisson_periodic_fft_2d(rho_low + rho_high)
+
+    denom_gx = float(np.mean(np.abs(full.gx))) + 1e-12
+    denom_gy = float(np.mean(np.abs(full.gy))) + 1e-12
+    rel_err_gx = float(np.mean(np.abs(full.gx - (low.gx + high.gx))) / denom_gx)
+    rel_err_gy = float(np.mean(np.abs(full.gy - (low.gy + high.gy))) / denom_gy)
+    return BandSplit2D(
+        rho=rho01,
+        rho_low=rho_low,
+        rho_high=rho_high,
+        low=low,
+        high=high,
+        full=full,
+        rel_err_gx=rel_err_gx,
+        rel_err_gy=rel_err_gy,
+    )
+
 def generate_1overf_field_3d(
     shape: tuple[int, int, int],
     alpha: float,
