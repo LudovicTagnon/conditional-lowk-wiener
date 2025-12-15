@@ -2771,6 +2771,256 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
+    if experiment == "e15c":
+        # Kernel "ground-truth" via impulse response through the exact discrete pipeline, then compare to learned/theory.
+        import matplotlib.pyplot as plt
+
+        kernel_run_dirs = [Path(p) for p in cfg.get("kernel_run_dirs", [])]
+        if not kernel_run_dirs:
+            raise ValueError("kernel_run_dirs must list e15 run folders containing kernel_{learned,theoretical}_*.npy")
+
+        grid_size = int(cfg.get("grid_size", 256))
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        ws = [int(x) for x in cfg.get("ws", [17, 33])]
+        modes = [str(x).lower() for x in cfg.get("modes", ["rho_high"])]  # rho|rho_high
+
+        # Load kernels from provided run dirs (keyed by w).
+        learned_by_w: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        theory_by_w: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for rd in kernel_run_dirs:
+            kth_gx = np.load(rd / "kernel_theoretical_gx.npy")
+            kth_gy = np.load(rd / "kernel_theoretical_gy.npy")
+            kl_gx = np.load(rd / "kernel_learned_gx.npy")
+            kl_gy = np.load(rd / "kernel_learned_gy.npy")
+            w = int(kth_gx.shape[0])
+            learned_by_w[w] = (kl_gx.astype(np.float64), kl_gy.astype(np.float64))
+            theory_by_w[w] = (kth_gx.astype(np.float64), kth_gy.astype(np.float64))
+
+        def corr(a: np.ndarray, b: np.ndarray) -> float:
+            a = a.reshape(-1).astype(np.float64)
+            b = b.reshape(-1).astype(np.float64)
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+            return float((a @ b) / denom)
+
+        def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+            return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+
+        def scale_best(klearn: np.ndarray, kth: np.ndarray) -> tuple[float, np.ndarray]:
+            num = float(np.sum(klearn * kth))
+            den = float(np.sum(klearn * klearn)) + 1e-12
+            a = num / den
+            return a, a * klearn
+
+        def extract_periodic_kernel(field: np.ndarray, w: int) -> np.ndarray:
+            # field is the impulse response evaluated on the grid, with the impulse at (0,0).
+            # A linear, translation-invariant operator satisfies:
+            #   y(center) = sum_{dx,dy} K(-dx,-dy) * x(center+dx,center+dy)
+            # so we reverse the impulse patch to match the regression dot-product convention.
+            ps = _require_odd("w", w)
+            r = ps // 2
+            idx = (np.arange(-r, r + 1, dtype=np.int64) % field.shape[0]).astype(np.int64)
+            patch = field[np.ix_(idx, idx)]
+            return patch[::-1, ::-1].astype(np.float64, copy=False)
+
+        def save_kernel_png(arr: np.ndarray, name: str) -> None:
+            vmax = float(np.max(np.abs(arr))) + 1e-12
+            plt.figure(figsize=(4, 4))
+            plt.imshow(arr, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.colorbar()
+            plt.title(name.replace(".png", ""))
+            plt.tight_layout()
+            plt.savefig(paths.run_dir / name, dpi=150)
+            plt.close()
+
+        def save_triplet(a: np.ndarray, b: np.ndarray, name: str, title_a: str, title_b: str) -> None:
+            vmax = float(np.max(np.abs(a))) + 1e-12
+            plt.figure(figsize=(9, 3))
+            plt.subplot(1, 3, 1)
+            plt.imshow(a, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title(title_a)
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 2)
+            plt.imshow(b, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title(title_b)
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 3)
+            plt.imshow(b - a, cmap="coolwarm")
+            plt.title("diff")
+            plt.colorbar(fraction=0.046)
+            plt.tight_layout()
+            plt.savefig(paths.run_dir / name, dpi=150)
+            plt.close()
+
+        # Build impulse (delta at origin) and run the exact same discrete pipeline.
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[0, 0] = 1.0
+
+        impulse_by_mode: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for mode in modes:
+            if mode == "rho":
+                sol = solve_poisson_periodic_fft_2d(rho_delta)
+                impulse_by_mode[mode] = (sol.gx, sol.gy)
+            elif mode == "rho_high":
+                split = band_split_poisson_2d(rho_delta, k0_frac=k0_frac)
+                impulse_by_mode[mode] = (split.high.gx, split.high.gy)
+            else:
+                raise ValueError("modes must be a list of: rho, rho_high")
+
+        results: list[dict[str, Any]] = []
+        rows_md: list[dict[str, str]] = []
+
+        for mode, (gx_imp, gy_imp) in impulse_by_mode.items():
+            for w in ws:
+                kx_imp = extract_periodic_kernel(gx_imp, w)
+                ky_imp = extract_periodic_kernel(gy_imp, w)
+
+                np.save(paths.run_dir / f"kernel_impulse_{mode}_w{w}_gx.npy", kx_imp)
+                np.save(paths.run_dir / f"kernel_impulse_{mode}_w{w}_gy.npy", ky_imp)
+
+                save_kernel_png(kx_imp, f"kernel_impulse_{mode}_w{w}_gx.png")
+                save_kernel_png(ky_imp, f"kernel_impulse_{mode}_w{w}_gy.png")
+
+                def compare_pair(
+                    tag: str, kx: np.ndarray, ky: np.ndarray
+                ) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+                    ax, kx_s = scale_best(kx, kx_imp)
+                    ay, ky_s = scale_best(ky, ky_imp)
+                    metrics = {
+                        "corr_gx": corr(kx, kx_imp),
+                        "corr_gy": corr(ky, ky_imp),
+                        "relL2_gx": rel_l2(kx, kx_imp),
+                        "relL2_gy": rel_l2(ky, ky_imp),
+                        "scale_a_gx": float(ax),
+                        "scale_a_gy": float(ay),
+                        "relL2_scaled_gx": rel_l2(kx_s, kx_imp),
+                        "relL2_scaled_gy": rel_l2(ky_s, ky_imp),
+                        "corr_mean": 0.5 * (corr(kx, kx_imp) + corr(ky, ky_imp)),
+                        "relL2_scaled_mean": 0.5 * (rel_l2(kx_s, kx_imp) + rel_l2(ky_s, ky_imp)),
+                    }
+                    np.save(paths.run_dir / f"kernel_{tag}_{mode}_w{w}_gx.npy", kx.astype(np.float64, copy=False))
+                    np.save(paths.run_dir / f"kernel_{tag}_{mode}_w{w}_gy.npy", ky.astype(np.float64, copy=False))
+                    return metrics, kx_s, ky_s
+
+                # learned vs impulse
+                learn_metrics: dict[str, float] | None = None
+                if w in learned_by_w:
+                    klx, kly = learned_by_w[w]
+                    learn_metrics, _, _ = compare_pair("learned", klx, kly)
+                    save_triplet(
+                        kx_imp,
+                        klx,
+                        f"kernel_compare_learn_vs_impulse_{mode}_w{w}_gx.png",
+                        "impulse",
+                        "learned",
+                    )
+                    save_triplet(
+                        ky_imp,
+                        kly,
+                        f"kernel_compare_learn_vs_impulse_{mode}_w{w}_gy.png",
+                        "impulse",
+                        "learned",
+                    )
+
+                # theory vs impulse
+                theory_metrics: dict[str, float] | None = None
+                if w in theory_by_w:
+                    kthx, kthy = theory_by_w[w]
+                    theory_metrics, _, _ = compare_pair("theory", kthx, kthy)
+                    save_triplet(
+                        kx_imp,
+                        kthx,
+                        f"kernel_compare_theory_vs_impulse_{mode}_w{w}_gx.png",
+                        "impulse",
+                        "theory",
+                    )
+                    save_triplet(
+                        ky_imp,
+                        kthy,
+                        f"kernel_compare_theory_vs_impulse_{mode}_w{w}_gy.png",
+                        "impulse",
+                        "theory",
+                    )
+
+                row = {
+                    "mode": mode,
+                    "w": int(w),
+                    "learn_corr_mean": float("nan") if learn_metrics is None else float(learn_metrics["corr_mean"]),
+                    "learn_relL2_scaled_mean": float("nan") if learn_metrics is None else float(learn_metrics["relL2_scaled_mean"]),
+                    "theory_corr_mean": float("nan") if theory_metrics is None else float(theory_metrics["corr_mean"]),
+                    "theory_relL2_scaled_mean": float("nan") if theory_metrics is None else float(theory_metrics["relL2_scaled_mean"]),
+                    "learn_details": learn_metrics,
+                    "theory_details": theory_metrics,
+                }
+                results.append(row)
+
+                def fmt(x: float) -> str:
+                    if not np.isfinite(x):
+                        return "nan"
+                    ax = abs(float(x))
+                    if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                        return f"{x:.3e}"
+                    return f"{x:.4f}"
+
+                rows_md.append(
+                    {
+                        "mode": mode,
+                        "w": str(w),
+                        "corr_mean(learn,imp)": "nan" if learn_metrics is None else fmt(float(learn_metrics["corr_mean"])),
+                        "relL2_scaled_mean(learn,imp)": "nan" if learn_metrics is None else fmt(float(learn_metrics["relL2_scaled_mean"])),
+                        "corr_mean(theory,imp)": "nan" if theory_metrics is None else fmt(float(theory_metrics["corr_mean"])),
+                        "relL2_scaled_mean(theory,imp)": "nan" if theory_metrics is None else fmt(float(theory_metrics["relL2_scaled_mean"])),
+                    }
+                )
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r in rows:
+                out.append("| " + " | ".join(r.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        summary_md = (
+            "# Impulse-response kernel comparison (E15c)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size: `{grid_size}`\n"
+            f"- k0_frac: `{k0_frac}`\n"
+            f"- kernel sources: {', '.join(f'`{p}`' for p in kernel_run_dirs)}\n\n"
+            "## Summary table\n"
+            + md_table(
+                rows_md,
+                [
+                    "mode",
+                    "w",
+                    "corr_mean(learn,imp)",
+                    "relL2_scaled_mean(learn,imp)",
+                    "corr_mean(theory,imp)",
+                    "relL2_scaled_mean(theory,imp)",
+                ],
+            )
+            + "\n"
+        )
+        (paths.run_dir / "summary_kernel_impulse.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "modes": modes,
+                "ws": ws,
+                "kernel_run_dirs": [str(p) for p in kernel_run_dirs],
+                "results": results,
+            },
+        )
+        return paths
+
     if experiment == "e17":
         # LOFO moments vs baseline B vs pixels, for gx/gy targets (high or full).
         from numpy.lib.stride_tricks import sliding_window_view

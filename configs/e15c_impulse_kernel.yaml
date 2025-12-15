@@ -1,0 +1,13 @@
+experiment: e15c
+exp_name: e15c_impulse_kernel
+
+# This must point at e15 run folders (same grid_size) providing:
+# - kernel_theoretical_gx.npy / kernel_theoretical_gy.npy
+# - kernel_learned_gx.npy / kernel_learned_gy.npy
+kernel_run_dirs: []
+
+grid_size: 256
+k0_frac: 0.15
+modes: [rho_high]
+ws: [17, 33]
+
