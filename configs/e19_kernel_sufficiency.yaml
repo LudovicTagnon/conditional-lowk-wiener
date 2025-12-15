@@ -1,0 +1,23 @@
+experiment: e19
+exp_name: e19_kernel_sufficiency
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+patches_per_field: 20000
+ws: [17, 33]
+
+# Uses E15c impulse patches as truncated kernels (w=17,33). Must be provided by user.
+impulse_run_dir: ""
+
+# Residual model features:
+topo_mode: quantile_per_field
+quantiles_b0: [0.6, 0.7, 0.8, 0.9]
+
+# Residual ridge + placebo permutations per fold:
+ridge_alpha: 1.0
+n_perms: 200
+placebo_shuffle_test: false
+

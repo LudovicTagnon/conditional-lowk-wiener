@@ -3608,6 +3608,483 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e19":
+        # Kernel sufficiency test: baseline = truncated impulse kernel convolution, then predict residual with topo in LOFO.
+        import math
+        import matplotlib.pyplot as plt
+        from scipy import stats
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 20_000))
+        ws = [int(x) for x in cfg.get("ws", [17, 33])]
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        topo_mode = str(cfg.get("topo_mode", "quantile_per_field")).lower()  # quantile_per_field only here
+        quantiles_b0 = [float(x) for x in cfg.get("quantiles_b0", [0.6, 0.7, 0.8, 0.9])]
+        n_perms = int(cfg.get("n_perms", 200))
+        shuffle_test = bool(cfg.get("placebo_shuffle_test", False))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if not (0.0 < k0_frac < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if topo_mode != "quantile_per_field":
+            raise ValueError("E19 currently supports topo_mode=quantile_per_field only")
+        if any((q <= 0.0) or (q >= 1.0) for q in quantiles_b0):
+            raise ValueError("quantiles_b0 must be in (0,1)")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+
+        impulse_run_dir = Path(str(cfg.get("impulse_run_dir", "")))
+        if not impulse_run_dir.exists():
+            raise FileNotFoundError(f"impulse_run_dir not found: {impulse_run_dir}")
+
+        # Helpers
+        def vec_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+            from .models import rmse, safe_pearson
+
+            out: dict[str, float] = {}
+            for i, name in enumerate(["gx", "gy"]):
+                yt = np.asarray(y_true[:, i], dtype=np.float64)
+                yp = np.asarray(y_pred[:, i], dtype=np.float64)
+                out[f"pearson_{name}"] = float(safe_pearson(yt, yp))
+                r = float(rmse(yt, yp))
+                s = float(np.std(yt))
+                out[f"relRMSE_{name}"] = float(r / s) if s > 0 else float("nan")
+            out["pearson_mean"] = float(np.mean([out["pearson_gx"], out["pearson_gy"]]))
+            out["relRMSE_mean"] = float(np.mean([out["relRMSE_gx"], out["relRMSE_gy"]]))
+            return out
+
+        def corr(a: np.ndarray, b: np.ndarray) -> float:
+            a = a.reshape(-1).astype(np.float64)
+            b = b.reshape(-1).astype(np.float64)
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+            return float((a @ b) / denom)
+
+        def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+            return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+
+        def scale_best(klearn: np.ndarray, kth: np.ndarray) -> tuple[float, np.ndarray]:
+            num = float(np.sum(klearn * kth))
+            den = float(np.sum(klearn * klearn)) + 1e-12
+            a = num / den
+            return a, a * klearn
+
+        def fisher_p(ps: list[float]) -> float:
+            # Fisher method with clamping to avoid log(0)
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def embed_kernel_patch(h_patch: np.ndarray) -> np.ndarray:
+            # h_patch indexed by dx,dy in [-r..r] at [i=r+dx,j=r+dy], placed at wrapped indices.
+            w = int(h_patch.shape[0])
+            r = w // 2
+            out = np.zeros((grid_size, grid_size), dtype=np.float64)
+            for i in range(w):
+                dx = i - r
+                xi = dx % grid_size
+                for j in range(w):
+                    dy = j - r
+                    yj = dy % grid_size
+                    out[xi, yj] = float(h_patch[i, j])
+            return out
+
+        def fmt_mu_sd(vals: list[float], digits: int = 4) -> str:
+            if not vals:
+                return "nan"
+            v = np.asarray(vals, dtype=np.float64)
+            mu = float(np.mean(v))
+            sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+            return f"{mu:.{digits}f} ± {sd:.{digits}f}"
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r in rows:
+                out.append("| " + " | ".join(r.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        # Precompute kernels for each w from impulse patches (stored in regression convention); convert to convolution h via flip.
+        kernels: dict[int, dict[str, Any]] = {}
+        for w in ws:
+            k_reg_gx = np.load(impulse_run_dir / f"kernel_impulse_rho_high_w{w}_gx.npy").astype(np.float64)
+            k_reg_gy = np.load(impulse_run_dir / f"kernel_impulse_rho_high_w{w}_gy.npy").astype(np.float64)
+            h_gx = k_reg_gx[::-1, ::-1]
+            h_gy = k_reg_gy[::-1, ::-1]
+            hx_full = embed_kernel_patch(h_gx)
+            hy_full = embed_kernel_patch(h_gy)
+            Hx = np.fft.fftn(hx_full)
+            Hy = np.fft.fftn(hy_full)
+            kernels[w] = {
+                "k_reg_gx": k_reg_gx,
+                "k_reg_gy": k_reg_gy,
+                "h_gx": h_gx,
+                "h_gy": h_gy,
+                "hx_full": hx_full,
+                "hy_full": hy_full,
+                "Hx": Hx,
+                "Hy": Hy,
+            }
+
+        # Cache per-field data that is shared across w (rho_high, g_true high).
+        rho_high_by_field: list[np.ndarray] = []
+        gx_true_by_field: list[np.ndarray] = []
+        gy_true_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+            rho_high_by_field.append(np.asarray(split.rho_high, dtype=np.float64))
+            gx_true_by_field.append(np.asarray(split.high.gx, dtype=np.float64))
+            gy_true_by_field.append(np.asarray(split.high.gy, dtype=np.float64))
+
+        baseline_rows: list[dict[str, Any]] = []
+        residual_summary_by_w: dict[int, dict[str, Any]] = {}
+
+        # Work per window size.
+        for w in ws:
+            ps = _require_odd("w", w)
+            # Baseline kernel prediction (truncated impulse kernel, via FFT convolution)
+            pearsons: list[float] = []
+            rels: list[float] = []
+
+            # Per-field sampled datasets for LOFO residual modeling.
+            B_by_field: list[np.ndarray] = []
+            T_by_field: list[np.ndarray] = []
+            yres_by_field: list[np.ndarray] = []
+
+            # Identify topo names from the sampler output; keep stable ordering.
+            topo_names: list[str] | None = None
+
+            for field_id in range(n_fields):
+                rho_high = rho_high_by_field[field_id]
+                gx_true = gx_true_by_field[field_id]
+                gy_true = gy_true_by_field[field_id]
+
+                # Baseline prediction on full grid.
+                R = np.fft.fftn(rho_high)
+                gx_pred = np.fft.ifftn(R * kernels[w]["Hx"]).real
+                gy_pred = np.fft.ifftn(R * kernels[w]["Hy"]).real
+                assert_finite("gx_pred", gx_pred)
+                assert_finite("gy_pred", gy_pred)
+
+                # Baseline metrics on the full grid (all pixels).
+                m_full = vec_metrics(
+                    np.column_stack([gx_true.reshape(-1), gy_true.reshape(-1)]),
+                    np.column_stack([gx_pred.reshape(-1), gy_pred.reshape(-1)]),
+                )
+                baseline_rows.append(
+                    {
+                        "w": int(w),
+                        "field_id": int(field_id),
+                        "pearson_mean": float(m_full["pearson_mean"]),
+                        "relRMSE_mean": float(m_full["relRMSE_mean"]),
+                    }
+                )
+                pearsons.append(float(m_full["pearson_mean"]))
+                rels.append(float(m_full["relRMSE_mean"]))
+
+                # Residual field.
+                gx_res = gx_true - gx_pred
+                gy_res = gy_true - gy_pred
+
+                # Topo thresholds per field using quantiles on rho_high itself (supports negative values).
+                thr = [float(np.quantile(rho_high.reshape(-1), q)) for q in quantiles_b0]
+
+                feats, y_resid, _centers = _sample_features_2d_fast_topo(
+                    field=rho_high,
+                    gx=gx_res,
+                    gy=gy_res,
+                    n_patches=patches_per_field,
+                    patch_size=ps,
+                    topo_mode=topo_mode,
+                    topo_thresholds=thr,
+                    thresholds_pos_sigma=None,
+                    thresholds_neg_sigma=None,
+                    rng=rng,
+                )
+                y_resid = np.asarray(y_resid, dtype=np.float64)
+                assert y_resid.shape == (patches_per_field, 2)
+                assert_finite("y_resid", y_resid)
+
+                B_names = ["mass", "mass2", "var", "max", "grad_energy"]
+                for n in B_names:
+                    if n not in feats:
+                        raise RuntimeError(f"Missing B feature: {n}")
+                B = np.column_stack([np.asarray(feats[n], dtype=np.float64) for n in B_names])
+
+                # topo keys are those starting with b0_
+                tnames = sorted([k for k in feats.keys() if k.startswith("b0_")])
+                if topo_names is None:
+                    topo_names = tnames
+                elif topo_names != tnames:
+                    raise RuntimeError(f"Topo feature names mismatch across fields: {topo_names} vs {tnames}")
+                T = np.column_stack([np.asarray(feats[n], dtype=np.float64) for n in topo_names])
+
+                B_by_field.append(B)
+                T_by_field.append(T)
+                yres_by_field.append(y_resid)
+
+            if topo_names is None:
+                raise RuntimeError("No topo features found")
+
+            # LOFO residual modeling: compare B vs C=B+T, with topo placebo permutations.
+            fold_rows: list[dict[str, Any]] = []
+            pvals_pearson: list[float] = []
+            pvals_rel: list[float] = []
+
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                Btr = np.concatenate([B_by_field[i] for i in train_fields], axis=0)
+                Ttr = np.concatenate([T_by_field[i] for i in train_fields], axis=0)
+                ytr = np.concatenate([yres_by_field[i] for i in train_fields], axis=0)
+
+                Bte = B_by_field[test_field]
+                Tte = T_by_field[test_field]
+                yte = yres_by_field[test_field]
+
+                # Standardize using train stats (perm invariant per column).
+                B_mu = Btr.mean(axis=0)
+                B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                T_mu = Ttr.mean(axis=0)
+                T_sd = np.where(Ttr.std(axis=0) > 0, Ttr.std(axis=0), 1.0)
+
+                Btr_s = (Btr - B_mu) / B_sd
+                Bte_s = (Bte - B_mu) / B_sd
+                Ttr_s = (Ttr - T_mu) / T_sd
+                Tte_s = (Tte - T_mu) / T_sd
+
+                y_mean = ytr.mean(axis=0)
+                yc = ytr - y_mean
+
+                # Fit B
+                XtX_B = Btr_s.T @ Btr_s
+                Xty_B = Btr_s.T @ yc
+                wB = np.linalg.solve(XtX_B + ridge_alpha * np.eye(XtX_B.shape[0]), Xty_B)
+                yB = Bte_s @ wB + y_mean
+                mB = vec_metrics(yte, yB)
+
+                # Fit C (real)
+                XtrC = np.concatenate([Btr_s, Ttr_s], axis=1)
+                XteC = np.concatenate([Bte_s, Tte_s], axis=1)
+                XtX_C = XtrC.T @ XtrC
+                Xty_C = XtrC.T @ yc
+                wC = np.linalg.solve(XtX_C + ridge_alpha * np.eye(XtX_C.shape[0]), Xty_C)
+                yC = XteC @ wC + y_mean
+                mC = vec_metrics(yte, yC)
+
+                deltaP_real = float(mC["pearson_mean"] - mB["pearson_mean"])
+                deltaR_real = float(mC["relRMSE_mean"] - mB["relRMSE_mean"])
+
+                # Permutation null: shuffle topo rows, refit C each time, compare to fixed B metrics.
+                # Optimization: B^T B and T^T T are invariant to row permutation; only cross-terms and T^T y change.
+                A = XtX_B  # B^T B
+                Cmat = Ttr_s.T @ Ttr_s
+                u = Xty_B  # B^T yc
+
+                deltasP_null: list[float] = []
+                deltasR_null: list[float] = []
+                for _p in range(n_perms):
+                    perm_tr = rng_placebo.permutation(Ttr_s.shape[0])
+                    Ttr_p = Ttr_s[perm_tr]
+                    if shuffle_test:
+                        perm_te = rng_placebo.permutation(Tte_s.shape[0])
+                        Tte_p = Tte_s[perm_te]
+                    else:
+                        Tte_p = Tte_s
+
+                    D = Btr_s.T @ Ttr_p
+                    v = Ttr_p.T @ yc
+                    XtX = np.block([[A, D], [D.T, Cmat]])
+                    Xty = np.vstack([u, v])
+                    wP = np.linalg.solve(XtX + ridge_alpha * np.eye(XtX.shape[0]), Xty)
+                    yP = (np.concatenate([Bte_s, Tte_p], axis=1) @ wP) + y_mean
+                    mP = vec_metrics(yte, yP)
+                    deltasP_null.append(float(mP["pearson_mean"] - mB["pearson_mean"]))
+                    deltasR_null.append(float(mP["relRMSE_mean"] - mB["relRMSE_mean"]))
+
+                nullP = np.asarray(deltasP_null, dtype=np.float64)
+                nullR = np.asarray(deltasR_null, dtype=np.float64)
+                nullP_mu = float(nullP.mean())
+                nullP_sd = float(nullP.std(ddof=1)) if len(nullP) > 1 else 0.0
+                nullR_mu = float(nullR.mean())
+                nullR_sd = float(nullR.std(ddof=1)) if len(nullR) > 1 else 0.0
+
+                zP = float((deltaP_real - nullP_mu) / nullP_sd) if nullP_sd > 0 else float("nan")
+                zR = float((deltaR_real - nullR_mu) / nullR_sd) if nullR_sd > 0 else float("nan")
+
+                # Empirical p-values
+                pP = float(np.mean(nullP >= deltaP_real))
+                pR = float(np.mean(nullR <= deltaR_real))  # smaller relRMSE delta is better
+                pvals_pearson.append(pP)
+                pvals_rel.append(pR)
+
+                fold_rows.append(
+                    {
+                        "w": int(w),
+                        "field_id": int(test_field),
+                        "pearson_B": float(mB["pearson_mean"]),
+                        "relRMSE_B": float(mB["relRMSE_mean"]),
+                        "pearson_C": float(mC["pearson_mean"]),
+                        "relRMSE_C": float(mC["relRMSE_mean"]),
+                        "deltaP_real": float(deltaP_real),
+                        "deltaR_real": float(deltaR_real),
+                        "nullP_mean": float(nullP_mu),
+                        "nullP_std": float(nullP_sd),
+                        "nullR_mean": float(nullR_mu),
+                        "nullR_std": float(nullR_sd),
+                        "zP": float(zP),
+                        "zR": float(zR),
+                        "p_emp_P": float(pP),
+                        "p_emp_R": float(pR),
+                    }
+                )
+
+            # Aggregate per w
+            dp = [float(r["deltaP_real"]) for r in fold_rows]
+            dr = [float(r["deltaR_real"]) for r in fold_rows]
+            zps = [float(r["zP"]) for r in fold_rows if np.isfinite(float(r["zP"]))]
+            zrs = [float(r["zR"]) for r in fold_rows if np.isfinite(float(r["zR"]))]
+            n_pos = int(np.sum(np.asarray(dp) > 0.0))
+
+            fpP = fisher_p(pvals_pearson)
+            fpR = fisher_p(pvals_rel)
+
+            verdict = (
+                (float(np.mean(dp)) > 0.0)
+                and (float(np.mean(dr)) < 0.0)
+                and (n_pos >= 7)
+                and (fpP < 0.01)
+            )
+
+            residual_summary_by_w[w] = {
+                "w": int(w),
+                "deltaP_mean": float(np.mean(dp)),
+                "deltaP_std": float(np.std(np.asarray(dp), ddof=1)) if len(dp) > 1 else 0.0,
+                "deltaR_mean": float(np.mean(dr)),
+                "deltaR_std": float(np.std(np.asarray(dr), ddof=1)) if len(dr) > 1 else 0.0,
+                "zP_mean": float(np.mean(zps)) if zps else float("nan"),
+                "zR_mean": float(np.mean(zrs)) if zrs else float("nan"),
+                "fisher_p_P": float(fpP),
+                "fisher_p_R": float(fpR),
+                "n_pos_deltaP": int(n_pos),
+                "n_fields": int(n_fields),
+                "verdict_PASS": bool(verdict),
+                "folds": fold_rows,
+            }
+
+            # Write per-w fold CSV
+            header = list(fold_rows[0].keys()) if fold_rows else []
+            write_csv(paths.run_dir / f"residual_lofo_by_field_w{w}.csv", header, [[r[h] for h in header] for r in fold_rows])
+
+        # Baseline kernel table aggregated by w
+        baseline_summary: dict[int, dict[str, float]] = {}
+        for w in ws:
+            rows_w = [r for r in baseline_rows if int(r["w"]) == int(w)]
+            valsP = [float(r["pearson_mean"]) for r in rows_w]
+            valsR = [float(r["relRMSE_mean"]) for r in rows_w]
+            baseline_summary[w] = {
+                "pearson_mean": float(np.mean(valsP)) if valsP else float("nan"),
+                "pearson_std": float(np.std(np.asarray(valsP), ddof=1)) if len(valsP) > 1 else 0.0,
+                "relRMSE_mean": float(np.mean(valsR)) if valsR else float("nan"),
+                "relRMSE_std": float(np.std(np.asarray(valsR), ddof=1)) if len(valsR) > 1 else 0.0,
+            }
+
+        # Write baseline CSV
+        header = list(baseline_rows[0].keys()) if baseline_rows else []
+        write_csv(paths.run_dir / "baseline_kernel_by_field.csv", header, [[r[h] for h in header] for r in baseline_rows])
+
+        # Summary markdown
+        base_md_rows: list[dict[str, str]] = []
+        for w in ws:
+            b = baseline_summary[w]
+            base_md_rows.append(
+                {
+                    "w": str(int(w)),
+                    "pearson_mean": f"{b['pearson_mean']:.4f} ± {b['pearson_std']:.4f}",
+                    "relRMSE_mean": f"{b['relRMSE_mean']:.4f} ± {b['relRMSE_std']:.4f}",
+                }
+            )
+
+        resid_md_rows: list[dict[str, str]] = []
+        for w in ws:
+            s = residual_summary_by_w[w]
+            resid_md_rows.append(
+                {
+                    "w": str(int(w)),
+                    "ΔPearson(C-B) (resid)": f"{s['deltaP_mean']:.4f} ± {s['deltaP_std']:.4f}",
+                    "ΔrelRMSE(C-B) (resid)": f"{s['deltaR_mean']:.4f} ± {s['deltaR_std']:.4f}",
+                    "zP_mean": fmt(float(s["zP_mean"])),
+                    "Fisher p (Pearson)": fmt(float(s["fisher_p_P"])),
+                    "#folds ΔPearson>0": f"{int(s['n_pos_deltaP'])}/{int(s['n_fields'])}",
+                    "verdict": "PASS" if bool(s["verdict_PASS"]) else "FAIL",
+                }
+            )
+
+        summary_md = (
+            "# E19 — Kernel sufficiency + topo-on-residual (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- impulse_run_dir: `{impulse_run_dir}`\n"
+            f"- ws: {ws}\n"
+            f"- topo_mode: `{topo_mode}` quantiles_b0={quantiles_b0}\n"
+            f"- ridge_alpha: {ridge_alpha}  n_perms: {n_perms}  placebo_shuffle_test: {shuffle_test}\n\n"
+            "## A) Baseline kernel (truncated impulse) performance on g_high\n"
+            + md_table(base_md_rows, ["w", "pearson_mean", "relRMSE_mean"])
+            + "\n\n"
+            "## B) LOFO residual: Δ(C-B) on residual (gx_resid,gy_resid)\n"
+            + md_table(
+                resid_md_rows,
+                ["w", "ΔPearson(C-B) (resid)", "ΔrelRMSE(C-B) (resid)", "zP_mean", "Fisher p (Pearson)", "#folds ΔPearson>0", "verdict"],
+            )
+            + "\n"
+        )
+        (paths.run_dir / "summary_e19_kernel_sufficiency.md").write_text(summary_md, encoding="utf-8")
+
+        metrics = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "k0_frac": k0_frac,
+            "n_fields": n_fields,
+            "patches_per_field": patches_per_field,
+            "ws": ws,
+            "impulse_run_dir": str(impulse_run_dir),
+            "topo_mode": topo_mode,
+            "quantiles_b0": quantiles_b0,
+            "ridge_alpha": ridge_alpha,
+            "n_perms": n_perms,
+            "placebo_shuffle_test": shuffle_test,
+            "baseline_by_field": baseline_rows,
+            "baseline_summary": baseline_summary,
+            "residual_summary_by_w": residual_summary_by_w,
+        }
+        write_json(paths.metrics_json, metrics)
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
