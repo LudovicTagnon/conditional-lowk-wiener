@@ -5005,6 +5005,483 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e21b":
+        # Injection power study (scalar detection): inject topo signal into gx only, test detectability after pixels baseline.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import stats
+        from sklearn.linear_model import SGDRegressor
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        ws = [int(x) for x in cfg.get("ws", [17, 33])]
+        eps_list = [float(x) for x in cfg.get("eps_list", [0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2])]
+
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        quantiles_b0 = [float(x) for x in cfg.get("quantiles_b0", [0.6, 0.7, 0.8, 0.9])]
+        n_perms = int(cfg.get("n_perms", 200))
+
+        pixel_epochs = int(cfg.get("pixel_epochs", 2))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 4096))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if not (0.0 < k0_frac < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if any(w <= 0 or (w % 2) == 0 for w in ws):
+            raise ValueError("ws must be odd positive window sizes")
+        if any((q <= 0.0) or (q >= 1.0) for q in quantiles_b0):
+            raise ValueError("quantiles_b0 must be in (0,1)")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if not eps_list:
+            raise ValueError("eps_list must be non-empty")
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r in rows:
+                out.append("| " + " | ".join(r.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def rmse_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            return float(np.sqrt(np.mean((a - b) ** 2)))
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            sd = float(np.std(y_true))
+            return float(rmse_1d(y_true, y_pred) / sd) if sd > 0 else float("nan")
+
+        def fit_pixel_model(train_fields: list[int], Xpix_by_field: list[np.ndarray], y_by_field: list[np.ndarray], *, rng_perm: np.random.Generator) -> tuple[SGDRegressor, SGDRegressor]:
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 1,
+            )
+            for _epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    X = Xpix_by_field[fid]
+                    y = y_by_field[fid]
+                    perm = rng_perm.permutation(X.shape[0])
+                    for start in range(0, X.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        Xb = X[idx]
+                        reg_gx.partial_fit(Xb, y[idx, 0])
+                        reg_gy.partial_fit(Xb, y[idx, 1])
+            return reg_gx, reg_gy
+
+        def predict_pixel(reg_gx: SGDRegressor, reg_gy: SGDRegressor, X: np.ndarray) -> np.ndarray:
+            X = np.asarray(X)
+            y_pred = np.empty((X.shape[0], 2), dtype=np.float64)
+            for start in range(0, X.shape[0], pixel_batch_size):
+                sl = slice(start, min(X.shape[0], start + pixel_batch_size))
+                y_pred[sl, 0] = reg_gx.predict(X[sl])
+                y_pred[sl, 1] = reg_gy.predict(X[sl])
+            return y_pred
+
+        # Field generation (rho_high z-scored per field; target g_high from same split).
+        rho_high_by_field: list[np.ndarray] = []
+        gx_by_field: list[np.ndarray] = []
+        gy_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+            rho_high = _zscore_field(split.rho_high)
+            rho_high_by_field.append(np.asarray(rho_high, dtype=np.float64))
+            gx_by_field.append(np.asarray(split.high.gx, dtype=np.float64))
+            gy_by_field.append(np.asarray(split.high.gy, dtype=np.float64))
+
+        results_by_w: dict[int, Any] = {}
+
+        for w in ws:
+            ps = _require_odd("w", w)
+            r = ps // 2
+
+            Xpix_by_field: list[np.ndarray] = []
+            B_by_field: list[np.ndarray] = []
+            Tmulti_by_field: list[np.ndarray] = []
+            t_scalar_by_field: list[np.ndarray] = []
+            y_by_field: list[np.ndarray] = []
+            tz_by_field: list[np.ndarray] = []
+            topo_names: list[str] | None = None
+
+            for field_id in range(n_fields):
+                field = rho_high_by_field[field_id]
+                gx = gx_by_field[field_id]
+                gy = gy_by_field[field_id]
+
+                thr = [float(np.quantile(field.reshape(-1), q)) for q in quantiles_b0]
+                rng_samp = np.random.default_rng(seed + 10_000 * field_id + 17 * ps)
+                feats, y, centers = _sample_features_2d_fast_topo(
+                    field=field,
+                    gx=gx,
+                    gy=gy,
+                    n_patches=patches_per_field,
+                    patch_size=ps,
+                    topo_mode="quantile_per_field",
+                    topo_thresholds=thr,
+                    thresholds_pos_sigma=None,
+                    thresholds_neg_sigma=None,
+                    rng=rng_samp,
+                )
+                y = np.asarray(y, dtype=np.float64)
+                assert y.shape == (patches_per_field, 2)
+
+                cx = centers[:, 0].astype(np.int64)
+                cy = centers[:, 1].astype(np.int64)
+                win = sliding_window_view(field, (ps, ps))
+                Xpix = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
+
+                B_names = ["mass", "mass2", "var", "max", "grad_energy"]
+                B = np.column_stack([np.asarray(feats[n], dtype=np.float64) for n in B_names])
+
+                tnames = sorted([k for k in feats.keys() if k.startswith("b0_")])
+                if topo_names is None:
+                    topo_names = tnames
+                elif topo_names != tnames:
+                    raise RuntimeError(f"Topo feature names mismatch across fields: {topo_names} vs {tnames}")
+                Tmulti = np.column_stack([np.asarray(feats[n], dtype=np.float64) for n in topo_names])
+                t_scalar = np.mean(Tmulti, axis=1).astype(np.float64, copy=False)
+
+                Xpix_by_field.append(Xpix)
+                B_by_field.append(B)
+                Tmulti_by_field.append(Tmulti)
+                t_scalar_by_field.append(t_scalar)
+                y_by_field.append(y)
+
+            if topo_names is None:
+                raise RuntimeError("No topo features found")
+
+            # Global scaling for injection: s = std(gx_high) over all samples.
+            gx_all = np.concatenate([y[:, 0] for y in y_by_field], axis=0)
+            s_scale = float(np.std(gx_all))
+
+            # Global tz for scalar topo t.
+            t_all = np.concatenate(t_scalar_by_field, axis=0)
+            t_mu = float(np.mean(t_all))
+            t_sd = float(np.std(t_all))
+            if t_sd <= 0:
+                t_sd = 1.0
+            tz_by_field = [(t - t_mu) / t_sd for t in t_scalar_by_field]
+
+            # Fold cache for residual models (features only; reused across eps).
+            fold_cache: dict[int, dict[str, Any]] = {}
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                Btr = np.concatenate([B_by_field[i] for i in train_fields], axis=0)
+                Ttr = np.concatenate([Tmulti_by_field[i] for i in train_fields], axis=0)
+                Bte = B_by_field[test_field]
+                Tte = Tmulti_by_field[test_field]
+
+                B_mu = Btr.mean(axis=0)
+                B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                T_mu = Ttr.mean(axis=0)
+                T_sd = np.where(Ttr.std(axis=0) > 0, Ttr.std(axis=0), 1.0)
+                Btr_s = (Btr - B_mu) / B_sd
+                Bte_s = (Bte - B_mu) / B_sd
+                Ttr_s = (Ttr - T_mu) / T_sd
+                Tte_s = (Tte - T_mu) / T_sd
+
+                A = Btr_s.T @ Btr_s
+                Cmat = Ttr_s.T @ Ttr_s
+                D_real = Btr_s.T @ Ttr_s
+                XtX_C = np.block([[A, D_real], [D_real.T, Cmat]])
+
+                perms = [rng_placebo.permutation(Ttr_s.shape[0]) for _ in range(n_perms)]
+                D_perms = np.stack([Btr_s.T @ Ttr_s[p] for p in perms], axis=0)
+
+                fold_cache[test_field] = {
+                    "train_fields": train_fields,
+                    "Btr_s": Btr_s,
+                    "Bte_s": Bte_s,
+                    "Ttr_s": Ttr_s,
+                    "Tte_s": Tte_s,
+                    "A": A,
+                    "Cmat": Cmat,
+                    "XtX_C": XtX_C,
+                    "perms": perms,
+                    "D_perms": D_perms,
+                }
+
+            eps_rows: list[dict[str, Any]] = []
+
+            for eps in eps_list:
+                # Build injected targets per field (gx only).
+                y_total_by_field: list[np.ndarray] = []
+                for fid in range(n_fields):
+                    y = y_by_field[fid]
+                    tz = tz_by_field[fid]
+                    y_total = y.copy()
+                    y_total[:, 0] = y_total[:, 0] + float(eps) * float(s_scale) * tz
+                    y_total_by_field.append(y_total)
+
+                fold_rows: list[dict[str, Any]] = []
+                pvals_pearson: list[float] = []
+                corr_tz_r_test: list[float] = []
+
+                for test_field in range(n_fields):
+                    cache = fold_cache[test_field]
+                    train_fields = cache["train_fields"]
+
+                    reg_gx, reg_gy = fit_pixel_model(train_fields, Xpix_by_field, y_total_by_field, rng_perm=rng_placebo)
+                    ypred_te = predict_pixel(reg_gx, reg_gy, Xpix_by_field[test_field])
+
+                    # scalar residual on test (gx channel)
+                    gx_te = y_total_by_field[test_field][:, 0]
+                    gx_pred_te = ypred_te[:, 0]
+                    r_te = gx_te - gx_pred_te
+                    corr_tz_r_test.append(safe_corr_1d(tz_by_field[test_field], r_te))
+
+                    # build train residual targets (gx only)
+                    r_tr_list: list[np.ndarray] = []
+                    for fid in train_fields:
+                        ypred_tr = predict_pixel(reg_gx, reg_gy, Xpix_by_field[fid])
+                        r_tr_list.append(y_total_by_field[fid][:, 0] - ypred_tr[:, 0])
+                    r_tr = np.concatenate(r_tr_list, axis=0)
+
+                    Btr_s = cache["Btr_s"]
+                    Bte_s = cache["Bte_s"]
+                    Ttr_s = cache["Ttr_s"]
+                    Tte_s = cache["Tte_s"]
+
+                    r_mu = float(np.mean(r_tr))
+                    rc = r_tr - r_mu
+
+                    # Fit B_resid (scalar)
+                    A = cache["A"]
+                    uB = Btr_s.T @ rc.reshape(-1, 1)
+                    wB = np.linalg.solve(A + ridge_alpha * np.eye(A.shape[0]), uB).reshape(-1)
+                    rB_te = Bte_s @ wB + r_mu
+                    pB = safe_corr_1d(r_te, rB_te)
+                    rrB = relrmse_1d(r_te, rB_te)
+
+                    # Fit C_resid (real)
+                    XtX_C = cache["XtX_C"]
+                    v_real = Ttr_s.T @ rc.reshape(-1, 1)
+                    Xty_C = np.vstack([uB, v_real])
+                    wC = np.linalg.solve(XtX_C + ridge_alpha * np.eye(XtX_C.shape[0]), Xty_C).reshape(-1)
+                    XteC = np.concatenate([Bte_s, Tte_s], axis=1)
+                    rC_te = XteC @ wC + r_mu
+                    pC = safe_corr_1d(r_te, rC_te)
+                    rrC = relrmse_1d(r_te, rC_te)
+
+                    deltaP_real = float(pC - pB)
+                    deltaR_real = float(rrC - rrB)
+
+                    # Permutation null on ΔPearson
+                    perms = cache["perms"]
+                    D_perms = cache["D_perms"]
+                    Cmat = cache["Cmat"]
+                    null_dP: list[float] = []
+                    for pi in range(n_perms):
+                        pidx = perms[pi]
+                        D = D_perms[pi]
+                        v = Ttr_s[pidx].T @ rc.reshape(-1, 1)
+                        XtX = np.block([[A, D], [D.T, Cmat]])
+                        Xty = np.vstack([uB, v])
+                        wP = np.linalg.solve(XtX + ridge_alpha * np.eye(XtX.shape[0]), Xty).reshape(-1)
+                        rP_te = XteC @ wP + r_mu
+                        pP = safe_corr_1d(r_te, rP_te)
+                        null_dP.append(float(pP - pB))
+
+                    null = np.asarray(null_dP, dtype=np.float64)
+                    null_mu = float(null.mean())
+                    null_sd = float(null.std(ddof=1)) if len(null) > 1 else 0.0
+                    zP = float((deltaP_real - null_mu) / null_sd) if null_sd > 0 else float("nan")
+                    p_emp = float(np.mean(null >= deltaP_real))
+                    pvals_pearson.append(p_emp)
+
+                    fold_rows.append(
+                        {
+                            "w": int(w),
+                            "eps": float(eps),
+                            "field_id": int(test_field),
+                            "deltaP_real": float(deltaP_real),
+                            "deltaR_real": float(deltaR_real),
+                            "zP": float(zP),
+                            "p_emp_P": float(p_emp),
+                            "corr_tz_r_test": float(corr_tz_r_test[-1]),
+                        }
+                    )
+
+                dp = np.asarray([r["deltaP_real"] for r in fold_rows], dtype=np.float64)
+                dr = np.asarray([r["deltaR_real"] for r in fold_rows], dtype=np.float64)
+                n_pos = int(np.sum(dp > 0.0))
+                fp = fisher_p(pvals_pearson)
+
+                corr_tr = np.asarray(corr_tz_r_test, dtype=np.float64)
+                verdict = (float(fp) < 0.05) and (float(dr.mean()) < 0.0) and (n_pos >= 7)
+
+                eps_rows.append(
+                    {
+                        "w": int(w),
+                        "eps": float(eps),
+                        "deltaP_mean": float(dp.mean()),
+                        "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                        "deltaR_mean": float(dr.mean()),
+                        "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                        "fisher_p_P": float(fp),
+                        "n_pos_deltaP": int(n_pos),
+                        "corr_tz_r_test_mean": float(np.mean(corr_tr)),
+                        "corr_tz_r_test_std": float(np.std(corr_tr, ddof=1)) if len(corr_tr) > 1 else 0.0,
+                        "verdict_PASS": bool(verdict),
+                        "folds": fold_rows,
+                    }
+                )
+
+                header = list(fold_rows[0].keys()) if fold_rows else []
+                tag = f"w{w}_eps{str(eps).replace('.','p')}"
+                write_csv(paths.run_dir / f"lofo_by_field_{tag}.csv", header, [[r[h] for h in header] for r in fold_rows])
+
+            det = [r for r in eps_rows if bool(r["verdict_PASS"])]
+            eps_det = float(min((r["eps"] for r in det), default=float("nan")))
+
+            results_by_w[w] = {
+                "w": int(w),
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "pixel": {
+                    "solver": "sgd_l2",
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "residual": {"ridge_alpha": ridge_alpha, "quantiles_b0": quantiles_b0, "n_perms": n_perms},
+                "topo_names": topo_names,
+                "t_scalar": {"mean": t_mu, "std": t_sd},
+                "s_scale_std_gx": s_scale,
+                "eps_rows": eps_rows,
+                "eps_detection_threshold": eps_det,
+            }
+
+            del Xpix_by_field, B_by_field, Tmulti_by_field, t_scalar_by_field, y_by_field, tz_by_field, fold_cache
+
+        # Summary markdown
+        md_parts: list[str] = []
+        md_parts.append("# E21b — Injection power study (scalar gx) (LOFO)\n")
+        md_parts.append(f"- run: `{paths.run_dir}`")
+        md_parts.append(f"- grid_size={grid_size}, alpha={alpha}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}")
+        md_parts.append(f"- eps_list={eps_list}")
+        md_parts.append("")
+
+        for w in ws:
+            res = results_by_w[w]
+            md_parts.append(f"## w={w}")
+            md_parts.append(f"- detection threshold (smallest ε that PASS): `{fmt(float(res['eps_detection_threshold']))}`")
+            md_parts.append("")
+            rows = []
+            for r0 in res["eps_rows"]:
+                rows.append(
+                    {
+                        "ε": fmt(float(r0["eps"])),
+                        "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                        "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                        "Fisher p": fmt(float(r0["fisher_p_P"])),
+                        "#folds ΔP>0": f"{int(r0['n_pos_deltaP'])}/{n_fields}",
+                        "corr(tz,r)_test": f"{float(r0['corr_tz_r_test_mean']):.4f} ± {float(r0['corr_tz_r_test_std']):.4f}",
+                        "PASS": "PASS" if bool(r0["verdict_PASS"]) else "FAIL",
+                    }
+                )
+            md_parts.append(
+                md_table(
+                    rows,
+                    ["ε", "ΔPearson mean±std", "ΔrelRMSE mean±std", "Fisher p", "#folds ΔP>0", "corr(tz,r)_test", "PASS"],
+                )
+            )
+            md_parts.append("")
+
+        summary_md = "\n".join(md_parts) + "\n"
+        (paths.run_dir / "summary_e21b_injection_scalar_power.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "ws": ws,
+                "eps_list": eps_list,
+                "pixel": {
+                    "solver": "sgd_l2",
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "residual": {"ridge_alpha": ridge_alpha, "quantiles_b0": quantiles_b0, "n_perms": n_perms},
+                "results_by_w": results_by_w,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
