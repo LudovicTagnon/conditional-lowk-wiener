@@ -2190,7 +2190,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             def plot_grid(mat: np.ndarray, title: str, fname: str) -> None:
                 plt.figure(figsize=(6, 3))
                 plt.imshow(mat, aspect="auto", cmap="viridis")
-                plt.xticks(range(len(ks)), [f\"{k:.2f}\" for k in ks])
+                plt.xticks(range(len(ks)), [f"{k:.2f}" for k in ks])
                 plt.yticks(range(len(ws)), [str(w) for w in ws])
                 plt.xlabel("k0_frac")
                 plt.ylabel("w")
