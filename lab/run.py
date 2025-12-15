@@ -1986,8 +1986,15 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                     field_pix = _zscore_field(field_pix)
                     field_b = _zscore_field(field_b)
 
-                    gx = split.high.gx
-                    gy = split.high.gy
+                    target_field = str(cfg.get("target_field", "high")).lower()
+                    if target_field == "high":
+                        gx = split.high.gx
+                        gy = split.high.gy
+                    elif target_field == "full":
+                        gx = split.full.gx
+                        gy = split.full.gy
+                    else:
+                        raise ValueError("target_field must be high or full")
                     yfield = np.stack([gx, gy], axis=2)
 
                     if any(s < ps for s in field_pix.shape):
@@ -2203,6 +2210,304 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             plot_grid(pear, "mean Pearson agg (P)", "heatmap_pearson.png")
             plot_grid(rel, "mean relRMSE agg (P)", "heatmap_relRMSE.png")
 
+        write_json(paths.metrics_json, metrics)
+        return paths
+
+    if experiment == "e15":
+        # Compare learned linear kernel to theoretical impulse-response kernel for bandpassed operator.
+        import matplotlib.pyplot as plt
+        from numpy.lib.stride_tricks import sliding_window_view
+        from sklearn.linear_model import SGDRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+
+        grid_size = int(cfg.get("grid_size", 128))
+        alpha = float(cfg.get("alpha", 2.0))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 20_000))
+        ps = _require_odd("window_size", int(cfg.get("window_size", patch_size)))
+        r = ps // 2
+        pixel_field = str(cfg.get("pixel_field", "rho_high")).lower()  # rho|rho_high
+        sgd_alpha = float(cfg.get("sgd_alpha", 1e-4))
+        sgd_max_iter = int(cfg.get("sgd_max_iter", 10))
+
+        # theoretical kernel via delta impulse in rho (within [0,1])
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c = grid_size // 2
+        rho_delta[c, c] = 1.0
+        split_th = band_split_poisson_2d(rho_delta, k0_frac=k0_frac)
+        rho_high_th = split_th.rho_high
+        gx_high_th = split_th.high.gx
+        gy_high_th = split_th.high.gy
+        # kernel coeff at offset = response at -offset => flip both axes
+        Kth_gx = gx_high_th[c - r : c + r + 1, c - r : c + r + 1][::-1, ::-1]
+        Kth_gy = gy_high_th[c - r : c + r + 1, c - r : c + r + 1][::-1, ::-1]
+
+        # train per-fold and compare
+        per_fold: list[dict[str, Any]] = []
+        learned_gx: list[np.ndarray] = []
+        learned_gy: list[np.ndarray] = []
+
+        def corr(a: np.ndarray, b: np.ndarray) -> float:
+            a = a.reshape(-1).astype(np.float64)
+            b = b.reshape(-1).astype(np.float64)
+            a = a - a.mean()
+            b = b - b.mean()
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+            return float((a @ b) / denom)
+
+        # per-field cached data
+        X_by_field: list[np.ndarray] = []
+        y_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+            if pixel_field == "rho":
+                field = rho01
+            elif pixel_field == "rho_high":
+                field = split.rho_high
+            else:
+                raise ValueError("pixel_field must be rho or rho_high")
+
+            win = sliding_window_view(field, (ps, ps))
+            cx = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+            cy = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+            X = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
+            y = np.column_stack([split.high.gx[cx, cy], split.high.gy[cx, cy]]).astype(np.float64, copy=False)
+            X_by_field.append(X)
+            y_by_field.append(y)
+
+        for test_field in range(n_fields):
+            train_fields = [i for i in range(n_fields) if i != test_field]
+            Xtr = np.concatenate([X_by_field[i] for i in train_fields], axis=0)
+            ytr = np.concatenate([y_by_field[i] for i in train_fields], axis=0)
+            Xte = X_by_field[test_field]
+            yte = y_by_field[test_field]
+
+            base = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(sgd_alpha),
+                max_iter=int(sgd_max_iter),
+                tol=1e-3,
+                random_state=int(placebo_seed),
+            )
+            model = MultiOutputRegressor(base)
+            model.fit(Xtr, ytr)
+
+            coef_gx = np.asarray(model.estimators_[0].coef_, dtype=np.float64).reshape(ps, ps)
+            coef_gy = np.asarray(model.estimators_[1].coef_, dtype=np.float64).reshape(ps, ps)
+            learned_gx.append(coef_gx)
+            learned_gy.append(coef_gy)
+
+            corr_gx = corr(coef_gx, Kth_gx)
+            corr_gy = corr(coef_gy, Kth_gy)
+            rel_l2_gx = float(np.linalg.norm(coef_gx - Kth_gx) / (np.linalg.norm(Kth_gx) + 1e-12))
+            rel_l2_gy = float(np.linalg.norm(coef_gy - Kth_gy) / (np.linalg.norm(Kth_gy) + 1e-12))
+
+            gx_antisym_x = corr(coef_gx, -coef_gx[::-1, :])
+            gy_antisym_y = corr(coef_gy, -coef_gy[:, ::-1])
+
+            per_fold.append(
+                {
+                    "field_id": int(test_field),
+                    "corr_gx": corr_gx,
+                    "corr_gy": corr_gy,
+                    "relL2_gx": rel_l2_gx,
+                    "relL2_gy": rel_l2_gy,
+                    "gx_antisym_x_corr": gx_antisym_x,
+                    "gy_antisym_y_corr": gy_antisym_y,
+                }
+            )
+
+        Kgx = np.mean(np.stack(learned_gx, axis=0), axis=0)
+        Kgy = np.mean(np.stack(learned_gy, axis=0), axis=0)
+
+        # Save weights
+        np.save(paths.run_dir / "kernel_theoretical_gx.npy", Kth_gx)
+        np.save(paths.run_dir / "kernel_theoretical_gy.npy", Kth_gy)
+        np.save(paths.run_dir / "kernel_learned_gx.npy", Kgx)
+        np.save(paths.run_dir / "kernel_learned_gy.npy", Kgy)
+
+        def save_triplet(th: np.ndarray, le: np.ndarray, name: str) -> None:
+            vmax = float(np.max(np.abs(th))) + 1e-12
+            plt.figure(figsize=(9, 3))
+            plt.subplot(1, 3, 1)
+            plt.imshow(th, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title("theory")
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 2)
+            plt.imshow(le, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            plt.title("learned")
+            plt.colorbar(fraction=0.046)
+            plt.subplot(1, 3, 3)
+            plt.imshow(le - th, cmap="coolwarm")
+            plt.title("diff")
+            plt.colorbar(fraction=0.046)
+            plt.tight_layout()
+            plt.savefig(paths.run_dir / name, dpi=150)
+            plt.close()
+
+        save_triplet(Kth_gx, Kgx, "kernel_compare_gx.png")
+        save_triplet(Kth_gy, Kgy, "kernel_compare_gy.png")
+
+        header = list(per_fold[0].keys()) if per_fold else []
+        write_csv(paths.run_dir / "kernel_compare_by_field.csv", header, [[r[h] for h in header] for r in per_fold])
+
+        metrics = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "k0_frac": k0_frac,
+            "window_size": ps,
+            "pixel_field": pixel_field,
+            "n_fields": n_fields,
+            "patches_per_field": patches_per_field,
+            "sgd_alpha": sgd_alpha,
+            "sgd_max_iter": sgd_max_iter,
+            "per_field": per_fold,
+            "agg": {
+                "corr_gx_mean": float(np.mean([r["corr_gx"] for r in per_fold])),
+                "corr_gy_mean": float(np.mean([r["corr_gy"] for r in per_fold])),
+                "relL2_gx_mean": float(np.mean([r["relL2_gx"] for r in per_fold])),
+                "relL2_gy_mean": float(np.mean([r["relL2_gy"] for r in per_fold])),
+            },
+        }
+        write_json(paths.metrics_json, metrics)
+        return paths
+
+    if experiment == "e16":
+        # LOFO pixels-only on full gx/gy (no bandpass target) to probe non-locality.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from sklearn.linear_model import SGDRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 128))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 5_000))
+        if n_fields <= 1:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+
+        w_list = [int(x) for x in cfg.get("w_list", [17, 33])]
+        k0_frac = float(cfg.get("k0_frac", 0.15))  # used only to compute split/full consistently
+        pixel_field = str(cfg.get("pixel_field", "rho")).lower()
+        sgd_alpha = float(cfg.get("sgd_alpha", 1e-4))
+        sgd_max_iter = int(cfg.get("sgd_max_iter", 10))
+
+        from .models import rmse, safe_pearson
+
+        def vec_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
+            pears = []
+            rels = []
+            for i in range(2):
+                yt = y_true[:, i]
+                yp = y_pred[:, i]
+                pears.append(float(safe_pearson(yt, yp)))
+                rm = float(rmse(yt, yp))
+                std = float(np.std(yt))
+                rels.append(float(rm / std) if std > 0 else float("nan"))
+            return float(np.mean(pears)), float(np.mean(rels))
+
+        rows: list[dict[str, Any]] = []
+        for w in w_list:
+            ps = _require_odd("window_size", w)
+            r = ps // 2
+            X_by_field: list[np.ndarray] = []
+            y_by_field: list[np.ndarray] = []
+            for field_id in range(n_fields):
+                rng_field = np.random.default_rng(seed + field_id)
+                rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+                split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+                field = rho01 if pixel_field == "rho" else split.rho_high
+                field = _zscore_field(field)
+                win = sliding_window_view(field, (ps, ps))
+                cx = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+                cy = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+                X = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
+                y = np.column_stack([split.full.gx[cx, cy], split.full.gy[cx, cy]]).astype(np.float64, copy=False)
+                X_by_field.append(X)
+                y_by_field.append(y)
+
+            fold_pears = []
+            fold_rels = []
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                Xtr = np.concatenate([X_by_field[i] for i in train_fields], axis=0)
+                ytr = np.concatenate([y_by_field[i] for i in train_fields], axis=0)
+                Xte = X_by_field[test_field]
+                yte = y_by_field[test_field]
+                base = SGDRegressor(
+                    loss="squared_error",
+                    penalty="l2",
+                    alpha=float(sgd_alpha),
+                    max_iter=int(sgd_max_iter),
+                    tol=1e-3,
+                    random_state=int(placebo_seed),
+                )
+                model = MultiOutputRegressor(base)
+                model.fit(Xtr, ytr)
+                ypred = model.predict(Xte)
+                p, rrm = vec_metrics(yte, ypred)
+                fold_pears.append(p)
+                fold_rels.append(rrm)
+
+            rows.append(
+                {
+                    "w": int(ps),
+                    "k0_frac": float(k0_frac),
+                    "pixel_field": pixel_field,
+                    "pearson_mean": float(np.mean(fold_pears)),
+                    "pearson_std": float(np.std(fold_pears, ddof=1)),
+                    "relRMSE_mean": float(np.mean(fold_rels)),
+                    "relRMSE_std": float(np.std(fold_rels, ddof=1)),
+                }
+            )
+
+        header = list(rows[0].keys()) if rows else []
+        write_csv(paths.run_dir / "fullg_sweep.csv", header, [[r[h] for h in header] for r in rows])
+
+        # simple plot
+        ws = [r["w"] for r in rows]
+        pears = [r["pearson_mean"] for r in rows]
+        rels = [r["relRMSE_mean"] for r in rows]
+        plt.figure(figsize=(8, 3))
+        plt.subplot(1, 2, 1)
+        plt.plot(ws, pears, marker="o")
+        plt.xlabel("w")
+        plt.ylabel("mean Pearson")
+        plt.title("full gx/gy (LOFO)")
+        plt.grid(True, alpha=0.3)
+        plt.subplot(1, 2, 2)
+        plt.plot(ws, rels, marker="o")
+        plt.xlabel("w")
+        plt.ylabel("mean relRMSE")
+        plt.title("full gx/gy (LOFO)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(paths.run_dir / "fullg_locality.png", dpi=150)
+        plt.close()
+
+        metrics = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "n_fields": n_fields,
+            "patches_per_field": patches_per_field,
+            "k0_frac": k0_frac,
+            "pixel_field": pixel_field,
+            "sgd_alpha": sgd_alpha,
+            "sgd_max_iter": sgd_max_iter,
+            "rows": rows,
+        }
         write_json(paths.metrics_json, metrics)
         return paths
 

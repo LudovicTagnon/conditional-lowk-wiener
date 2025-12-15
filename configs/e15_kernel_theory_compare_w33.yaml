@@ -1,0 +1,16 @@
+experiment: e15
+exp_name: e15_kernel_theory_compare_w33
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+k0_frac: 0.15
+
+n_fields: 10
+patches_per_field: 20000
+window_size: 33
+
+pixel_field: rho_high
+sgd_alpha: 1.0e-4
+sgd_max_iter: 10
+

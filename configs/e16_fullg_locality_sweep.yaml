@@ -1,0 +1,17 @@
+experiment: e16
+exp_name: e16_fullg_locality_sweep
+seed: 123
+
+grid_size: 128
+alpha: 2.0
+
+n_fields: 10
+patches_per_field: 5000
+
+w_list: [17, 33, 65]
+k0_frac: 0.15
+
+pixel_field: rho
+sgd_alpha: 1.0e-4
+sgd_max_iter: 10
+
