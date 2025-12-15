@@ -2509,8 +2509,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
 
     if experiment == "e15b":
         # Kernel diagnostics: scale/shift correction + ridge_alpha sweep vs theory.
-        from sklearn.linear_model import Ridge
-        from sklearn.preprocessing import StandardScaler
+        from sklearn.linear_model import SGDRegressor
 
         run_dirs = [Path(p) for p in cfg.get("kernel_run_dirs", [])]
         if not run_dirs:
@@ -2592,6 +2591,10 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         n_fields = int(cfg.get("n_fields", 10))
         patches_per_field = int(cfg.get("patches_per_field", 20_000))
         ridge_alphas = [float(x) for x in cfg.get("ridge_alphas", [1e-6, 1e-4, 1e-2, 1.0, 1e2])]
+        sgd_epochs = int(cfg.get("sgd_epochs", 3))
+        batch_size = int(cfg.get("batch_size", 4096))
+        eta0 = float(cfg.get("sgd_eta0", 0.01))
+        power_t = float(cfg.get("sgd_power_t", 0.25))
 
         # theory kernel for sweep_w
         rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
@@ -2602,36 +2605,69 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         kth_gx = split_th.high.gx[c - r : c + r + 1, c - r : c + r + 1][::-1, ::-1]
         kth_gy = split_th.high.gy[c - r : c + r + 1, c - r : c + r + 1][::-1, ::-1]
 
-        # build training set (all fields)
         from numpy.lib.stride_tricks import sliding_window_view
 
-        Xs: list[np.ndarray] = []
-        Ys: list[np.ndarray] = []
-        for field_id in range(n_fields):
-            rng_field = np.random.default_rng(seed + field_id)
-            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
-            split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
-            field = split.rho_high
-            win = sliding_window_view(field, (sweep_ps, sweep_ps))
-            cx = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
-            cy = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
-            X = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
-            y = np.column_stack([split.high.gx[cx, cy], split.high.gy[cx, cy]]).astype(np.float64, copy=False)
-            Xs.append(X)
-            Ys.append(y)
+        # Train all ridge_alphas in one streamed pass over data (avoids repeating FFT work per alpha).
+        models: dict[float, tuple[SGDRegressor, SGDRegressor]] = {}
+        for i, ra in enumerate(ridge_alphas):
+            # SGDRegressor is a scalable ridge-like learner (L2 penalty).
+            # Note: `alpha` here is SGD's L2 strength; it's not numerically identical to `Ridge(alpha=...)`,
+            # but it is suitable for diagnosing shrinkage vs theory without materializing X_all.
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(ra),
+                learning_rate="invscaling",
+                eta0=float(eta0),
+                power_t=float(power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 10_000 * i + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(ra),
+                learning_rate="invscaling",
+                eta0=float(eta0),
+                power_t=float(power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 10_000 * i + 1,
+            )
+            models[float(ra)] = (reg_gx, reg_gy)
 
-        X_all = np.concatenate(Xs, axis=0)
-        y_all = np.concatenate(Ys, axis=0)
-        scaler = StandardScaler(with_mean=True, with_std=True)
-        Xs_all = scaler.fit_transform(X_all)
+        for epoch in range(sgd_epochs):
+            for field_id in range(n_fields):
+                rng_field = np.random.default_rng(seed + field_id)
+                rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+                split = band_split_poisson_2d(rho01, k0_frac=k0_frac)
+                field = split.rho_high
+                win = sliding_window_view(field, (sweep_ps, sweep_ps))
+                cx = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+                cy = rng.integers(r, grid_size - r, size=patches_per_field, dtype=np.int64)
+                X = win[cx - r, cy - r].reshape(patches_per_field, -1).astype(np.float32, copy=False)
+                y = np.column_stack([split.high.gx[cx, cy], split.high.gy[cx, cy]]).astype(np.float64, copy=False)
+
+                perm = rng_placebo.permutation(patches_per_field)
+                for start in range(0, patches_per_field, batch_size):
+                    idx = perm[start : start + batch_size]
+                    Xb = X[idx]
+                    ygx = y[idx, 0]
+                    ygy = y[idx, 1]
+                    for reg_gx, reg_gy in models.values():
+                        reg_gx.partial_fit(Xb, ygx)
+                        reg_gy.partial_fit(Xb, ygy)
+
+                del X, y, win, cx, cy, split, field, rho01
 
         sweep_rows: list[dict[str, Any]] = []
         for ra in ridge_alphas:
-            model = Ridge(alpha=float(ra), fit_intercept=True, solver="sag", max_iter=2000, random_state=int(placebo_seed))
-            model.fit(Xs_all, y_all)
-            coef = np.asarray(model.coef_, dtype=np.float64)  # (2, p)
-            kgx = coef[0].reshape(sweep_ps, sweep_ps)
-            kgy = coef[1].reshape(sweep_ps, sweep_ps)
+            reg_gx, reg_gy = models[float(ra)]
+            kgx = np.asarray(reg_gx.coef_, dtype=np.float64).reshape(sweep_ps, sweep_ps)
+            kgy = np.asarray(reg_gy.coef_, dtype=np.float64).reshape(sweep_ps, sweep_ps)
             ax, kgx_s = scale_best(kgx, kth_gx)
             ay, kgy_s = scale_best(kgy, kth_gy)
 
@@ -2639,9 +2675,9 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             for dx in (-1, 0, 1):
                 for dy in (-1, 0, 1):
                     x = shift_zero(kgx, dx, dy)
-                    y = shift_zero(kgy, dx, dy)
+                    y_ = shift_zero(kgy, dx, dy)
                     _, xs = scale_best(x, kth_gx)
-                    _, ys = scale_best(y, kth_gy)
+                    _, ys = scale_best(y_, kth_gy)
                     cmean = 0.5 * (corr(xs, kth_gx) + corr(ys, kth_gy))
                     rmean = 0.5 * (rel_l2(xs, kth_gx) + rel_l2(ys, kth_gy))
                     if cmean > best["corr"]:
@@ -2650,6 +2686,10 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             sweep_rows.append(
                 {
                     "ridge_alpha": float(ra),
+                    "sgd_epochs": int(sgd_epochs),
+                    "batch_size": int(batch_size),
+                    "sgd_eta0": float(eta0),
+                    "sgd_power_t": float(power_t),
                     "corr_gx": corr(kgx, kth_gx),
                     "corr_gy": corr(kgy, kth_gy),
                     "relL2_gx": rel_l2(kgx, kth_gx),
@@ -2667,6 +2707,60 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
 
         write_csv(paths.run_dir / "kernel_diag.csv", list(diag_rows[0].keys()), [[r[k] for k in diag_rows[0].keys()] for r in diag_rows])
         write_csv(paths.run_dir / "ridge_sweep.csv", list(sweep_rows[0].keys()), [[r[k] for k in sweep_rows[0].keys()] for r in sweep_rows])
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, Any]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r in rows:
+                out.append("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |")
+            return "\n".join(out)
+
+        diag_md_rows: list[dict[str, str]] = []
+        for r0 in diag_rows:
+            diag_md_rows.append(
+                {
+                    "w": str(r0["w"]),
+                    "corr_mean": fmt(0.5 * (float(r0["corr_gx"]) + float(r0["corr_gy"]))),
+                    "relL2_mean": fmt(0.5 * (float(r0["relL2_gx"]) + float(r0["relL2_gy"]))),
+                    "relL2_scaled_mean": fmt(0.5 * (float(r0["relL2_scaled_gx"]) + float(r0["relL2_scaled_gy"]))),
+                    "bestshift_(dx,dy)": f"({int(r0['bestshift_dx'])},{int(r0['bestshift_dy'])})",
+                    "corr_bestshift_mean": fmt(float(r0["corr_bestshift_mean"])),
+                    "relL2_scaled_bestshift_mean": fmt(float(r0["relL2_scaled_bestshift_mean"])),
+                }
+            )
+
+        sweep_md_rows: list[dict[str, str]] = []
+        for r0 in sweep_rows:
+            sweep_md_rows.append(
+                {
+                    "ridge_alpha": fmt(float(r0["ridge_alpha"])),
+                    "corr_mean": fmt(0.5 * (float(r0["corr_gx"]) + float(r0["corr_gy"]))),
+                    "corr_bestshift_mean": fmt(float(r0["corr_bestshift_mean"])),
+                    "relL2_scaled_mean": fmt(0.5 * (float(r0["relL2_scaled_gx"]) + float(r0["relL2_scaled_gy"]))),
+                    "bestshift_(dx,dy)": f"({int(r0['bestshift_dx'])},{int(r0['bestshift_dy'])})",
+                }
+            )
+
+        summary_md = (
+            f"# Kernel diagnostics (E15b)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- source kernels: {', '.join(f'`{p}`' for p in run_dirs)}\n\n"
+            f"## Direct compare (loaded .npy)\n"
+            f"{md_table(diag_md_rows, ['w','corr_mean','relL2_mean','relL2_scaled_mean','bestshift_(dx,dy)','corr_bestshift_mean','relL2_scaled_bestshift_mean'])}\n\n"
+            f"## Ridge-alpha sweep (SGD L2)\n"
+            f"{md_table(sweep_md_rows, ['ridge_alpha','corr_mean','corr_bestshift_mean','relL2_scaled_mean','bestshift_(dx,dy)'])}\n"
+        )
+        (paths.run_dir / "summary_kernel_diag.md").write_text(summary_md, encoding="utf-8")
+        (paths.run_dir.parent.parent / "summary_kernel_diag.md").write_text(summary_md, encoding="utf-8")
 
         metrics = {
             "experiment": experiment,
@@ -2701,6 +2795,10 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         ridge_alpha_m = float(cfg.get("ridge_alpha", 1.0))
         sgd_alpha = float(cfg.get("sgd_alpha", 1e-4))
         sgd_max_iter = int(cfg.get("sgd_max_iter", 10))
+        pixel_epochs = int(cfg.get("pixel_epochs", 3))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 4096))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
         ridge_max_iter = int(cfg.get("ridge_max_iter", 2000))
 
         ps = _require_odd("window_size", int(cfg.get("window_size", patch_size)))
@@ -2868,6 +2966,51 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 return model.predict(Xte_s)
             raise ValueError("pixel_solver must be sgd or ridge")
 
+        def fit_predict_pixels_stream(train_fields: list[int], test_field: int) -> np.ndarray:
+            if pixel_solver != "sgd":
+                raise ValueError("fit_predict_pixels_stream requires pixel_solver=sgd")
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(sgd_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(sgd_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 1,
+            )
+            for epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    X = Xp_by_field[fid]
+                    y = y_by_field[fid]
+                    perm = rng_placebo.permutation(X.shape[0])
+                    for start in range(0, X.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        Xb = X[idx]
+                        reg_gx.partial_fit(Xb, y[idx, 0])
+                        reg_gy.partial_fit(Xb, y[idx, 1])
+            Xte = Xp_by_field[test_field]
+            y_pred = np.empty((Xte.shape[0], 2), dtype=np.float64)
+            for start in range(0, Xte.shape[0], pixel_batch_size):
+                sl = slice(start, min(Xte.shape[0], start + pixel_batch_size))
+                y_pred[sl, 0] = reg_gx.predict(Xte[sl])
+                y_pred[sl, 1] = reg_gy.predict(Xte[sl])
+            return y_pred
+
         fold_rows: list[dict[str, Any]] = []
         for test_field in range(n_fields):
             train_fields = [i for i in range(n_fields) if i != test_field]
@@ -2904,9 +3047,12 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             }
 
             if include_pixels:
-                Ptr = np.concatenate([Xp_by_field[i] for i in train_fields], axis=0)
-                Pte = Xp_by_field[test_field]
-                yP = fit_predict_pixels(Ptr, ytr, Pte)
+                if pixel_solver == "sgd":
+                    yP = fit_predict_pixels_stream(train_fields, test_field)
+                else:
+                    Ptr = np.concatenate([Xp_by_field[i] for i in train_fields], axis=0)
+                    Pte = Xp_by_field[test_field]
+                    yP = fit_predict_pixels(Ptr, ytr, Pte)
                 mP = vec_metrics(yte, yP)
                 row.update(
                     {
@@ -2916,7 +3062,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                         "deltaR_P_minus_B": float(mP["relRMSE_mean"] - mB["relRMSE_mean"]),
                     }
                 )
-            fold_rows.append(row)
+                fold_rows.append(row)
 
         header = list(fold_rows[0].keys()) if fold_rows else []
         write_csv(paths.run_dir / "lofo_by_field.csv", header, [[r[h] for h in header] for r in fold_rows])
@@ -2939,6 +3085,10 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 "ridge_alpha": ridge_alpha_m,
                 "sgd_alpha": sgd_alpha,
                 "sgd_max_iter": sgd_max_iter,
+                "pixel_epochs": pixel_epochs,
+                "pixel_batch_size": pixel_batch_size,
+                "pixel_eta0": pixel_eta0,
+                "pixel_power_t": pixel_power_t,
                 "lofo_folds": fold_rows,
             },
         )
