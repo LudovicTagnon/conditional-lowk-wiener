@@ -1,0 +1,15 @@
+experiment: e8
+exp_name: e10_lofo_alpha2_w17_quantile_perfield
+seed: 123
+
+grid_size: 64
+alpha: 2.0
+
+n_fields: 10
+patches_per_field: 20000
+window_size: 17
+
+threshold_mode: quantile_per_field
+quantiles_b0: [0.6, 0.7, 0.8, 0.9]
+
+ridge_alpha: 1.0

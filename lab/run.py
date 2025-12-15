@@ -181,12 +181,12 @@ def _compute_b0_thresholds_for_run(cfg: dict[str, Any], field01: np.ndarray) -> 
       - fixed: thresholds_b0=[0.4,0.5,0.6,0.7] -> names t04,t05,t06,t07
       - quantile_global: quantiles_b0=[0.6,0.7,0.8,0.9] -> names q60,q70,q80,q90 (thresholds derived from field)
     """
-    mode = str(cfg.get("threshold_mode", "fixed")).lower()
+    mode = str(cfg.get("topo_threshold_mode", cfg.get("threshold_mode", "fixed"))).lower()
     if mode == "fixed":
         thresholds = [float(x) for x in cfg.get("thresholds_b0", [0.4, 0.5, 0.6, 0.7])]
         names = [f"t{int(round(t * 10)):02d}" for t in thresholds]
         return dict(zip(names, thresholds)), {"threshold_mode": "fixed", "thresholds": thresholds}
-    if mode == "quantile_global":
+    if mode in {"quantile_global", "quantile_per_field"}:
         qs = [float(x) for x in cfg.get("quantiles_b0", [0.6, 0.7, 0.8, 0.9])]
         if any((q <= 0.0) or (q >= 1.0) for q in qs):
             raise ValueError("quantiles_b0 must be in (0,1)")
@@ -197,8 +197,8 @@ def _compute_b0_thresholds_for_run(cfg: dict[str, Any], field01: np.ndarray) -> 
             raise ValueError("field01 must be in [0,1] for quantile_global thresholds")
         thr = [float(np.quantile(field01.reshape(-1), q)) for q in qs]
         names = [f"q{int(round(q * 100)):02d}" for q in qs]
-        return dict(zip(names, thr)), {"threshold_mode": "quantile_global", "quantiles": qs, "thresholds": thr}
-    raise ValueError(f"Unknown threshold_mode: {mode} (expected fixed|quantile_global)")
+        return dict(zip(names, thr)), {"threshold_mode": mode, "quantiles": qs, "thresholds": thr}
+    raise ValueError(f"Unknown threshold_mode: {mode} (expected fixed|quantile_global|quantile_per_field)")
 
 
 def _sample_features_3d_fast(
@@ -857,15 +857,31 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             rho_fields.append(sol.rho)
             g_fields.append(sol.g)
 
-        # thresholds computed once per run from the global field values (all realizations)
-        field_stack = np.concatenate([rf.reshape(-1) for rf in rho_fields], axis=0)
-        topo_thresholds_by_name, topo_thr_meta = _compute_b0_thresholds_for_run(cfg, field01=field_stack)
+        mode = str(cfg.get("topo_threshold_mode", cfg.get("threshold_mode", "fixed"))).lower()
+        topo_thresholds_by_name_global: dict[str, float] | None = None
+        topo_thr_meta_global: dict[str, Any] | None = None
+        per_field_thresholds: dict[int, dict[str, float]] = {}
+        per_field_thresholds_meta: dict[int, dict[str, Any]] = {}
+
+        if mode != "quantile_per_field":
+            # thresholds computed once per run from the global field values (all realizations)
+            field_stack = np.concatenate([rf.reshape(-1) for rf in rho_fields], axis=0)
+            topo_thresholds_by_name_global, topo_thr_meta_global = _compute_b0_thresholds_for_run(cfg, field01=field_stack)
 
         # sample per field
         feats_lists: dict[str, list[np.ndarray]] = {}
         ys: list[np.ndarray] = []
         field_ids: list[np.ndarray] = []
         for field_id in range(n_fields):
+            if mode == "quantile_per_field":
+                topo_thresholds_by_name, topo_thr_meta = _compute_b0_thresholds_for_run(cfg, field01=rho_fields[field_id])
+                per_field_thresholds[field_id] = topo_thresholds_by_name
+                per_field_thresholds_meta[field_id] = topo_thr_meta
+            else:
+                assert topo_thresholds_by_name_global is not None and topo_thr_meta_global is not None
+                topo_thresholds_by_name = topo_thresholds_by_name_global
+                topo_thr_meta = topo_thr_meta_global
+
             feats_f, y_f = _sample_features_3d_fast(
                 rho=rho_fields[field_id],
                 g=g_fields[field_id],
@@ -885,9 +901,12 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         if y.shape[0] != n_patches_total or fid.shape[0] != n_patches_total:
             raise RuntimeError("LOFO dataset size mismatch")
 
+        topo_keys = sorted([k for k in feats.keys() if k.startswith("b0_")])
+        if not topo_keys:
+            raise RuntimeError("No topo features found (expected b0_*)")
+
         keys_B = ["mass", "mass2", "var", "max", "grad_energy"]
         X_B = _build_feature_matrix(feats, keys_B)
-        topo_keys = [f"b0_{n}" for n in topo_thresholds_by_name.keys()]
         X_topo = _build_feature_matrix(feats, topo_keys)
         X_C = np.concatenate([X_B, X_topo], axis=1)
 
@@ -900,6 +919,31 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 X_topo_pl[idx, j] = X_topo_pl[idx[perm], j]
         X_C_pl = np.concatenate([X_B, X_topo_pl], axis=1)
 
+        # inter-field shift stats
+        field_stats: list[dict[str, Any]] = []
+        for field_id in range(n_fields):
+            idx = np.nonzero(fid == field_id)[0]
+            b0_mean = float(np.mean(X_topo[idx].mean(axis=1)))
+            b0_std = float(np.std(X_topo[idx].mean(axis=1)))
+            field_stats.append(
+                {
+                    "field_id": int(field_id),
+                    "n": int(idx.size),
+                    "mass_mean": float(np.mean(feats["mass"][idx])),
+                    "mass_std": float(np.std(feats["mass"][idx])),
+                    "var_mean": float(np.mean(feats["var"][idx])),
+                    "var_std": float(np.std(feats["var"][idx])),
+                    "max_mean": float(np.mean(feats["max"][idx])),
+                    "max_std": float(np.std(feats["max"][idx])),
+                    "grad_energy_mean": float(np.mean(feats["grad_energy"][idx])),
+                    "grad_energy_std": float(np.std(feats["grad_energy"][idx])),
+                    "b0_mean": b0_mean,
+                    "b0_std": b0_std,
+                    "y_mean": float(np.mean(y[idx])),
+                    "y_std": float(np.std(y[idx])),
+                }
+            )
+
         fold_rows: list[dict[str, Any]] = []
         dP_real: list[float] = []
         dR_real: list[float] = []
@@ -910,25 +954,38 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             test_idx = np.nonzero(fid == field_id)[0]
             train_idx = np.nonzero(fid != field_id)[0]
 
-            _, mB, _ = fit_eval_ridge(X_B, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
-            _, mC, _ = fit_eval_ridge(X_C, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
-            _, mCp, _ = fit_eval_ridge(X_C_pl, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
+            yB_test, mB, _ = fit_eval_ridge(X_B, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
+            yC_test, mC, _ = fit_eval_ridge(X_C, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
+            yCp_test, mCp, _ = fit_eval_ridge(X_C_pl, y, train_idx, test_idx, ridge_alpha=ridge_alpha)
 
             dp = float(mC["pearson"] - mB["pearson"])
             dr = float(mC["relRMSE"] - mB["relRMSE"])
             dpp = float(mCp["pearson"] - mB["pearson"])
             drp = float(mCp["relRMSE"] - mB["relRMSE"])
 
+            # direction check: corr(b0_mean, residual_B) on the test field
+            y_test = y[test_idx]
+            resid_B = y_test - yB_test
+            b0_mean_test = X_topo[test_idx].mean(axis=1)
+            from .models import safe_pearson
+
+            corr_b0_resid = float(safe_pearson(b0_mean_test, resid_B))
+
             fold_rows.append(
                 {
                     "field_id": int(field_id),
                     "n_test": int(test_idx.size),
+                    "pearson_B": float(mB["pearson"]),
+                    "relRMSE_B": float(mB["relRMSE"]),
+                    "pearson_C": float(mC["pearson"]),
+                    "relRMSE_C": float(mC["relRMSE"]),
+                    "pearson_C_placebo": float(mCp["pearson"]),
+                    "relRMSE_C_placebo": float(mCp["relRMSE"]),
                     "delta_pearson_real": dp,
                     "delta_relRMSE_real": dr,
                     "delta_pearson_placebo": dpp,
                     "delta_relRMSE_placebo": drp,
-                    "pearson_B": float(mB["pearson"]),
-                    "relRMSE_B": float(mB["relRMSE"]),
+                    "corr_b0mean_residB": corr_b0_resid,
                 }
             )
             dP_real.append(dp)
@@ -962,7 +1019,9 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             "alpha": alpha,
             "ridge_alpha": ridge_alpha,
             "topo_keys": topo_keys,
-            "topo_thresholds": topo_thr_meta,
+            "topo_thresholds": topo_thr_meta_global if topo_thr_meta_global is not None else {"threshold_mode": "quantile_per_field"},
+            "topo_thresholds_per_field": per_field_thresholds_meta,
+            "field_stats": field_stats,
             "lofo_folds": fold_rows,
             "lofo_agg": {
                 "delta_pearson_real_mean": float(dP_real.mean()),
