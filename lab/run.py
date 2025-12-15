@@ -286,6 +286,170 @@ def _sample_features_3d_fast(
     return feats, y
 
 
+def _sample_features_3d_fast_signed_topo(
+    rho: np.ndarray,
+    g: np.ndarray,
+    n_patches: int,
+    patch_size: int,
+    thresholds_pos: list[float],
+    thresholds_neg: list[float],
+    rng: np.random.Generator,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """
+    Like _sample_features_3d_fast, but compute topo features:
+    - b0_pos_tXX = #CC(patch > t) for t in thresholds_pos (including t=0.0)
+    - b0_neg_tXX = #CC(patch < -t) for t in thresholds_neg
+    """
+    from scipy import ndimage
+
+    rho = np.asarray(rho, dtype=np.float64)
+    g = np.asarray(g, dtype=np.float64)
+    assert rho.shape == g.shape
+    assert rho.ndim == 3
+    assert_finite("rho", rho)
+    assert_finite("g", g)
+
+    ps = _require_odd("patch_size", patch_size)
+    r = ps // 2
+    nx, ny, nz = rho.shape
+    if any(s < ps for s in (nx, ny, nz)):
+        raise ValueError(f"grid too small for patch_size={ps}: {rho.shape}")
+
+    cx = rng.integers(r, nx - r, size=n_patches, dtype=np.int64)
+    cy = rng.integers(r, ny - r, size=n_patches, dtype=np.int64)
+    cz = rng.integers(r, nz - r, size=n_patches, dtype=np.int64)
+
+    # Prefix sums for mass and variance
+    pref1 = _prefix_sum_3d(rho)
+    pref2 = _prefix_sum_3d(rho * rho)
+    x0 = (cx - r).astype(np.int64)
+    x1 = (cx + r + 1).astype(np.int64)
+    y0 = (cy - r).astype(np.int64)
+    y1 = (cy + r + 1).astype(np.int64)
+    z0 = (cz - r).astype(np.int64)
+    z1 = (cz + r + 1).astype(np.int64)
+
+    mass = _box_sum_3d(pref1, x0, x1, y0, y1, z0, z1)
+    nvox = float(ps * ps * ps)
+    mean = mass / nvox
+    sumsq = _box_sum_3d(pref2, x0, x1, y0, y1, z0, z1)
+    var = np.maximum(0.0, sumsq / nvox - mean * mean)
+    mass2 = mass * mass
+
+    max_grid = ndimage.maximum_filter(rho, size=ps, mode="constant", cval=-np.inf)
+    mx = max_grid[cx, cy, cz]
+
+    gx, gy, gz = np.gradient(rho)
+    egrid = gx * gx + gy * gy + gz * gz
+    egrid = np.asarray(egrid, dtype=np.float64)
+    eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+    ge = eavg[cx, cy, cz]
+
+    structure = ndimage.generate_binary_structure(3, 1)  # 6-neigh
+    thresholds_pos = [float(t) for t in thresholds_pos]
+    thresholds_neg = [float(t) for t in thresholds_neg]
+    names_pos = [f"t{int(round(t * 10)):02d}" for t in thresholds_pos]
+    names_neg = [f"t{int(round(t * 10)):02d}" for t in thresholds_neg]
+    b0p = np.empty((n_patches, len(names_pos)), dtype=np.float64)
+    b0n = np.empty((n_patches, len(names_neg)), dtype=np.float64)
+    for i in range(n_patches):
+        patch = rho[cx[i] - r : cx[i] + r + 1, cy[i] - r : cy[i] + r + 1, cz[i] - r : cz[i] + r + 1]
+        if patch.shape != (ps, ps, ps):
+            raise RuntimeError(f"bad patch shape at {i}: {patch.shape}")
+        for j, t in enumerate(thresholds_pos):
+            binary = patch > t
+            if not binary.any():
+                b0p[i, j] = 0.0
+            else:
+                _, num = ndimage.label(binary, structure=structure)
+                b0p[i, j] = float(num)
+        for j, t in enumerate(thresholds_neg):
+            binary = patch < (-t)
+            if not binary.any():
+                b0n[i, j] = 0.0
+            else:
+                _, num = ndimage.label(binary, structure=structure)
+                b0n[i, j] = float(num)
+
+    y = g[cx, cy, cz].astype(np.float64, copy=False)
+    assert_finite("y", y)
+
+    feats: dict[str, np.ndarray] = {
+        "mass": mass.astype(np.float64, copy=False),
+        "mass2": mass2.astype(np.float64, copy=False),
+        "var": var.astype(np.float64, copy=False),
+        "max": mx.astype(np.float64, copy=False),
+        "grad_energy": ge.astype(np.float64, copy=False),
+    }
+    for j, n in enumerate(names_pos):
+        feats[f"b0_pos_{n}"] = b0p[:, j]
+    for j, n in enumerate(names_neg):
+        feats[f"b0_neg_{n}"] = b0n[:, j]
+    return feats, y
+
+
+def _zscore_field(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    mu = float(x.mean())
+    sd = float(x.std())
+    if sd <= 0:
+        return x - mu
+    return (x - mu) / sd
+
+
+def _ridge_metrics_from_blocks(
+    B_train: np.ndarray,
+    T_train: np.ndarray | None,
+    y_train: np.ndarray,
+    B_test: np.ndarray,
+    T_test: np.ndarray | None,
+    y_test: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """
+    Closed-form ridge with train-standardization and y centering.
+    If T_* is None: fits only on B.
+    Returns y_pred_test and metrics dict.
+    """
+    from .models import rmse, safe_pearson
+
+    B_train = np.asarray(B_train, dtype=np.float64)
+    y_train = np.asarray(y_train, dtype=np.float64)
+    B_test = np.asarray(B_test, dtype=np.float64)
+    y_test = np.asarray(y_test, dtype=np.float64)
+    if T_train is not None:
+        T_train = np.asarray(T_train, dtype=np.float64)
+        T_test = np.asarray(T_test, dtype=np.float64)
+
+    def standardize(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mu = train.mean(axis=0)
+        sd = train.std(axis=0)
+        sd = np.where(sd > 0, sd, 1.0)
+        return (train - mu) / sd, (test - mu) / sd
+
+    y_mean = float(y_train.mean())
+    yc = y_train - y_mean
+
+    Btr, Bte = standardize(B_train, B_test)
+    if T_train is None:
+        Xtr = Btr
+        Xte = Bte
+    else:
+        Ttr, Tte = standardize(T_train, T_test)
+        Xtr = np.concatenate([Btr, Ttr], axis=1)
+        Xte = np.concatenate([Bte, Tte], axis=1)
+
+    XtX = Xtr.T @ Xtr
+    Xty = Xtr.T @ yc
+    w = np.linalg.solve(XtX + float(alpha) * np.eye(XtX.shape[0]), Xty)
+    y_pred = Xte @ w + y_mean
+    rm = rmse(y_test, y_pred)
+    std_y = float(np.std(y_test))
+    rel = float(rm / std_y) if std_y > 0 else float("nan")
+    metrics = {"pearson": safe_pearson(y_test, y_pred), "rmse": float(rm), "relRMSE": rel}
+    return y_pred, metrics
+
+
 def _sample_patches_2d(
     sigma: np.ndarray,
     g_proj: np.ndarray,
@@ -1044,6 +1208,272 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
+    if experiment == "e11":
+        # LOFO with per-field z-scoring and sigma-threshold topo; permutation-based placebo per fold.
+        grid_size = int(cfg.get("grid_size", 64))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 20_000))
+        n_patches_total = int(n_fields * patches_per_field)
+        if n_fields <= 1:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        P = int(cfg.get("placebo_permutations", 30))
+        if P <= 0:
+            raise ValueError("placebo_permutations must be > 0")
+
+        normalize_y_per_field = bool(cfg.get("normalize_y_per_field", True))
+        thresholds_pos = [float(x) for x in cfg.get("thresholds_pos_sigma", [0.0, 0.5, 1.0, 1.5])]
+        thresholds_neg = [float(x) for x in cfg.get("thresholds_neg_sigma", [0.5, 1.0, 1.5])]
+
+        feats_lists: dict[str, list[np.ndarray]] = {}
+        ys: list[np.ndarray] = []
+        field_ids: list[np.ndarray] = []
+        field_stats: list[dict[str, Any]] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_3d((grid_size, grid_size, grid_size), alpha=alpha, rng=rng_field)
+            rho_z = _zscore_field(rho01)
+            sol = solve_poisson_periodic_fft(rho_z)
+            g = sol.g
+            if normalize_y_per_field:
+                g = _zscore_field(g)
+
+            feats_f, y_f = _sample_features_3d_fast_signed_topo(
+                rho=sol.rho,
+                g=g,
+                n_patches=patches_per_field,
+                patch_size=patch_size,
+                thresholds_pos=thresholds_pos,
+                thresholds_neg=thresholds_neg,
+                rng=rng,
+            )
+            for k, v in feats_f.items():
+                feats_lists.setdefault(k, []).append(np.asarray(v, dtype=np.float64))
+            y_f = np.asarray(y_f, dtype=np.float64)
+            ys.append(y_f)
+            field_ids.append(np.full((patches_per_field,), field_id, dtype=np.int32))
+
+            # quick shift stats
+            b0_cols = [kk for kk in feats_f.keys() if kk.startswith("b0_")]
+            b0_mean = float(np.mean(np.column_stack([feats_f[k] for k in b0_cols]).mean(axis=1))) if b0_cols else float("nan")
+            b0_std = float(np.std(np.column_stack([feats_f[k] for k in b0_cols]).mean(axis=1))) if b0_cols else float("nan")
+            field_stats.append(
+                {
+                    "field_id": int(field_id),
+                    "n": int(patches_per_field),
+                    "mass_mean": float(np.mean(feats_f["mass"])),
+                    "mass_std": float(np.std(feats_f["mass"])),
+                    "var_mean": float(np.mean(feats_f["var"])),
+                    "var_std": float(np.std(feats_f["var"])),
+                    "max_mean": float(np.mean(feats_f["max"])),
+                    "max_std": float(np.std(feats_f["max"])),
+                    "grad_energy_mean": float(np.mean(feats_f["grad_energy"])),
+                    "grad_energy_std": float(np.std(feats_f["grad_energy"])),
+                    "b0_mean": b0_mean,
+                    "b0_std": b0_std,
+                    "y_mean": float(np.mean(y_f)),
+                    "y_std": float(np.std(y_f)),
+                }
+            )
+
+        feats = {k: np.concatenate(vs, axis=0) for k, vs in feats_lists.items()}
+        y = np.concatenate(ys, axis=0)
+        fid = np.concatenate(field_ids, axis=0)
+        if y.shape[0] != n_patches_total:
+            raise RuntimeError("dataset size mismatch")
+
+        keys_B = ["mass", "mass2", "var", "max", "grad_energy"]
+        topo_keys = sorted([k for k in feats.keys() if k.startswith("b0_")])
+        X_B = _build_feature_matrix(feats, keys_B)
+        X_T = _build_feature_matrix(feats, topo_keys)
+
+        from .models import safe_pearson
+        from scipy.stats import chi2
+
+        folds: list[dict[str, Any]] = []
+        deltas_real_p: list[float] = []
+        deltas_real_r: list[float] = []
+        zscores_p: list[float] = []
+        pvals_p: list[float] = []
+        pvals_r: list[float] = []
+        n_pos_p = 0
+
+        for field_id in range(n_fields):
+            test_idx = np.nonzero(fid == field_id)[0]
+            train_idx = np.nonzero(fid != field_id)[0]
+
+            y_train = y[train_idx]
+            y_test = y[test_idx]
+            B_train = X_B[train_idx]
+            B_test = X_B[test_idx]
+            T_train = X_T[train_idx]
+            T_test = X_T[test_idx]
+
+            _, mB = _ridge_metrics_from_blocks(B_train, None, y_train, B_test, None, y_test, alpha=ridge_alpha)
+            yC_pred, mC = _ridge_metrics_from_blocks(B_train, T_train, y_train, B_test, T_test, y_test, alpha=ridge_alpha)
+
+            dp_real = float(mC["pearson"] - mB["pearson"])
+            dr_real = float(mC["relRMSE"] - mB["relRMSE"])
+            deltas_real_p.append(dp_real)
+            deltas_real_r.append(dr_real)
+            if dp_real > 0:
+                n_pos_p += 1
+
+            # direction check on test fold: corr(mean topo, residual_B)
+            # compute B-only predictions to get residuals
+            yB_pred, _ = _ridge_metrics_from_blocks(B_train, None, y_train, B_test, None, y_test, alpha=ridge_alpha)
+            resid_B = y_test - yB_pred
+            corr_dir = float(safe_pearson(T_test.mean(axis=1), resid_B))
+
+            # permutation null
+            null_dp: list[float] = []
+            null_dr: list[float] = []
+            # Precompute train standardization for blocks for speed: standardize B and T with train stats.
+            muB = B_train.mean(axis=0)
+            sdB = np.where(B_train.std(axis=0) > 0, B_train.std(axis=0), 1.0)
+            muT = T_train.mean(axis=0)
+            sdT = np.where(T_train.std(axis=0) > 0, T_train.std(axis=0), 1.0)
+            Btr = (B_train - muB) / sdB
+            Bte = (B_test - muB) / sdB
+            Ttr = (T_train - muT) / sdT
+            Tte = (T_test - muT) / sdT
+            y_mean = float(y_train.mean())
+            yc = y_train - y_mean
+
+            # constants
+            SBB = Btr.T @ Btr
+            STT = Ttr.T @ Ttr
+            SBy = Btr.T @ yc
+            pB = Btr.shape[1]
+            pT = Ttr.shape[1]
+            I = np.eye(pB + pT)
+
+            for _ in range(P):
+                perm_tr = rng_placebo.permutation(train_idx.size)
+                inv_tr = np.argsort(perm_tr)
+                # topo permuted => use inv permutation on B and y when forming cross terms
+                B_perm = Btr[inv_tr]
+                y_perm = yc[inv_tr]
+                SBT = B_perm.T @ Ttr
+                STy = Ttr.T @ y_perm
+                XtX = np.block([[SBB, SBT], [SBT.T, STT]])
+                Xty = np.concatenate([SBy, STy], axis=0)
+                w = np.linalg.solve(XtX + float(ridge_alpha) * I, Xty)
+                wB = w[:pB]
+                wT = w[pB:]
+
+                perm_te = rng_placebo.permutation(test_idx.size)
+                Tte_perm = Tte[perm_te]
+                y_pred = Bte @ wB + Tte_perm @ wT + y_mean
+                # metrics
+                pear = float(safe_pearson(y_test, y_pred))
+                rm = float(np.sqrt(np.mean((y_pred - y_test) ** 2)))
+                std_y = float(np.std(y_test))
+                rel = float(rm / std_y) if std_y > 0 else float("nan")
+                null_dp.append(pear - float(mB["pearson"]))
+                null_dr.append(rel - float(mB["relRMSE"]))
+
+            null_dp_a = np.asarray(null_dp, dtype=np.float64)
+            null_dr_a = np.asarray(null_dr, dtype=np.float64)
+            ndp_mean = float(null_dp_a.mean())
+            ndp_std = float(null_dp_a.std(ddof=1)) if null_dp_a.size > 1 else 0.0
+            ndr_mean = float(null_dr_a.mean())
+            ndr_std = float(null_dr_a.std(ddof=1)) if null_dr_a.size > 1 else 0.0
+
+            z_p = float((dp_real - ndp_mean) / ndp_std) if ndp_std > 0 else float("inf")
+            z_r = float((dr_real - ndr_mean) / ndr_std) if ndr_std > 0 else float("inf")
+            # empirical p with +1 smoothing
+            p_emp_p = float((np.sum(null_dp_a >= dp_real) + 1) / (P + 1))
+            p_emp_r = float((np.sum(null_dr_a <= dr_real) + 1) / (P + 1))
+
+            zscores_p.append(z_p)
+            pvals_p.append(p_emp_p)
+            pvals_r.append(p_emp_r)
+
+            folds.append(
+                {
+                    "field_id": int(field_id),
+                    "n_test": int(test_idx.size),
+                    "pearson_B": float(mB["pearson"]),
+                    "relRMSE_B": float(mB["relRMSE"]),
+                    "pearson_C": float(mC["pearson"]),
+                    "relRMSE_C": float(mC["relRMSE"]),
+                    "delta_pearson_real": dp_real,
+                    "delta_relRMSE_real": dr_real,
+                    "null_pearson_mean": ndp_mean,
+                    "null_pearson_std": ndp_std,
+                    "null_relRMSE_mean": ndr_mean,
+                    "null_relRMSE_std": ndr_std,
+                    "zscore_pearson": z_p,
+                    "zscore_relRMSE": z_r,
+                    "p_emp_pearson": p_emp_p,
+                    "p_emp_relRMSE": p_emp_r,
+                    "corr(b0_mean,resid_B)": corr_dir,
+                }
+            )
+
+        deltas_real_p = np.asarray(deltas_real_p, dtype=np.float64)
+        deltas_real_r = np.asarray(deltas_real_r, dtype=np.float64)
+        zscores_p = np.asarray(zscores_p, dtype=np.float64)
+        pvals_p = np.asarray(pvals_p, dtype=np.float64)
+        pvals_r = np.asarray(pvals_r, dtype=np.float64)
+
+        # Fisher combine p-values
+        eps = 1e-12
+        stat_p = float(-2.0 * np.sum(np.log(np.clip(pvals_p, eps, 1.0))))
+        stat_r = float(-2.0 * np.sum(np.log(np.clip(pvals_r, eps, 1.0))))
+        fisher_p = float(chi2.sf(stat_p, 2 * n_fields))
+        fisher_r = float(chi2.sf(stat_r, 2 * n_fields))
+
+        verdict = bool(
+            (float(deltas_real_p.mean()) > 0.0)
+            and (float(deltas_real_r.mean()) < 0.0)
+            and (fisher_p < 0.01)
+            and (n_pos_p >= 7)
+        )
+
+        metrics: dict[str, Any] = {
+            "experiment": experiment,
+            "exp_name": exp_name,
+            "seed": seed,
+            "split_seed": split_seed,
+            "placebo_seed": placebo_seed,
+            "n_fields": n_fields,
+            "patches_per_field": patches_per_field,
+            "n_patches_total": n_patches_total,
+            "patch_size": patch_size,
+            "grid_size": grid_size,
+            "alpha": alpha,
+            "ridge_alpha": ridge_alpha,
+            "normalize_y_per_field": normalize_y_per_field,
+            "topo_keys": topo_keys,
+            "thresholds_pos_sigma": thresholds_pos,
+            "thresholds_neg_sigma": thresholds_neg,
+            "placebo_permutations": P,
+            "field_stats": field_stats,
+            "lofo_folds": folds,
+            "lofo_agg": {
+                "delta_pearson_real_mean": float(deltas_real_p.mean()),
+                "delta_pearson_real_std": float(deltas_real_p.std(ddof=1)),
+                "delta_relRMSE_real_mean": float(deltas_real_r.mean()),
+                "delta_relRMSE_real_std": float(deltas_real_r.std(ddof=1)),
+                "mean_zscore_pearson": float(np.mean(zscores_p)),
+                "fisher_p_pearson": fisher_p,
+                "fisher_p_relRMSE": fisher_r,
+                "n_fields": int(n_fields),
+                "n_pos_delta_pearson": int(n_pos_p),
+                "verdict_pass": verdict,
+            },
+        }
+
+        header = list(folds[0].keys()) if folds else []
+        rows = [[r[h] for h in header] for r in folds]
+        write_csv(paths.run_dir / "lofo_by_field.csv", header, rows)
+        write_json(paths.metrics_json, metrics)
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -1125,7 +1555,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
-    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8)")
+    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11)")
 
 
 def main() -> None:

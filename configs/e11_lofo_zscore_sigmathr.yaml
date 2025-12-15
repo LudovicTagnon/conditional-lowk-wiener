@@ -1,0 +1,18 @@
+experiment: e11
+exp_name: e11_lofo_zscore_sigmathr
+seed: 123
+
+grid_size: 64
+alpha: 2.0
+
+n_fields: 10
+patches_per_field: 20000
+window_size: 17
+
+normalize_y_per_field: true
+
+thresholds_pos_sigma: [0.0, 0.5, 1.0, 1.5]
+thresholds_neg_sigma: [0.5, 1.0, 1.5]
+
+placebo_permutations: 30
+ridge_alpha: 1.0
