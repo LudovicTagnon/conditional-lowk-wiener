@@ -2509,7 +2509,6 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
 
     if experiment == "e15b":
         # Kernel diagnostics: scale/shift correction + ridge_alpha sweep vs theory.
-        import numpy as np
         from sklearn.linear_model import Ridge
         from sklearn.preprocessing import StandardScaler
 
