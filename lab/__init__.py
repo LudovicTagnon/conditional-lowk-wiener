@@ -1,0 +1,2 @@
+"""Mini-lab CLI package."""
+
