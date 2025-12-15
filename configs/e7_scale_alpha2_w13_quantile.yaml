@@ -1,0 +1,15 @@
+experiment: e7
+exp_name: e7_scale_w13_quantile
+seed: 123
+
+grid_size: 64
+alpha: 2.0
+
+n_patches: 100000
+window_size: 13
+
+threshold_mode: quantile_global
+quantiles_b0: [0.6, 0.7, 0.8, 0.9]
+
+test_frac: 0.3
+ridge_alpha: 1.0

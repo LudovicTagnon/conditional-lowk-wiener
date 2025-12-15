@@ -1,0 +1,16 @@
+experiment: e5
+exp_name: e5_residual_b0multi_alpha20
+seed: 123
+
+grid_size: 64
+alpha: 2.0
+
+n_patches: 10000
+patch_size: 9
+
+thresholds_b0: [0.4, 0.5, 0.6, 0.7]
+
+test_frac: 0.3
+ridge_alpha: 1.0
+
+include_mass_interactions: false

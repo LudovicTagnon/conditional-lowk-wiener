@@ -18,6 +18,39 @@ def grad_energy(patch: np.ndarray) -> float:
     return float(energy.mean())
 
 
+def b0_multi(
+    patch: np.ndarray,
+    thresholds: Iterable[float] = (0.4, 0.5, 0.6, 0.7),
+    *,
+    adjacency: int,
+) -> dict[str, int]:
+    """
+    Multi-threshold b0 (connected components count) helper.
+
+    Returns keys:
+    - 0.4 -> b0_t04, 0.5 -> b0_t05, 0.6 -> b0_t06, 0.7 -> b0_t07
+    """
+    ts = [float(t) for t in thresholds]
+    counts = b0_counts(patch, ts, adjacency=adjacency)
+    out: dict[str, int] = {}
+    for t, c in zip(ts, counts):
+        key = f"b0_t{int(round(t * 10)):02d}"
+        out[key] = int(c)
+    return out
+
+
+def b0_named(
+    patch: np.ndarray,
+    thresholds_by_name: dict[str, float],
+    *,
+    adjacency: int,
+) -> dict[str, int]:
+    names = list(thresholds_by_name.keys())
+    thresholds = [float(thresholds_by_name[n]) for n in names]
+    counts = b0_counts(patch, thresholds, adjacency=adjacency)
+    return {f"b0_{n}": int(c) for n, c in zip(names, counts)}
+
+
 def b0_counts(
     patch: np.ndarray,
     thresholds: Iterable[float],
