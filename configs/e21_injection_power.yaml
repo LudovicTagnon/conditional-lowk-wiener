@@ -1,0 +1,26 @@
+experiment: e21
+exp_name: e21_injection_power_n256
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+k0_frac: 0.15
+n_fields: 10
+
+# Use 10k to keep runtime/memory reasonable; bump to 20000 if desired.
+patches_per_field: 10000
+ws: [17, 33]
+eps_list: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 2
+pixel_batch_size: 4096
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# Residual models + topo
+ridge_alpha: 1.0
+quantiles_b0: [0.6, 0.7, 0.8, 0.9]
+n_perms: 200
+
