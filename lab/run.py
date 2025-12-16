@@ -7375,6 +7375,556 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e26":
+        # Non-local geometric moments vs topo for full-g residual (LOFO).
+        #
+        # Data: rho01 in [0,1] (2D 1/f), full gx_full from Poisson FFT.
+        # Baseline: local pixels-only ridge-like SGD on z-scored rho patches (w_local).
+        # Residual target: r = gx_full_center - gx_pred_center (scalar).
+        # Residual models: B_resid (local B features on w_local) vs C_resid (B + nonlocal moments on w_big=129).
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        from .data_synth import solve_poisson_periodic_fft_2d
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_locals = [int(x) for x in cfg.get("w_locals", [33, 65])]
+        w_big = int(cfg.get("w_big", 129))
+        include_quadrupole = bool(cfg.get("include_quadrupole", True))
+        b_resid_mode = str(cfg.get("b_resid_mode", "local_B")).lower()
+        n_perms = int(cfg.get("n_perms", 200))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        pixel_epochs = int(cfg.get("pixel_epochs", 2))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 1024))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if any((w <= 0) or (w % 2 == 0) for w in w_locals):
+            raise ValueError("w_locals must be odd positive ints")
+        w_big = _require_odd("w_big", w_big)
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if b_resid_mode not in {"local_b", "intercept"}:
+            raise ValueError("b_resid_mode must be 'local_B' or 'intercept'")
+
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 99_111)
+        rng_null = np.random.default_rng(int(placebo_seed) + 99_222)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        # Pixel baseline: ridge-like SGD (scalar target), with fold-specific y scaling.
+        def fit_pixel_model(
+            train_fields: list[int],
+            fields_z: list[np.ndarray],
+            centers_by_field: list[np.ndarray],
+            w_local: int,
+            y_by_field: list[np.ndarray],
+        ) -> tuple[SGDRegressor, float, float]:
+            y_all = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0).astype(np.float64, copy=False)
+            y_mu = float(np.mean(y_all))
+            y_sd = float(np.std(y_all))
+            if not np.isfinite(y_sd) or y_sd <= 0:
+                y_sd = 1.0
+
+            eta0_eff = float(pixel_eta0) / float(w_local)
+            reg = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            rloc = w_local // 2
+            for _epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w_local, w_local))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - rloc, cy - rloc].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg.partial_fit(Xb, (y[idx] - y_mu) / y_sd)
+            return reg, y_mu, y_sd
+
+        def predict_pixel(reg: SGDRegressor, y_mu: float, y_sd: float, field_z: np.ndarray, centers: np.ndarray, w_local: int) -> np.ndarray:
+            rloc = w_local // 2
+            win = sliding_window_view(field_z, (w_local, w_local))
+            out = np.empty((centers.shape[0],), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - rloc, cy - rloc].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx] = reg.predict(Xb) * y_sd + y_mu
+            return out
+
+        # Generate fields (rho in [0,1]) and full gx, plus z-scored rho for pixels.
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        gx_full_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            sol = solve_poisson_periodic_fft_2d(rho01)
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            gx_full_by_field.append(sol.gx.astype(np.float64, copy=False))
+
+        # Choose centers once per field, valid for all windows (avoid borders).
+        r_max = max(max(w_locals), w_big) // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 333_333 + 1_000 * field_id)
+            cx = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # y=gx_full at centers (independent of w_local).
+        y_gx_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            centers = centers_by_field[fid]
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            y_gx_by_field.append(gx_full_by_field[fid][cx, cy].astype(np.float64, copy=False))
+
+        # Precompute local B features on rho01 for each w_local and each field (stored per w_local).
+        B_by_w_field: dict[int, list[np.ndarray]] = {w: [] for w in w_locals}
+        for w_local in w_locals:
+            rloc = w_local // 2
+            for field_id in range(n_fields):
+                field = rho01_by_field[field_id]
+                centers = centers_by_field[field_id]
+                cx = centers[:, 0]
+                cy = centers[:, 1]
+                pref1 = _prefix_sum_2d(field)
+                pref2 = _prefix_sum_2d(field * field)
+                x0 = (cx - rloc).astype(np.int64)
+                x1 = (cx + rloc + 1).astype(np.int64)
+                y0 = (cy - rloc).astype(np.int64)
+                y1 = (cy + rloc + 1).astype(np.int64)
+                mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+                nvox = float(w_local * w_local)
+                mean = mass / nvox
+                sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+                var = np.maximum(0.0, sumsq / nvox - mean * mean)
+                mass2 = mass * mass
+                max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+                mx = max_grid[cx, cy]
+                gx_f, gy_f = np.gradient(field)
+                egrid = gx_f * gx_f + gy_f * gy_f
+                eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+                ge = eavg[cx, cy]
+                B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+                B_by_w_field[w_local].append(B)
+
+        # Precompute nonlocal geometric moments from a larger context w_big=129 (same for all w_local).
+        xs = np.arange(grid_size, dtype=np.float64)[:, None]
+        ys = np.arange(grid_size, dtype=np.float64)[None, :]
+        X = np.broadcast_to(xs, (grid_size, grid_size))
+        Y = np.broadcast_to(ys, (grid_size, grid_size))
+
+        def _window_sums_at_centers(arr: np.ndarray, centers: np.ndarray, w: int) -> np.ndarray:
+            area = float(w * w)
+            grid = ndimage.uniform_filter(arr, size=w, mode="constant", cval=0.0) * area
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return grid[cx, cy].astype(np.float64, copy=False)
+
+        nonlocal_names: list[str] = [
+            "M33",
+            "M65",
+            "M129",
+            "Ring1_M65m33",
+            "Ring2_M129m65",
+            "Dx33",
+            "Dy33",
+            "DxRing1",
+            "DyRing1",
+            "DxRing2",
+            "DyRing2",
+        ]
+        if include_quadrupole:
+            nonlocal_names += [
+                "Qxx33",
+                "Qyy33",
+                "Qxy33",
+                "QxxRing1",
+                "QyyRing1",
+                "QxyRing1",
+                "QxxRing2",
+                "QyyRing2",
+                "QxyRing2",
+            ]
+
+        nonlocal_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0].astype(np.float64)
+            cy = centers[:, 1].astype(np.float64)
+
+            rho = field
+            rho_x = rho * X
+            rho_y = rho * Y
+            rho_x2 = rho * (X * X)
+            rho_y2 = rho * (Y * Y)
+            rho_xy = rho * (X * Y)
+
+            # Window sums at sizes 33/65/129.
+            M33 = _window_sums_at_centers(rho, centers, 33)
+            M65 = _window_sums_at_centers(rho, centers, 65)
+            M129 = _window_sums_at_centers(rho, centers, 129)
+
+            Sx33 = _window_sums_at_centers(rho_x, centers, 33)
+            Sy33 = _window_sums_at_centers(rho_y, centers, 33)
+            Sx65 = _window_sums_at_centers(rho_x, centers, 65)
+            Sy65 = _window_sums_at_centers(rho_y, centers, 65)
+            Sx129 = _window_sums_at_centers(rho_x, centers, 129)
+            Sy129 = _window_sums_at_centers(rho_y, centers, 129)
+
+            Dx33 = (Sx33 - cx * M33) / 33.0
+            Dy33 = (Sy33 - cy * M33) / 33.0
+            Dx65 = (Sx65 - cx * M65) / 65.0
+            Dy65 = (Sy65 - cy * M65) / 65.0
+            Dx129 = (Sx129 - cx * M129) / 129.0
+            Dy129 = (Sy129 - cy * M129) / 129.0
+            DxR1 = Dx65 - Dx33
+            DyR1 = Dy65 - Dy33
+            DxR2 = Dx129 - Dx65
+            DyR2 = Dy129 - Dy65
+
+            Ring1 = M65 - M33
+            Ring2 = M129 - M65
+
+            cols: list[np.ndarray] = [M33, M65, M129, Ring1, Ring2, Dx33, Dy33, DxR1, DyR1, DxR2, DyR2]
+
+            if include_quadrupole:
+                Sxx33 = _window_sums_at_centers(rho_x2, centers, 33)
+                Syy33 = _window_sums_at_centers(rho_y2, centers, 33)
+                Sxy33 = _window_sums_at_centers(rho_xy, centers, 33)
+                Sxx65 = _window_sums_at_centers(rho_x2, centers, 65)
+                Syy65 = _window_sums_at_centers(rho_y2, centers, 65)
+                Sxy65 = _window_sums_at_centers(rho_xy, centers, 65)
+                Sxx129 = _window_sums_at_centers(rho_x2, centers, 129)
+                Syy129 = _window_sums_at_centers(rho_y2, centers, 129)
+                Sxy129 = _window_sums_at_centers(rho_xy, centers, 129)
+
+                Qxx33 = (Sxx33 - 2.0 * cx * Sx33 + (cx * cx) * M33) / (33.0 * 33.0)
+                Qyy33 = (Syy33 - 2.0 * cy * Sy33 + (cy * cy) * M33) / (33.0 * 33.0)
+                Qxy33 = (Sxy33 - cx * Sy33 - cy * Sx33 + (cx * cy) * M33) / (33.0 * 33.0)
+                Qxx65 = (Sxx65 - 2.0 * cx * Sx65 + (cx * cx) * M65) / (65.0 * 65.0)
+                Qyy65 = (Syy65 - 2.0 * cy * Sy65 + (cy * cy) * M65) / (65.0 * 65.0)
+                Qxy65 = (Sxy65 - cx * Sy65 - cy * Sx65 + (cx * cy) * M65) / (65.0 * 65.0)
+                Qxx129 = (Sxx129 - 2.0 * cx * Sx129 + (cx * cx) * M129) / (129.0 * 129.0)
+                Qyy129 = (Syy129 - 2.0 * cy * Sy129 + (cy * cy) * M129) / (129.0 * 129.0)
+                Qxy129 = (Sxy129 - cx * Sy129 - cy * Sx129 + (cx * cy) * M129) / (129.0 * 129.0)
+
+                cols += [
+                    Qxx33,
+                    Qyy33,
+                    Qxy33,
+                    (Qxx65 - Qxx33),
+                    (Qyy65 - Qyy33),
+                    (Qxy65 - Qxy33),
+                    (Qxx129 - Qxx65),
+                    (Qyy129 - Qyy65),
+                    (Qxy129 - Qxy65),
+                ]
+
+            F = np.column_stack(cols).astype(np.float64, copy=False)
+            assert_finite("nonlocal_F", F)
+            nonlocal_by_field.append(F)
+
+        # Run configs: for each w_local, fit LOFO pixel baseline and evaluate residual model B vs C.
+        rows_summary: list[dict[str, Any]] = []
+        for w_local in w_locals:
+            fold_rows: list[dict[str, Any]] = []
+            pvals: list[float] = []
+
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                reg, y_mu, y_sd = fit_pixel_model(train_fields, rhoz_by_field, centers_by_field, w_local, y_gx_by_field)
+
+                # Baseline predictions and residual targets
+                r_tr_list: list[np.ndarray] = []
+                Btr_list: list[np.ndarray] = []
+                Ftr_list: list[np.ndarray] = []
+                for fid in train_fields:
+                    y = y_gx_by_field[fid]
+                    ypred = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[fid], centers_by_field[fid], w_local)
+                    r_tr_list.append((y - ypred).astype(np.float64, copy=False))
+                    if b_resid_mode == "local_b":
+                        Btr_list.append(B_by_w_field[w_local][fid])
+                    Ftr_list.append(nonlocal_by_field[fid])
+                r_tr = np.concatenate(r_tr_list, axis=0)
+                Ftr_raw = np.concatenate(Ftr_list, axis=0)
+                if b_resid_mode == "local_b":
+                    Btr = np.concatenate(Btr_list, axis=0)
+                else:
+                    Btr = np.zeros((r_tr.shape[0], 0), dtype=np.float64)
+
+                y_te = y_gx_by_field[test_field]
+                ypred_te = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[test_field], centers_by_field[test_field], w_local)
+                r_te = (y_te - ypred_te).astype(np.float64, copy=False)
+                if b_resid_mode == "local_b":
+                    Bte = B_by_w_field[w_local][test_field]
+                else:
+                    Bte = np.zeros((r_te.shape[0], 0), dtype=np.float64)
+                Fte_raw = nonlocal_by_field[test_field]
+
+                # Baseline metrics for gx_full
+                pearson_P = safe_corr_1d(y_te, ypred_te)
+                relrmse_P = relrmse_1d(y_te, ypred_te)
+
+                # Standardize B on train
+                if Btr.shape[1] > 0:
+                    B_mu = Btr.mean(axis=0)
+                    B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                    Btr_s = (Btr - B_mu) / B_sd
+                    Bte_s = (Bte - B_mu) / B_sd
+                else:
+                    Btr_s = Btr
+                    Bte_s = Bte
+
+                # Nonlocal block is used as-is (no nonlinear expansions by default).
+                F_mu = Ftr_raw.mean(axis=0)
+                F_sd = np.where(Ftr_raw.std(axis=0) > 0, Ftr_raw.std(axis=0), 1.0)
+                Ftr_s = (Ftr_raw - F_mu) / F_sd
+                Fte_s = (Fte_raw - F_mu) / F_sd
+
+                # Center residual target
+                r_mu = float(np.mean(r_tr))
+                rc = (r_tr - r_mu).reshape(-1, 1)
+
+                # Fit B_resid
+                if Btr_s.shape[1] > 0:
+                    A = Btr_s.T @ Btr_s
+                    uB = Btr_s.T @ rc
+                    wB = np.linalg.solve(A + ridge_alpha * np.eye(A.shape[0]), uB).reshape(-1)
+                    rB_te = Bte_s @ wB + r_mu
+                else:
+                    A = np.zeros((0, 0), dtype=np.float64)
+                    uB = np.zeros((0, 1), dtype=np.float64)
+                    rB_te = np.full_like(r_te, r_mu, dtype=np.float64)
+                pB = safe_corr_1d(r_te, rB_te)
+                rrB = relrmse_1d(r_te, rB_te)
+
+                # Fit C_resid (real)
+                if Btr_s.shape[1] > 0:
+                    XtrC = np.concatenate([Btr_s, Ftr_s], axis=1)
+                    XteC = np.concatenate([Bte_s, Fte_s], axis=1)
+                else:
+                    XtrC = Ftr_s
+                    XteC = Fte_s
+                XtX = XtrC.T @ XtrC
+                Xty = XtrC.T @ rc
+                wC = np.linalg.solve(XtX + ridge_alpha * np.eye(XtX.shape[0]), Xty).reshape(-1)
+                rC_te = XteC @ wC + r_mu
+                pC = safe_corr_1d(r_te, rC_te)
+                rrC = relrmse_1d(r_te, rC_te)
+
+                deltaP = float(pC - pB)
+                deltaR = float(rrC - rrB)
+
+                # Placebo permutations: shuffle nonlocal rows in train.
+                Cmat = Ftr_s.T @ Ftr_s
+                Z = np.concatenate([Btr_s, rc], axis=1)  # (n, dB+1)
+                null_dP: list[float] = []
+                for _ in range(n_perms):
+                    pidx = rng_null.permutation(Ftr_s.shape[0])
+                    Fp = Ftr_s[pidx]
+                    M = Z.T @ Fp
+                    D = M[:-1, :]
+                    v = M[-1, :].reshape(-1, 1)
+                    XtX_p = np.block([[A, D], [D.T, Cmat]])
+                    Xty_p = np.vstack([uB, v])
+                    wP = np.linalg.solve(XtX_p + ridge_alpha * np.eye(XtX_p.shape[0]), Xty_p).reshape(-1)
+                    rP_te = XteC @ wP + r_mu
+                    pP = safe_corr_1d(r_te, rP_te)
+                    null_dP.append(float(pP - pB))
+                null = np.asarray(null_dP, dtype=np.float64)
+                p_emp = float((np.sum(null >= deltaP) + 1.0) / (float(n_perms) + 1.0))
+                pvals.append(p_emp)
+
+                fold_rows.append(
+                    {
+                        "field_id": int(test_field),
+                        "pearson_P": float(pearson_P),
+                        "relRMSE_P": float(relrmse_P),
+                        "pearson_B": float(pB),
+                        "relRMSE_B": float(rrB),
+                        "pearson_C": float(pC),
+                        "relRMSE_C": float(rrC),
+                        "deltaP": float(deltaP),
+                        "deltaR": float(deltaR),
+                        "p_emp": float(p_emp),
+                    }
+                )
+
+            dp = np.asarray([r0["deltaP"] for r0 in fold_rows], dtype=np.float64)
+            dr = np.asarray([r0["deltaR"] for r0 in fold_rows], dtype=np.float64)
+            pearP = np.asarray([r0["pearson_P"] for r0 in fold_rows], dtype=np.float64)
+            rrP = np.asarray([r0["relRMSE_P"] for r0 in fold_rows], dtype=np.float64)
+            n_pos = int(np.sum(dp > 0.0))
+            fp = fisher_p(pvals)
+            verdict = (float(dp.mean()) > 0.0) and (float(dr.mean()) < 0.0) and (fp < 0.05) and (n_pos >= 7)
+
+            if b_resid_mode == "local_b":
+                base = "B_resid=local_B(mass,mass2,var,max,grad_energy)"
+            else:
+                base = "B_resid=intercept"
+            cfg_str = f"{base} + nonlocal_moments(w_big={w_big}, include_quadrupole={include_quadrupole})"
+            rows_summary.append(
+                {
+                    "w_local": int(w_local),
+                    "features_used": cfg_str,
+                    "deltaP_mean": float(dp.mean()),
+                    "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                    "deltaR_mean": float(dr.mean()),
+                    "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                    "fisher_p": float(fp),
+                    "n_pos": int(n_pos),
+                    "verdict": bool(verdict),
+                    "baseline_pearson_mean": float(pearP.mean()),
+                    "baseline_pearson_std": float(pearP.std(ddof=1)) if len(pearP) > 1 else 0.0,
+                    "baseline_relrmse_mean": float(rrP.mean()),
+                    "baseline_relrmse_std": float(rrP.std(ddof=1)) if len(rrP) > 1 else 0.0,
+                }
+            )
+
+            header = list(fold_rows[0].keys()) if fold_rows else []
+            write_csv(paths.run_dir / f"lofo_by_field_wlocal{w_local}.csv", header, [[r0[h] for h in header] for r0 in fold_rows])
+
+        # Summary markdown (baseline + deltas)
+        md_base_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_base_rows.append(
+                {
+                    "w_local": str(int(r0["w_local"])),
+                    "Pearson_P mean±std": f"{float(r0['baseline_pearson_mean']):.4f} ± {float(r0['baseline_pearson_std']):.4f}",
+                    "relRMSE_P mean±std": f"{float(r0['baseline_relrmse_mean']):.4f} ± {float(r0['baseline_relrmse_std']):.4f}",
+                }
+            )
+        md_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_rows.append(
+                {
+                    "w_local": str(int(r0["w_local"])),
+                    "features_used": str(r0["features_used"]),
+                    "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                    "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                    "Fisher p": fmt(float(r0["fisher_p"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos'])}/{n_fields}",
+                    "verdict": "PASS" if bool(r0["verdict"]) else "FAIL",
+                }
+            )
+
+        summary_md = (
+            "# E26 — Nonlocal geometric moments on full-g residual (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_locals={w_locals}, w_big={w_big}, include_quadrupole={include_quadrupole}\n"
+            f"- pixel: SGD L2 (ridge-like) alpha={pixel_alpha}, epochs={pixel_epochs}, batch={pixel_batch_size}\n"
+            f"- residual ridge_alpha={ridge_alpha}, perms={n_perms}, B_resid_mode={b_resid_mode}\n"
+            f"- nonlocal feature names: {nonlocal_names}\n\n"
+            "## Baseline (pixels-only) on gx_full\n\n"
+            + md_table(md_base_rows, ["w_local", "Pearson_P mean±std", "relRMSE_P mean±std"])
+            + "\n\n## Residual model gain: C_resid(B + nonlocal) vs B_resid\n\n"
+            + md_table(md_rows, ["w_local", "features_used", "ΔPearson mean±std", "ΔrelRMSE mean±std", "Fisher p", "#folds ΔP>0", "verdict"])
+            + "\n"
+        )
+        (paths.run_dir / "summary_e26_nonlocal_moments_fullg_residual.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_locals": w_locals,
+                "w_big": w_big,
+                "include_quadrupole": include_quadrupole,
+                "nonlocal_names": nonlocal_names,
+                "pixel": {
+                    "solver": "sgd_l2",
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "residual": {"ridge_alpha": ridge_alpha, "n_perms": n_perms, "b_resid_mode": b_resid_mode},
+                "rows_summary": rows_summary,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -7456,7 +8006,9 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         write_json(paths.metrics_json, metrics)
         return paths
 
-    raise ValueError(f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e11/e12/e13/e14/e15/e16/e15b/e17)")
+    raise ValueError(
+        f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e10/e11/e12/e13/e14/e15/e15b/e15c/e16/e17/e18/e19/e20/e21/e21b/e22/e23/e24/e25/e26)"
+    )
 
 
 def main() -> None:

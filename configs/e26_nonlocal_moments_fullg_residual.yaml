@@ -1,0 +1,30 @@
+experiment: e26
+exp_name: e26_nonlocal_moments_fullg_residual
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Baseline local windows (pixels-only)
+w_locals: [33, 65]
+
+# Nonlocal geometric context (for moments features)
+w_big: 129
+include_quadrupole: true
+
+# Residual baseline: "local_B" (mass/var/max/grad_energy on w_local) or "intercept"
+b_resid_mode: local_B
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 2
+pixel_batch_size: 1024
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# Residual ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
