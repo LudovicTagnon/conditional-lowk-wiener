@@ -6918,6 +6918,463 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e25":
+        # Multi-scale nonlinear topo features to explain nonlocal residual in full g (LOFO).
+        #
+        # Baseline: local pixels-only ridge-like SGD on rho patches (w_local).
+        # Residual target: r_parallel = rx = gx_full_center - gx_pred_center (scalar).
+        # Residual models: B_resid (mass/var/max/grad_energy on w_local) vs C_resid (B + multi-scale topo).
+        #
+        # Topo features: for each scale, compute b0(superlevel) at sigma thresholds t in {0.0,0.5,1.0}
+        # on a z-scored rho field (per-field mean/std), after optional avg-pooling.
+        # Add nonlinear expansions: b0, b0^2, |b0-mean_train|.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        k0_frac = float(cfg.get("k0_frac", 0.15))  # used only as a seed-compatible knob; full-g does not band-split.
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_locals = [int(x) for x in cfg.get("w_locals", [33, 65])]
+        topo_scales = [int(x) for x in cfg.get("topo_scales", [33, 65, 129])]
+        topo_pool_factors = [int(x) for x in cfg.get("topo_pool_factors", [1, 2, 4])]
+        sigma_thresholds = [float(x) for x in cfg.get("sigma_thresholds", [0.0, 0.5, 1.0])]
+        n_perms = int(cfg.get("n_perms", 200))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        pixel_epochs = int(cfg.get("pixel_epochs", 2))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 1024))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if any((w <= 0) or (w % 2 == 0) for w in w_locals):
+            raise ValueError("w_locals must be odd positive ints")
+        if any((w <= 0) or (w % 2 == 0) for w in topo_scales):
+            raise ValueError("topo_scales must be odd positive ints")
+        if len(topo_pool_factors) < len(topo_scales):
+            raise ValueError("topo_pool_factors must have at least as many entries as topo_scales")
+        if any(f <= 0 for f in topo_pool_factors):
+            raise ValueError("topo_pool_factors must be positive ints")
+        if any(t < 0.0 for t in sigma_thresholds):
+            raise ValueError("sigma_thresholds must be >= 0")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 77_777)
+        rng_null = np.random.default_rng(int(placebo_seed) + 88_888)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            rm = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+            sd = float(np.std(y_true))
+            return float(rm / sd) if sd > 0 else float("nan")
+
+        def avg_pool(patch: np.ndarray, factor: int) -> np.ndarray:
+            if factor == 1:
+                return patch
+            h, w_ = patch.shape
+            hh = (h // factor) * factor
+            ww = (w_ // factor) * factor
+            x = patch[:hh, :ww]
+            x = x.reshape(hh // factor, factor, ww // factor, factor).mean(axis=(1, 3))
+            return x
+
+        # Connected components structure (4-neigh)
+        cc_structure = ndimage.generate_binary_structure(2, 1)
+
+        def b0_counts_sigma(patch_z: np.ndarray) -> np.ndarray:
+            out = np.zeros((len(sigma_thresholds),), dtype=np.float64)
+            for j, t in enumerate(sigma_thresholds):
+                binary = patch_z > float(t)
+                if not binary.any():
+                    out[j] = 0.0
+                else:
+                    _, num = ndimage.label(binary, structure=cc_structure)
+                    out[j] = float(num)
+            return out
+
+        def fit_pixel_model(train_fields: list[int], fields_z: list[np.ndarray], centers_by_field: list[np.ndarray], w_local: int, y_by_field: list[np.ndarray]) -> tuple[SGDRegressor, SGDRegressor]:
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(pixel_eta0),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                random_state=int(placebo_seed) + 1,
+            )
+            rloc = w_local // 2
+            for _epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w_local, w_local))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - rloc, cy - rloc].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg_gx.partial_fit(Xb, y[idx, 0])
+                        reg_gy.partial_fit(Xb, y[idx, 1])
+            return reg_gx, reg_gy
+
+        def predict_pixel(reg_gx: SGDRegressor, reg_gy: SGDRegressor, field_z: np.ndarray, centers: np.ndarray, w_local: int) -> np.ndarray:
+            rloc = w_local // 2
+            win = sliding_window_view(field_z, (w_local, w_local))
+            out = np.empty((centers.shape[0], 2), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - rloc, cy - rloc].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx, 0] = reg_gx.predict(Xb)
+                out[idx, 1] = reg_gy.predict(Xb)
+            return out
+
+        # Generate fields (rho in [0,1]) and full g, plus z-scored rho for pixels/topo.
+        from .data_synth import solve_poisson_periodic_fft_2d
+
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        gx_full_by_field: list[np.ndarray] = []
+        gy_full_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id + int(1e6 * k0_frac))
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            sol = solve_poisson_periodic_fft_2d(rho01)
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            gx_full_by_field.append(sol.gx.astype(np.float64, copy=False))
+            gy_full_by_field.append(sol.gy.astype(np.float64, copy=False))
+
+        # Choose centers once per field, valid for all w_local and topo_scales (avoid borders).
+        r_max = max(max(w_locals), max(topo_scales)) // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 123_456 + 1_000 * field_id)
+            cx = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Precompute B features on rho01 for each w_local and each field (stored per w_local).
+        B_by_w_field: dict[int, list[np.ndarray]] = {w: [] for w in w_locals}
+        for w_local in w_locals:
+            rloc = w_local // 2
+            for field_id in range(n_fields):
+                field = rho01_by_field[field_id]
+                centers = centers_by_field[field_id]
+                cx = centers[:, 0]
+                cy = centers[:, 1]
+                pref1 = _prefix_sum_2d(field)
+                pref2 = _prefix_sum_2d(field * field)
+                x0 = (cx - rloc).astype(np.int64)
+                x1 = (cx + rloc + 1).astype(np.int64)
+                y0 = (cy - rloc).astype(np.int64)
+                y1 = (cy + rloc + 1).astype(np.int64)
+                mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+                nvox = float(w_local * w_local)
+                mean = mass / nvox
+                sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+                var = np.maximum(0.0, sumsq / nvox - mean * mean)
+                mass2 = mass * mass
+                max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+                mx = max_grid[cx, cy]
+                gx_f, gy_f = np.gradient(field)
+                egrid = gx_f * gx_f + gy_f * gy_f
+                eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+                ge = eavg[cx, cy]
+                B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+                B_by_w_field[w_local].append(B)
+
+        # Precompute raw multi-scale b0 features per field (independent of w_local).
+        # Shape per field: (n_patches, n_scales * n_thresholds)
+        topo_scale_cfg: list[tuple[int, int]] = []
+        for s, f in zip(topo_scales, topo_pool_factors):
+            if s > grid_size:
+                continue
+            topo_scale_cfg.append((int(s), int(f)))
+        if not topo_scale_cfg:
+            raise ValueError("No valid topo_scales (all larger than grid_size?)")
+
+        topo_raw_by_field: list[np.ndarray] = []
+        topo_names: list[str] = []
+        for s, f in topo_scale_cfg:
+            for t in sigma_thresholds:
+                topo_names.append(f"b0_s{s}_p{f}_t{str(t).replace('.','p')}")
+
+        for field_id in range(n_fields):
+            field_z = rhoz_by_field[field_id]
+            centers = centers_by_field[field_id]
+            vals = np.zeros((centers.shape[0], len(topo_names)), dtype=np.float64)
+            col = 0
+            for s, f in topo_scale_cfg:
+                rs = s // 2
+                for i in range(centers.shape[0]):
+                    cx, cy = int(centers[i, 0]), int(centers[i, 1])
+                    patch = field_z[cx - rs : cx + rs + 1, cy - rs : cy + rs + 1]
+                    patch_p = avg_pool(patch, f)
+                    b0 = b0_counts_sigma(patch_p)
+                    vals[i, col : col + len(sigma_thresholds)] = b0
+                col += len(sigma_thresholds)
+            topo_raw_by_field.append(vals)
+
+        # Run configs: for each w_local, fit LOFO pixel baseline and evaluate residual model B vs C.
+        rows_summary: list[dict[str, Any]] = []
+        for w_local in w_locals:
+            # y_by_field at centers for this w_local
+            y_cent_by_field: list[np.ndarray] = []
+            for fid in range(n_fields):
+                centers = centers_by_field[fid]
+                cx = centers[:, 0].astype(np.int64)
+                cy = centers[:, 1].astype(np.int64)
+                y_cent_by_field.append(
+                    np.column_stack([gx_full_by_field[fid][cx, cy], gy_full_by_field[fid][cx, cy]]).astype(np.float64, copy=False)
+                )
+
+            fold_rows: list[dict[str, Any]] = []
+            pvals: list[float] = []
+
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                reg_gx, reg_gy = fit_pixel_model(train_fields, rhoz_by_field, centers_by_field, w_local, y_cent_by_field)
+
+                # residual targets
+                r_tr_list: list[np.ndarray] = []
+                Btr_list: list[np.ndarray] = []
+                Ftr_list: list[np.ndarray] = []
+                for fid in train_fields:
+                    y = y_cent_by_field[fid]
+                    ypred = predict_pixel(reg_gx, reg_gy, rhoz_by_field[fid], centers_by_field[fid], w_local)
+                    r_tr_list.append((y[:, 0] - ypred[:, 0]).astype(np.float64, copy=False))
+                    Btr_list.append(B_by_w_field[w_local][fid])
+                    Ftr_list.append(topo_raw_by_field[fid])
+                r_tr = np.concatenate(r_tr_list, axis=0)
+                Btr = np.concatenate(Btr_list, axis=0)
+                Ftr_raw = np.concatenate(Ftr_list, axis=0)
+
+                y_te = y_cent_by_field[test_field]
+                ypred_te = predict_pixel(reg_gx, reg_gy, rhoz_by_field[test_field], centers_by_field[test_field], w_local)
+                r_te = (y_te[:, 0] - ypred_te[:, 0]).astype(np.float64, copy=False)
+                Bte = B_by_w_field[w_local][test_field]
+                Fte_raw = topo_raw_by_field[test_field]
+
+                # Standardize B on train
+                B_mu = Btr.mean(axis=0)
+                B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                Btr_s = (Btr - B_mu) / B_sd
+                Bte_s = (Bte - B_mu) / B_sd
+
+                # Base topo block = raw b0 counts; compute expansions fold-safely:
+                # b0, b0^2, |b0-mean_train|
+                F_mu_raw = Ftr_raw.mean(axis=0, keepdims=True)
+                Ftr = np.concatenate([Ftr_raw, Ftr_raw * Ftr_raw, np.abs(Ftr_raw - F_mu_raw)], axis=1)
+                Fte = np.concatenate([Fte_raw, Fte_raw * Fte_raw, np.abs(Fte_raw - F_mu_raw)], axis=1)
+
+                # Standardize F on train
+                F_mu = Ftr.mean(axis=0)
+                F_sd = np.where(Ftr.std(axis=0) > 0, Ftr.std(axis=0), 1.0)
+                Ftr_s = (Ftr - F_mu) / F_sd
+                Fte_s = (Fte - F_mu) / F_sd
+
+                # Center residual target
+                r_mu = float(np.mean(r_tr))
+                rc = (r_tr - r_mu).reshape(-1, 1)
+
+                # Fit B_resid
+                A = Btr_s.T @ Btr_s
+                uB = Btr_s.T @ rc
+                wB = np.linalg.solve(A + ridge_alpha * np.eye(A.shape[0]), uB).reshape(-1)
+                rB_te = Bte_s @ wB + r_mu
+                pB = safe_corr_1d(r_te, rB_te)
+                rrB = relrmse_1d(r_te, rB_te)
+
+                # Fit C_resid (real)
+                XtrC = np.concatenate([Btr_s, Ftr_s], axis=1)
+                XteC = np.concatenate([Bte_s, Fte_s], axis=1)
+                XtX = XtrC.T @ XtrC
+                Xty = XtrC.T @ rc
+                wC = np.linalg.solve(XtX + ridge_alpha * np.eye(XtX.shape[0]), Xty).reshape(-1)
+                rC_te = XteC @ wC + r_mu
+                pC = safe_corr_1d(r_te, rC_te)
+                rrC = relrmse_1d(r_te, rC_te)
+
+                deltaP = float(pC - pB)
+                deltaR = float(rrC - rrB)
+
+                # Placebo permutations: shuffle topo rows in train.
+                # Use block-matrix trick: Z = [B, rc], then M = Z^T @ Fperm gives D and v.
+                Cmat = Ftr_s.T @ Ftr_s
+                Z = np.concatenate([Btr_s, rc], axis=1)
+                perms = [rng_null.permutation(Ftr_s.shape[0]) for _ in range(n_perms)]
+                null_dP: list[float] = []
+                for pidx in perms:
+                    Fp = Ftr_s[pidx]
+                    M = Z.T @ Fp
+                    D = M[:-1, :]
+                    v = M[-1, :].reshape(-1, 1)
+                    XtX_p = np.block([[A, D], [D.T, Cmat]])
+                    Xty_p = np.vstack([uB, v])
+                    wP = np.linalg.solve(XtX_p + ridge_alpha * np.eye(XtX_p.shape[0]), Xty_p).reshape(-1)
+                    rP_te = XteC @ wP + r_mu
+                    pP = safe_corr_1d(r_te, rP_te)
+                    null_dP.append(float(pP - pB))
+                null = np.asarray(null_dP, dtype=np.float64)
+                p_emp = float(np.mean(null >= deltaP))
+                pvals.append(p_emp)
+
+                fold_rows.append(
+                    {
+                        "field_id": int(test_field),
+                        "pearson_B": float(pB),
+                        "relRMSE_B": float(rrB),
+                        "pearson_C": float(pC),
+                        "relRMSE_C": float(rrC),
+                        "deltaP": float(deltaP),
+                        "deltaR": float(deltaR),
+                        "p_emp": float(p_emp),
+                    }
+                )
+
+            dp = np.asarray([r0["deltaP"] for r0 in fold_rows], dtype=np.float64)
+            dr = np.asarray([r0["deltaR"] for r0 in fold_rows], dtype=np.float64)
+            n_pos = int(np.sum(dp > 0.0))
+            fp = fisher_p(pvals)
+            verdict = (float(dp.mean()) > 0.0) and (float(dr.mean()) < 0.0) and (fp < 0.05) and (n_pos >= 7)
+
+            cfg_str = f"topo_scales={[(s,f) for (s,f) in topo_scale_cfg]} sigma_thr={sigma_thresholds} exp=[b0,b0^2,abs]"
+            rows_summary.append(
+                {
+                    "w_local": int(w_local),
+                    "config": cfg_str,
+                    "deltaP_mean": float(dp.mean()),
+                    "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                    "deltaR_mean": float(dr.mean()),
+                    "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                    "fisher_p": float(fp),
+                    "n_pos": int(n_pos),
+                    "verdict": bool(verdict),
+                }
+            )
+
+            header = list(fold_rows[0].keys()) if fold_rows else []
+            write_csv(paths.run_dir / f"lofo_by_field_wlocal{w_local}.csv", header, [[r0[h] for h in header] for r0 in fold_rows])
+
+        # Summary markdown
+        md_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_rows.append(
+                {
+                    "w_local": str(int(r0["w_local"])),
+                    "config": str(r0["config"]),
+                    "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                    "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                    "Fisher p": fmt(float(r0["fisher_p"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos'])}/{n_fields}",
+                    "verdict": "PASS" if bool(r0["verdict"]) else "FAIL",
+                }
+            )
+
+        summary_md = (
+            "# E25 — Multi-scale topo on full-g residual (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_locals={w_locals}\n"
+            f"- topo_scales_used={topo_scale_cfg}\n"
+            f"- sigma_thresholds={sigma_thresholds}\n"
+            f"- pixel: SGD L2 (ridge-like) alpha={pixel_alpha}, epochs={pixel_epochs}, batch={pixel_batch_size}\n"
+            f"- residual ridge_alpha={ridge_alpha}, perms={n_perms}\n\n"
+            + md_table(md_rows, ["w_local", "config", "ΔPearson mean±std", "ΔrelRMSE mean±std", "Fisher p", "#folds ΔP>0", "verdict"])
+            + "\n"
+        )
+        (paths.run_dir / "summary_e25_multiscale_topo_fullg_residual.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_locals": w_locals,
+                "topo_scales_used": topo_scale_cfg,
+                "sigma_thresholds": sigma_thresholds,
+                "pixel": {
+                    "solver": "sgd_l2",
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "residual": {"ridge_alpha": ridge_alpha, "n_perms": n_perms},
+                "topo_names_raw": topo_names,
+                "rows_summary": rows_summary,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))

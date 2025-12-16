@@ -1,0 +1,30 @@
+experiment: e25
+exp_name: e25_multiscale_topo_fullg_residual
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Baseline local windows (full rho -> full g)
+w_locals: [33, 65]
+
+# Multi-scale topo windows and avg-pool factors (s, pool_factor)
+# 65 is pooled to 32x32, 129 pooled to 32x32; drop 129 if runtime too high.
+topo_scales: [33, 65]
+topo_pool_factors: [1, 2]
+
+sigma_thresholds: [0.0, 0.5, 1.0]
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 2
+pixel_batch_size: 1024
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# Residual ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
