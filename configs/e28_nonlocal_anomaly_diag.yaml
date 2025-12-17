@@ -1,0 +1,24 @@
+experiment: e28
+exp_name: e28_nonlocal_anomaly_diag
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Focus case
+w_local: 65
+w_bigs: [65, 129]
+
+ridge_alpha_grid: [1.0e-6, 1.0e-4, 1.0e-2, 1.0e0, 1.0e2]
+n_perms: 100
+diag_fold: 0
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 2
+pixel_batch_size: 1024
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+

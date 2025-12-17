@@ -8561,6 +8561,715 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e28":
+        # Diagnose E27 anomaly: w_local=65 with w_big in {65,129}, ridge-alpha sweep, conditioning checks,
+        # and "ring mask" visualization to verify the meaning of "rings".
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        import matplotlib.pyplot as plt
+
+        from .data_synth import solve_poisson_periodic_fft_2d
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 65)))
+        w_bigs = [int(x) for x in cfg.get("w_bigs", [65, 129])]
+        ridge_alpha_grid = [float(x) for x in cfg.get("ridge_alpha_grid", [1e-6, 1e-4, 1e-2, 1e0, 1e2])]
+        n_perms = int(cfg.get("n_perms", 100))
+        diag_fold = int(cfg.get("diag_fold", 0))
+
+        pixel_epochs = int(cfg.get("pixel_epochs", 2))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 1024))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if w_local <= 0 or (w_local % 2) == 0:
+            raise ValueError("w_local must be an odd positive int")
+        w_bigs = [_require_odd("w_big", int(w)) for w in w_bigs]
+        if any(w not in {65, 129} for w in w_bigs):
+            raise ValueError("E28 focuses on w_bigs in {65,129}")
+        if any(w > grid_size for w in w_bigs):
+            raise ValueError("w_bigs must be <= grid_size")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if diag_fold < 0 or diag_fold >= n_fields:
+            raise ValueError("diag_fold must be in [0,n_fields)")
+        if any(a <= 0 for a in ridge_alpha_grid):
+            raise ValueError("ridge_alpha_grid must be positive")
+
+        # Match E27 RNG offsets so the residual baseline is comparable.
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 101_111)
+        rng_null = np.random.default_rng(int(placebo_seed) + 101_222)
+
+        variants = ["C1_rings", "C2_rings+dipoles", "C3_rings+dipoles+quadrupoles"]
+        variant_order = {v: i for i, v in enumerate(variants)}
+        # Column prefixes in our nonlocal block definition (same as E27).
+        k_by_wbig_variant: dict[tuple[int, str], int] = {
+            (65, "C1_rings"): 3,
+            (65, "C2_rings+dipoles"): 7,
+            (65, "C3_rings+dipoles+quadrupoles"): 13,
+            (129, "C1_rings"): 5,
+            (129, "C2_rings+dipoles"): 11,
+            (129, "C3_rings+dipoles+quadrupoles"): 20,
+        }
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def solve_ridge(XtX: np.ndarray, Xty: np.ndarray, alpha_r: float) -> np.ndarray:
+            try:
+                return np.linalg.solve(XtX + float(alpha_r) * np.eye(XtX.shape[0]), Xty)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(XtX + float(alpha_r) * np.eye(XtX.shape[0]), Xty, rcond=None)
+                return w
+
+        # Pixel baseline: ridge-like SGD (scalar target), with fold-specific y scaling.
+        def fit_pixel_model(
+            train_fields: list[int],
+            fields_z: list[np.ndarray],
+            centers_by_field: list[np.ndarray],
+            w: int,
+            y_by_field: list[np.ndarray],
+        ) -> tuple[SGDRegressor, float, float]:
+            y_all = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0).astype(np.float64, copy=False)
+            y_mu = float(np.mean(y_all))
+            y_sd = float(np.std(y_all))
+            if not np.isfinite(y_sd) or y_sd <= 0:
+                y_sd = 1.0
+
+            eta0_eff = float(pixel_eta0) / float(w)
+            reg = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            rloc = w // 2
+            for _epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w, w))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - rloc, cy - rloc].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg.partial_fit(Xb, (y[idx] - y_mu) / y_sd)
+            return reg, y_mu, y_sd
+
+        def predict_pixel(reg: SGDRegressor, y_mu: float, y_sd: float, field_z: np.ndarray, centers: np.ndarray, w: int) -> np.ndarray:
+            rloc = w // 2
+            win = sliding_window_view(field_z, (w, w))
+            out = np.empty((centers.shape[0],), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - rloc, cy - rloc].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx] = reg.predict(Xb) * y_sd + y_mu
+            return out
+
+        # Generate fields (rho in [0,1]) and full gx, plus z-scored rho for pixels.
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        gx_full_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            sol = solve_poisson_periodic_fft_2d(rho01)
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            gx_full_by_field.append(sol.gx.astype(np.float64, copy=False))
+
+        # Centers (match E27 seeding convention).
+        r_max = max(w_local, max(w_bigs)) // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 444_444 + 1_000 * field_id)
+            cx = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # y=gx_full at centers.
+        y_gx_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            centers = centers_by_field[fid]
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            y_gx_by_field.append(gx_full_by_field[fid][cx, cy].astype(np.float64, copy=False))
+
+        # Local B features (w_local only).
+        B_by_field: list[np.ndarray] = []
+        rloc = w_local // 2
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0]
+            cy = centers[:, 1]
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - rloc).astype(np.int64)
+            x1 = (cx + rloc + 1).astype(np.int64)
+            y0 = (cy - rloc).astype(np.int64)
+            y1 = (cy + rloc + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(w_local * w_local)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+            B_by_field.append(B)
+
+        # Nonlocal moments blocks for w_big=65 and 129 (same definitions as E27).
+        w_sizes = [33, 65, 129]
+        xs = np.arange(grid_size, dtype=np.float64)[:, None]
+        ys = np.arange(grid_size, dtype=np.float64)[None, :]
+        X = np.broadcast_to(xs, (grid_size, grid_size))
+        Y = np.broadcast_to(ys, (grid_size, grid_size))
+
+        def _window_sums_at_centers(arr: np.ndarray, centers: np.ndarray, w: int) -> np.ndarray:
+            area = float(w * w)
+            grid = ndimage.uniform_filter(arr, size=w, mode="constant", cval=0.0) * area
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return grid[cx, cy].astype(np.float64, copy=False)
+
+        names_full_by_wbig: dict[int, list[str]] = {
+            65: [
+                "M33",
+                "M65",
+                "Ring1_M65m33",
+                "Dx33",
+                "Dy33",
+                "DxRing1",
+                "DyRing1",
+                "Qxx33",
+                "Qyy33",
+                "Qxy33",
+                "QxxRing1",
+                "QyyRing1",
+                "QxyRing1",
+            ],
+            129: [
+                "M33",
+                "M65",
+                "M129",
+                "Ring1_M65m33",
+                "Ring2_M129m65",
+                "Dx33",
+                "Dy33",
+                "DxRing1",
+                "DyRing1",
+                "DxRing2",
+                "DyRing2",
+                "Qxx33",
+                "Qyy33",
+                "Qxy33",
+                "QxxRing1",
+                "QyyRing1",
+                "QxyRing1",
+                "QxxRing2",
+                "QyyRing2",
+                "QxyRing2",
+            ],
+        }
+
+        Ffull_by_wbig_field: dict[int, list[np.ndarray]] = {65: [], 129: []}
+        for field_id in range(n_fields):
+            rho = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0].astype(np.float64)
+            cy = centers[:, 1].astype(np.float64)
+
+            rho_x = rho * X
+            rho_y = rho * Y
+            rho_x2 = rho * (X * X)
+            rho_y2 = rho * (Y * Y)
+            rho_xy = rho * (X * Y)
+
+            M: dict[int, np.ndarray] = {}
+            Sx: dict[int, np.ndarray] = {}
+            Sy: dict[int, np.ndarray] = {}
+            Sxx: dict[int, np.ndarray] = {}
+            Syy: dict[int, np.ndarray] = {}
+            Sxy: dict[int, np.ndarray] = {}
+            for w in w_sizes:
+                M[w] = _window_sums_at_centers(rho, centers, w)
+                Sx[w] = _window_sums_at_centers(rho_x, centers, w)
+                Sy[w] = _window_sums_at_centers(rho_y, centers, w)
+                Sxx[w] = _window_sums_at_centers(rho_x2, centers, w)
+                Syy[w] = _window_sums_at_centers(rho_y2, centers, w)
+                Sxy[w] = _window_sums_at_centers(rho_xy, centers, w)
+
+            Dx: dict[int, np.ndarray] = {}
+            Dy: dict[int, np.ndarray] = {}
+            Qxx: dict[int, np.ndarray] = {}
+            Qyy: dict[int, np.ndarray] = {}
+            Qxy: dict[int, np.ndarray] = {}
+            for w in w_sizes:
+                Dx[w] = (Sx[w] - cx * M[w]) / float(w)
+                Dy[w] = (Sy[w] - cy * M[w]) / float(w)
+                ww2 = float(w * w)
+                Qxx[w] = (Sxx[w] - 2.0 * cx * Sx[w] + (cx * cx) * M[w]) / ww2
+                Qyy[w] = (Syy[w] - 2.0 * cy * Sy[w] + (cy * cy) * M[w]) / ww2
+                Qxy[w] = (Sxy[w] - cx * Sy[w] - cy * Sx[w] + (cx * cy) * M[w]) / ww2
+
+            # w_big=65 block
+            Ring1_65 = M[65] - M[33]
+            DxR1_65 = Dx[65] - Dx[33]
+            DyR1_65 = Dy[65] - Dy[33]
+            QxxR1_65 = Qxx[65] - Qxx[33]
+            QyyR1_65 = Qyy[65] - Qyy[33]
+            QxyR1_65 = Qxy[65] - Qxy[33]
+            F65 = np.column_stack(
+                [
+                    M[33],
+                    M[65],
+                    Ring1_65,
+                    Dx[33],
+                    Dy[33],
+                    DxR1_65,
+                    DyR1_65,
+                    Qxx[33],
+                    Qyy[33],
+                    Qxy[33],
+                    QxxR1_65,
+                    QyyR1_65,
+                    QxyR1_65,
+                ]
+            ).astype(np.float64, copy=False)
+            assert_finite("F65", F65)
+            Ffull_by_wbig_field[65].append(F65)
+
+            # w_big=129 block
+            Ring1_129 = M[65] - M[33]
+            Ring2_129 = M[129] - M[65]
+            DxR1_129 = Dx[65] - Dx[33]
+            DyR1_129 = Dy[65] - Dy[33]
+            DxR2_129 = Dx[129] - Dx[65]
+            DyR2_129 = Dy[129] - Dy[65]
+            QxxR1_129 = Qxx[65] - Qxx[33]
+            QyyR1_129 = Qyy[65] - Qyy[33]
+            QxyR1_129 = Qxy[65] - Qxy[33]
+            QxxR2_129 = Qxx[129] - Qxx[65]
+            QyyR2_129 = Qyy[129] - Qyy[65]
+            QxyR2_129 = Qxy[129] - Qxy[65]
+            F129 = np.column_stack(
+                [
+                    M[33],
+                    M[65],
+                    M[129],
+                    Ring1_129,
+                    Ring2_129,
+                    Dx[33],
+                    Dy[33],
+                    DxR1_129,
+                    DyR1_129,
+                    DxR2_129,
+                    DyR2_129,
+                    Qxx[33],
+                    Qyy[33],
+                    Qxy[33],
+                    QxxR1_129,
+                    QyyR1_129,
+                    QxyR1_129,
+                    QxxR2_129,
+                    QyyR2_129,
+                    QxyR2_129,
+                ]
+            ).astype(np.float64, copy=False)
+            assert_finite("F129", F129)
+            Ffull_by_wbig_field[129].append(F129)
+
+        # Save ring masks (these are square annuli, not radial/circular).
+        def plot_ring_masks(wb: int) -> Path:
+            r = wb // 2
+
+            def square(w: int) -> np.ndarray:
+                m = np.zeros((wb, wb), dtype=np.float64)
+                rr = w // 2
+                m[r - rr : r + rr + 1, r - rr : r + rr + 1] = 1.0
+                return m
+
+            m33 = square(33)
+            m65 = square(65)
+            if wb == 65:
+                ring1 = m65 - m33
+                fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+                items = [("M33", m33), ("M65", m65), ("Ring1 (M65-M33)", ring1)]
+            else:
+                mb = square(wb)
+                ring1 = m65 - m33
+                ring2 = mb - m65
+                fig, axes = plt.subplots(1, 5, figsize=(15, 3))
+                items = [("M33", m33), ("M65", m65), (f"M{wb}", mb), ("Ring1 (M65-M33)", ring1), (f"Ring2 (M{wb}-M65)", ring2)]
+
+            for ax, (title, arr) in zip(axes, items):
+                vmin = float(arr.min())
+                vmax = float(arr.max())
+                if vmin < 0:
+                    v = max(abs(vmin), abs(vmax))
+                    im = ax.imshow(arr, cmap="RdBu_r", vmin=-v, vmax=v, interpolation="nearest")
+                else:
+                    im = ax.imshow(arr, cmap="viridis", vmin=0.0, vmax=max(1.0, vmax), interpolation="nearest")
+                ax.set_title(title)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.suptitle(f"Ring masks (square windows), w_big={wb}")
+            out = paths.run_dir / f"ring_masks_wbig{wb}.png"
+            fig.tight_layout()
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+            return out
+
+        ring_png_65 = plot_ring_masks(65)
+        ring_png_129 = plot_ring_masks(129)
+
+        # Storage for sweep results across folds.
+        keys = [(wb, v, a) for wb in w_bigs for v in variants for a in ridge_alpha_grid]
+        dp_by_key: dict[tuple[int, str, float], list[float]] = {k: [] for k in keys}
+        dr_by_key: dict[tuple[int, str, float], list[float]] = {k: [] for k in keys}
+        pvals_by_key: dict[tuple[int, str, float], list[float]] = {k: [] for k in keys}
+
+        # Capture diagnostic fold (train) info for conditioning checks.
+        diag_info: dict[tuple[int, str], Any] = {}
+
+        for test_field in range(n_fields):
+            train_fields = [i for i in range(n_fields) if i != test_field]
+            reg, y_mu, y_sd = fit_pixel_model(train_fields, rhoz_by_field, centers_by_field, w_local, y_gx_by_field)
+
+            # residual targets + B blocks
+            r_tr_list: list[np.ndarray] = []
+            Btr_list: list[np.ndarray] = []
+            for fid in train_fields:
+                y = y_gx_by_field[fid]
+                ypred = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[fid], centers_by_field[fid], w_local)
+                r_tr_list.append((y - ypred).astype(np.float64, copy=False))
+                Btr_list.append(B_by_field[fid])
+            r_tr = np.concatenate(r_tr_list, axis=0)
+            Btr = np.concatenate(Btr_list, axis=0)
+
+            y_te = y_gx_by_field[test_field]
+            ypred_te = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[test_field], centers_by_field[test_field], w_local)
+            r_te = (y_te - ypred_te).astype(np.float64, copy=False)
+            Bte = B_by_field[test_field]
+
+            # Standardize B on train
+            B_mu = Btr.mean(axis=0)
+            B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+            Btr_s = (Btr - B_mu) / B_sd
+            Bte_s = (Bte - B_mu) / B_sd
+
+            # Center residual target
+            r_mu = float(np.mean(r_tr))
+            rc = (r_tr - r_mu).reshape(-1, 1)
+
+            A = Btr_s.T @ Btr_s
+            uB = Btr_s.T @ rc
+
+            # Precompute B baseline metrics for each ridge_alpha.
+            pB_by_alpha: dict[float, float] = {}
+            rrB_by_alpha: dict[float, float] = {}
+            for a in ridge_alpha_grid:
+                wB = solve_ridge(A, uB, a).reshape(-1)
+                rB_te = Bte_s @ wB + r_mu
+                pB_by_alpha[a] = safe_corr_1d(r_te, rB_te)
+                rrB_by_alpha[a] = relrmse_1d(r_te, rB_te)
+
+            # Shared placebo helper
+            Z = np.concatenate([Btr_s, rc], axis=1)  # (n_train, dB+1)
+            ZT = Z.T
+            n_train = Btr_s.shape[0]
+            rt = (r_te - float(r_te.mean())).astype(np.float64, copy=False)
+            norm_rt = float(np.linalg.norm(rt)) + 1e-12
+
+            # Process each w_big
+            for wb in w_bigs:
+                Ftr_raw_full = np.concatenate([Ffull_by_wbig_field[wb][fid] for fid in train_fields], axis=0)
+                Fte_raw_full = Ffull_by_wbig_field[wb][test_field]
+                names_full = names_full_by_wbig[wb]
+
+                F_mu = Ftr_raw_full.mean(axis=0)
+                F_sd = np.where(Ftr_raw_full.std(axis=0) > 0, Ftr_raw_full.std(axis=0), 1.0)
+                Ftr_s_full = (Ftr_raw_full - F_mu) / F_sd
+                Fte_s_full = (Fte_raw_full - F_mu) / F_sd
+                assert_finite("Ftr_s_full", Ftr_s_full)
+                assert_finite("Fte_s_full", Fte_s_full)
+
+                C_full = Ftr_s_full.T @ Ftr_s_full
+
+                # Precompute test correlation stats for full [B, F_full] and slice per variant.
+                Xte_full = np.concatenate([Bte_s, Fte_s_full], axis=1)
+                mX = Xte_full.mean(axis=0)
+                Xc = Xte_full - mX
+                t_full = (Xc.T @ rt.reshape(-1, 1)).reshape(-1)
+                S_full = Xc.T @ Xc
+                dB = Bte_s.shape[1]
+
+                # Fit real C models per alpha and store their pC (needed for placebo comparison).
+                pC_real: dict[tuple[str, float], float] = {}
+                for vname in variants:
+                    k = k_by_wbig_variant[(wb, vname)]
+                    Ftr_s = Ftr_s_full[:, :k]
+                    Fte_s = Fte_s_full[:, :k]
+                    XtrC = np.concatenate([Btr_s, Ftr_s], axis=1)
+                    XteC = np.concatenate([Bte_s, Fte_s], axis=1)
+                    XtX = XtrC.T @ XtrC
+                    Xty = XtrC.T @ rc
+                    for a in ridge_alpha_grid:
+                        wC = solve_ridge(XtX, Xty, a).reshape(-1)
+                        rC_te = XteC @ wC + r_mu
+                        pC = safe_corr_1d(r_te, rC_te)
+                        rrC = relrmse_1d(r_te, rC_te)
+
+                        pB = pB_by_alpha[a]
+                        rrB = rrB_by_alpha[a]
+                        dp = float(pC - pB)
+                        dr = float(rrC - rrB)
+
+                        key = (wb, vname, float(a))
+                        dp_by_key[key].append(dp)
+                        dr_by_key[key].append(dr)
+                        pC_real[(vname, float(a))] = float(pC)
+
+                # Store conditioning diagnostics on diag_fold (train fold only).
+                if test_field == diag_fold:
+                    diag_info[(wb, "Ftr_s_full")] = Ftr_s_full
+                    diag_info[(wb, "names_full")] = names_full
+                    diag_info[(wb, "r_tr")] = r_tr
+
+                # Placebo permutations: count p_perm >= p_real per alpha, per variant.
+                counts_ge: dict[tuple[str, float], int] = {(v, float(a)): 0 for v in variants for a in ridge_alpha_grid}
+                for _ in range(n_perms):
+                    pidx = rng_null.permutation(n_train)
+                    Fp_full = Ftr_s_full[pidx]
+                    M_full = ZT @ Fp_full
+                    D_full = M_full[:-1, :]
+                    v_full = M_full[-1, :].reshape(-1, 1)
+
+                    for vname in variants:
+                        k = k_by_wbig_variant[(wb, vname)]
+                        D = D_full[:, :k]
+                        v = v_full[:k, :]
+                        Cmat = C_full[:k, :k]
+
+                        XtX_p = np.block([[A, D], [D.T, Cmat]])
+                        Xty_p = np.vstack([uB, v])
+
+                        idx_cols = np.r_[np.arange(dB), dB + np.arange(k)]
+                        t_sub = t_full[idx_cols]
+                        S_sub = S_full[np.ix_(idx_cols, idx_cols)]
+
+                        for a in ridge_alpha_grid:
+                            wP = solve_ridge(XtX_p, Xty_p, a).reshape(-1)
+                            denom = norm_rt * (float(np.sqrt(max(0.0, wP @ (S_sub @ wP)))) + 1e-12)
+                            pP = float((t_sub @ wP) / denom)
+                            if pP >= float(pC_real[(vname, float(a))]):
+                                counts_ge[(vname, float(a))] += 1
+
+                for vname in variants:
+                    for a in ridge_alpha_grid:
+                        cge = counts_ge[(vname, float(a))]
+                        p_emp = float((cge + 1.0) / (float(n_perms) + 1.0))
+                        pvals_by_key[(wb, vname, float(a))].append(p_emp)
+
+        # Aggregate results
+        rows_summary: list[dict[str, Any]] = []
+        for wb in w_bigs:
+            for vname in variants:
+                for a in ridge_alpha_grid:
+                    key = (wb, vname, float(a))
+                    dp = np.asarray(dp_by_key[key], dtype=np.float64)
+                    dr = np.asarray(dr_by_key[key], dtype=np.float64)
+                    n_pos = int(np.sum(dp > 0.0))
+                    fp = fisher_p(pvals_by_key[key])
+                    verdict = (float(dp.mean()) > 0.0) and (float(dr.mean()) < 0.0) and (fp < 0.05) and (n_pos >= 7)
+                    rows_summary.append(
+                        {
+                            "w_big": int(wb),
+                            "variant": str(vname),
+                            "ridge_alpha": float(a),
+                            "deltaP_mean": float(dp.mean()),
+                            "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                            "deltaR_mean": float(dr.mean()),
+                            "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                            "fisher_p": float(fp),
+                            "n_pos": int(n_pos),
+                            "verdict": bool(verdict),
+                        }
+                    )
+
+        # Best alpha per (w_big, variant) under PASS criteria.
+        best_rows: list[dict[str, Any]] = []
+        for wb in w_bigs:
+            for vname in variants:
+                cand = [r for r in rows_summary if int(r["w_big"]) == int(wb) and str(r["variant"]) == vname and bool(r["verdict"])]
+                if not cand:
+                    best_rows.append({"w_big": int(wb), "variant": vname, "best_alpha": float("nan"), "best_deltaP_mean": float("nan"), "best_fisher_p": float("nan"), "verdict": False})
+                    continue
+                cand.sort(key=lambda r: (-float(r["deltaP_mean"]), float(r["ridge_alpha"])))
+                b = cand[0]
+                best_rows.append({"w_big": int(wb), "variant": vname, "best_alpha": float(b["ridge_alpha"]), "best_deltaP_mean": float(b["deltaP_mean"]), "best_fisher_p": float(b["fisher_p"]), "verdict": True})
+
+        # Conditioning/collinearity check on representative fold (train).
+        cond_lines: list[str] = []
+        if (65, "Ftr_s_full") in diag_info and (129, "Ftr_s_full") in diag_info:
+            rtr = np.asarray(diag_info[(65, "r_tr")], dtype=np.float64).reshape(-1)
+            for wb in w_bigs:
+                Ffull = np.asarray(diag_info[(wb, "Ftr_s_full")], dtype=np.float64)
+                names_full = list(diag_info[(wb, "names_full")])
+                for vname in variants:
+                    k = k_by_wbig_variant[(wb, vname)]
+                    F = Ffull[:, :k]
+                    names = names_full[:k]
+                    C = np.corrcoef(F, rowvar=False)
+                    C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+                    Cabs = np.abs(C)
+                    np.fill_diagonal(Cabs, 0.0)
+                    ij = np.unravel_index(int(np.argmax(Cabs)), Cabs.shape)
+                    max_abs = float(Cabs[ij]) if Cabs.size else float("nan")
+
+                    corr_fr = [safe_corr_1d(F[:, j], rtr) for j in range(F.shape[1])]
+                    top = np.argsort(-np.abs(np.asarray(corr_fr)))[: min(10, len(corr_fr))]
+                    top_txt = ", ".join([f"{names[j]}:{corr_fr[j]:+.3f}" for j in top])
+                    cond_lines.append(f"- fold={diag_fold} train | w_big={wb} {vname}: max|corr(feat,feat)|={max_abs:.3f} (pair={names[ij[0]]},{names[ij[1]]}); top corr(feat,r) = {top_txt}")
+
+        # Markdown summary
+        md_rows: list[dict[str, str]] = []
+        for r0 in sorted(rows_summary, key=lambda r: (int(r["w_big"]), variant_order[str(r["variant"])], float(r["ridge_alpha"]))):
+            md_rows.append(
+                {
+                    "w_big": str(int(r0["w_big"])),
+                    "variant": str(r0["variant"]),
+                    "ridge_alpha": fmt(float(r0["ridge_alpha"])),
+                    "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                    "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                    "Fisher p": fmt(float(r0["fisher_p"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos'])}/{n_fields}",
+                }
+            )
+        md_best_rows: list[dict[str, str]] = []
+        for b in best_rows:
+            md_best_rows.append(
+                {
+                    "w_big": str(int(b["w_big"])),
+                    "variant": str(b["variant"]),
+                    "best_alpha": fmt(float(b["best_alpha"])),
+                    "ΔPearson_mean": fmt(float(b["best_deltaP_mean"])),
+                    "Fisher p": fmt(float(b["best_fisher_p"])),
+                    "verdict": "PASS" if bool(b["verdict"]) else "FAIL",
+                }
+            )
+
+        summary_md = (
+            "# E28 — Diagnose nonlocal moments anomaly (w_local=65)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_local={w_local}, w_bigs={w_bigs}\n"
+            f"- ridge_alpha_grid={ridge_alpha_grid}\n"
+            f"- perms={n_perms} per fold, placebo_seed={placebo_seed}\n\n"
+            "## Sweep (LOFO)\n\n"
+            + md_table(md_rows, ["w_big", "variant", "ridge_alpha", "ΔPearson mean±std", "ΔrelRMSE mean±std", "Fisher p", "#folds ΔP>0"])
+            + "\n\n## Best alpha (PASS-only)\n\n"
+            + md_table(md_best_rows, ["w_big", "variant", "best_alpha", "ΔPearson_mean", "Fisher p", "verdict"])
+            + "\n\n## Conditioning / Collinearity (fold train diagnostics)\n\n"
+            + ("\n".join(cond_lines) if cond_lines else "- (diagnostics unavailable)\n")
+            + "\n\n## Ring masks\n\n"
+            + f"- `ring_masks_wbig65.png`: `{ring_png_65}`\n"
+            + f"- `ring_masks_wbig129.png`: `{ring_png_129}`\n"
+            + "\n"
+            + "Note: these are *square* window-difference masks (square annuli), not radial/circular annuli.\n"
+        )
+        (paths.run_dir / "summary_e28_nonlocal_anomaly_diag.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_local": w_local,
+                "w_bigs": w_bigs,
+                "ridge_alpha_grid": ridge_alpha_grid,
+                "n_perms": n_perms,
+                "rows_summary": rows_summary,
+                "best_rows": best_rows,
+                "diag_fold": diag_fold,
+                "ring_masks": {"wbig65": str(ring_png_65), "wbig129": str(ring_png_129)},
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -8643,7 +9352,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         return paths
 
     raise ValueError(
-        f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e10/e11/e12/e13/e14/e15/e15b/e15c/e16/e17/e18/e19/e20/e21/e21b/e22/e23/e24/e25/e26/e27)"
+        f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e10/e11/e12/e13/e14/e15/e15b/e15c/e16/e17/e18/e19/e20/e21/e21b/e22/e23/e24/e25/e26/e27/e28)"
     )
 
 
