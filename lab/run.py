@@ -9941,6 +9941,631 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e30":
+        # E30 — Show that annulus dipole predicts the low-k (far-field) component of g in LOFO.
+        #
+        # Targets: (gx_low, gy_low) at patch centers, from a band-split Poisson solve.
+        # Features:
+        # - B_low: local_B (mass, mass2, var, max, grad_energy) on rho01.
+        # - Ck: B_low + annulus multipoles on rho01 (rings, dipole, quadrupole), computed on the OUTER region
+        #       of a big window (w_big) excluding the inner local core (w_local).
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+
+        import matplotlib.pyplot as plt
+
+        from .features import nonlocal_annulus_moments
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 65)))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 129)))
+        n_radial_bins = int(cfg.get("n_radial_bins", 6))
+        eps_norm = float(cfg.get("eps_norm", 1e-12))
+        k0_fracs = [float(x) for x in cfg.get("k0_fracs", [0.10, 0.15, 0.25])]
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        n_perms = int(cfg.get("n_perms", 200))
+        validate_fft_n = int(cfg.get("validate_fft_n", 1))
+        validate_fft_rtol = float(cfg.get("validate_fft_rtol", 1e-6))
+        validate_fft_atol = float(cfg.get("validate_fft_atol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if w_local > w_big:
+            raise ValueError("w_local must be <= w_big")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if n_radial_bins <= 0:
+            raise ValueError("n_radial_bins must be > 0")
+        if eps_norm <= 0:
+            raise ValueError("eps_norm must be > 0")
+        if not k0_fracs:
+            raise ValueError("k0_fracs must be non-empty")
+        if any((k <= 0.0) or (k >= 0.5) for k in k0_fracs):
+            raise ValueError("k0_fracs entries must be in (0,0.5)")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if validate_fft_n < 0:
+            raise ValueError("validate_fft_n must be >= 0")
+        if validate_fft_rtol < 0 or validate_fft_atol < 0:
+            raise ValueError("validate_fft_rtol/atol must be >= 0")
+
+        rng_null = np.random.default_rng(int(placebo_seed) + 303_303)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            if y_true.shape != y_pred.shape or y_true.ndim != 2 or y_true.shape[1] != 2:
+                raise ValueError(f"invalid 2D targets shapes: {y_true.shape} vs {y_pred.shape}")
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(XtX: np.ndarray, Xty: np.ndarray) -> np.ndarray:
+            d = int(XtX.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(XtX + ridge_alpha * I, Xty)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(XtX + ridge_alpha * I, Xty, rcond=None)
+                return w
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            if x < 1e-3:
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        # Generate fields and centers (shared across k0_fracs).
+        rho01_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+
+        r_big = w_big // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 444_444 + 1_000 * field_id)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Local_B features (w_local) on rho01.
+        def _prefix_sum_2d(x: np.ndarray) -> np.ndarray:
+            x = np.asarray(x, dtype=np.float64)
+            return np.pad(x, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+
+        def _box_sum_2d(pref: np.ndarray, x0: np.ndarray, x1: np.ndarray, y0: np.ndarray, y1: np.ndarray) -> np.ndarray:
+            return pref[x1, y1] - pref[x0, y1] - pref[x1, y0] + pref[x0, y0]
+
+        B_by_field: list[np.ndarray] = []
+        rloc = w_local // 2
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0]
+            cy = centers[:, 1]
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - rloc).astype(np.int64)
+            x1 = (cx + rloc + 1).astype(np.int64)
+            y0 = (cy - rloc).astype(np.int64)
+            y1 = (cy + rloc + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(w_local * w_local)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+            assert_finite("B_local", B)
+            B_by_field.append(B)
+
+        # Annulus multipoles on rho01 (outer-only).
+        rings_end = 1 + 2 * n_radial_bins
+        dip_end = rings_end + 4
+        quad_end = dip_end + 4
+        n_full = quad_end
+
+        variants: list[tuple[str, int]] = [
+            ("C1_annulus_rings", rings_end),
+            ("C2_annulus_rings+dipole", dip_end),
+            ("C3_annulus_rings+dipole+quad", quad_end),
+        ]
+
+        def kernel_fft_centered(kernel: np.ndarray) -> np.ndarray:
+            """
+            FFT of a *centered* spatial kernel for circular correlation (see E29 for details).
+            """
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            wb = int(kernel.shape[0])
+            if (wb % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {wb}")
+            if wb > grid_size:
+                raise ValueError(f"kernel size {wb} exceeds grid_size {grid_size}")
+            r = wb // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def build_kernels() -> dict[str, np.ndarray]:
+            r_local = w_local // 2
+            coords = np.arange(w_big, dtype=np.float64) - float(r_big)
+            dx = coords[:, None]
+            dy = coords[None, :]
+            core = (np.abs(dx) <= float(r_local)) & (np.abs(dy) <= float(r_local))
+            outer = ~core
+            outer_f = outer.astype(np.float64)
+            r = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+
+            kernels: dict[str, np.ndarray] = {"M0": outer_f}
+            if r_big > r_local and outer.any():
+                edges = np.linspace(float(r_local), float(r_big) + 1e-9, n_radial_bins + 1, dtype=np.float64)
+                for k in range(n_radial_bins):
+                    lo = edges[k]
+                    hi = edges[k + 1]
+                    if k == n_radial_bins - 1:
+                        m = outer & (r >= lo) & (r <= hi)
+                    else:
+                        m = outer & (r >= lo) & (r < hi)
+                    kernels[f"ring{k}"] = m.astype(np.float64)
+            else:
+                for k in range(n_radial_bins):
+                    kernels[f"ring{k}"] = np.zeros((w_big, w_big), dtype=np.float64)
+
+            kernels["Dx"] = (dx * outer_f).astype(np.float64, copy=False)
+            kernels["Dy"] = (dy * outer_f).astype(np.float64, copy=False)
+            kernels["Qxx"] = ((dx * dx - dy * dy) * outer_f).astype(np.float64, copy=False)
+            kernels["Qxy"] = ((2.0 * dx * dy) * outer_f).astype(np.float64, copy=False)
+            return kernels
+
+        def plot_annulus_masks() -> Path:
+            r_local = w_local // 2
+            coords = np.arange(w_big, dtype=np.float64) - float(r_big)
+            dx = coords[:, None]
+            dy = coords[None, :]
+            core = (np.abs(dx) <= float(r_local)) & (np.abs(dy) <= float(r_local))
+            outer = (~core).astype(np.float64)
+            r = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+
+            edges = np.linspace(float(r_local), float(r_big) + 1e-9, n_radial_bins + 1, dtype=np.float64)
+            bins: list[np.ndarray] = []
+            for k in range(n_radial_bins):
+                lo = edges[k]
+                hi = edges[k + 1]
+                if k == n_radial_bins - 1:
+                    m = (r >= lo) & (r <= hi) & (~core)
+                else:
+                    m = (r >= lo) & (r < hi) & (~core)
+                bins.append(m.astype(np.float64))
+
+            ncols = 1 + len(bins)
+            fig, axes = plt.subplots(1, ncols, figsize=(3.0 * ncols, 3.0))
+            if ncols == 1:
+                axes = [axes]
+            axes[0].imshow(outer, cmap="gray", interpolation="nearest")
+            axes[0].set_title(f"outer (w_big={w_big}, w_local={w_local})")
+            axes[0].set_xticks([])
+            axes[0].set_yticks([])
+            for k, m in enumerate(bins):
+                axes[k + 1].imshow(m, cmap="gray", interpolation="nearest")
+                axes[k + 1].set_title(f"ring {k}")
+                axes[k + 1].set_xticks([])
+                axes[k + 1].set_yticks([])
+            fig.suptitle("E30 annulus + radial bins (outer-only)")
+            out = paths.run_dir / f"annulus_masks_wlocal{w_local}_wbig{w_big}.png"
+            fig.tight_layout()
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+            return out
+
+        mask_png = str(plot_annulus_masks())
+        kernels = build_kernels()
+        kernel_ffts = {name: kernel_fft_centered(k) for name, k in kernels.items()}
+
+        Ffull_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            F = np.zeros((patches_per_field, n_full), dtype=np.float64)
+
+            field_fft = np.fft.fftn(field)
+
+            m0_grid = np.fft.ifftn(field_fft * kernel_ffts["M0"]).real
+            M0 = m0_grid[cx, cy].astype(np.float64, copy=False)
+            denom = M0 + eps_norm
+            F[:, 0] = M0
+
+            ring_sums = np.zeros((patches_per_field, n_radial_bins), dtype=np.float64)
+            for k in range(n_radial_bins):
+                gk = np.fft.ifftn(field_fft * kernel_ffts[f"ring{k}"]).real
+                ring_sums[:, k] = gk[cx, cy].astype(np.float64, copy=False)
+            ring_fracs = ring_sums / denom[:, None]
+            F[:, 1 : 1 + n_radial_bins] = ring_sums
+            F[:, 1 + n_radial_bins : 1 + 2 * n_radial_bins] = ring_fracs
+
+            dx_grid = np.fft.ifftn(field_fft * kernel_ffts["Dx"]).real
+            dy_grid = np.fft.ifftn(field_fft * kernel_ffts["Dy"]).real
+            qxx_grid = np.fft.ifftn(field_fft * kernel_ffts["Qxx"]).real
+            qxy_grid = np.fft.ifftn(field_fft * kernel_ffts["Qxy"]).real
+            Dx = dx_grid[cx, cy].astype(np.float64, copy=False)
+            Dy = dy_grid[cx, cy].astype(np.float64, copy=False)
+            Qxx = qxx_grid[cx, cy].astype(np.float64, copy=False)
+            Qxy = qxy_grid[cx, cy].astype(np.float64, copy=False)
+
+            F[:, rings_end + 0] = Dx
+            F[:, rings_end + 1] = Dy
+            F[:, rings_end + 2] = Dx / denom
+            F[:, rings_end + 3] = Dy / denom
+
+            F[:, dip_end + 0] = Qxx
+            F[:, dip_end + 1] = Qxy
+            F[:, dip_end + 2] = Qxx / denom
+            F[:, dip_end + 3] = Qxy / denom
+
+            if field_id == 0 and validate_fft_n > 0:
+                n_check = min(int(validate_fft_n), patches_per_field)
+                feat_names = (
+                    ["M0"]
+                    + [f"ring_sum_{k}" for k in range(n_radial_bins)]
+                    + [f"ring_frac_{k}" for k in range(n_radial_bins)]
+                    + ["Dx", "Dy", "Dx_n", "Dy_n", "Qxx", "Qxy", "Qxx_n", "Qxy_n"]
+                )
+                for j in range(n_check):
+                    cxi = int(cx[j])
+                    cyi = int(cy[j])
+                    patch_big = field[cxi - r_big : cxi + r_big + 1, cyi - r_big : cyi + r_big + 1]
+                    d = nonlocal_annulus_moments(
+                        patch_big,
+                        w_local=w_local,
+                        n_radial_bins=n_radial_bins,
+                        include_dipole=True,
+                        include_quadrupole=True,
+                        eps=eps_norm,
+                    )
+                    row_d = np.zeros((n_full,), dtype=np.float64)
+                    row_d[0] = float(d["M0"])
+                    for k in range(n_radial_bins):
+                        row_d[1 + k] = float(d[f"ring_sum_{k}"])
+                        row_d[1 + n_radial_bins + k] = float(d[f"ring_frac_{k}"])
+                    row_d[rings_end + 0] = float(d["Dx"])
+                    row_d[rings_end + 1] = float(d["Dy"])
+                    row_d[rings_end + 2] = float(d["Dx_n"])
+                    row_d[rings_end + 3] = float(d["Dy_n"])
+                    row_d[dip_end + 0] = float(d["Qxx"])
+                    row_d[dip_end + 1] = float(d["Qxy"])
+                    row_d[dip_end + 2] = float(d["Qxx_n"])
+                    row_d[dip_end + 3] = float(d["Qxy_n"])
+
+                    for idx, name in enumerate(feat_names):
+                        a = float(F[j, idx])
+                        b = float(row_d[idx])
+                        if not np.isclose(a, b, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                            raise RuntimeError(
+                                "E30 annulus FFT feature mismatch "
+                                f"(field_id={field_id}, sample={j}, {name}): fft={a:.6g} direct={b:.6g}"
+                            )
+
+            assert_finite("annulus_F", F)
+            Ffull_by_field.append(F)
+
+        # Targets per k0_frac: (gx_low, gy_low) sampled at centers.
+        y_by_k0_field: dict[float, list[np.ndarray]] = {}
+        split_sanity: dict[float, dict[str, float]] = {}
+        for k0 in k0_fracs:
+            y_list: list[np.ndarray] = []
+            rel_errs_gx: list[float] = []
+            rel_errs_gy: list[float] = []
+            var_fracs_gx: list[float] = []
+            var_fracs_gy: list[float] = []
+            for field_id in range(n_fields):
+                rho01 = rho01_by_field[field_id]
+                split = band_split_poisson_2d(rho01, k0_frac=float(k0))
+                rel_errs_gx.append(float(split.rel_err_gx))
+                rel_errs_gy.append(float(split.rel_err_gy))
+                var_fracs_gx.append(float(np.var(split.low.gx) / (np.var(split.full.gx) + 1e-12)))
+                var_fracs_gy.append(float(np.var(split.low.gy) / (np.var(split.full.gy) + 1e-12)))
+
+                centers = centers_by_field[field_id]
+                cx = centers[:, 0].astype(np.int64)
+                cy = centers[:, 1].astype(np.int64)
+                gx_low_c = split.low.gx[cx, cy]
+                gy_low_c = split.low.gy[cx, cy]
+                y = np.column_stack([gx_low_c, gy_low_c]).astype(np.float64, copy=False)
+                assert_finite("y_low", y)
+                y_list.append(y)
+
+            y_by_k0_field[float(k0)] = y_list
+            split_sanity[float(k0)] = {
+                "rel_err_gx_mean": float(np.mean(rel_errs_gx)),
+                "rel_err_gy_mean": float(np.mean(rel_errs_gy)),
+                "var_frac_gx_low_mean": float(np.mean(var_fracs_gx)),
+                "var_frac_gy_low_mean": float(np.mean(var_fracs_gy)),
+            }
+
+        # Sanity plot: variance fractions vs k0_frac (field-averaged).
+        fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        ks = np.array(sorted(split_sanity.keys()), dtype=np.float64)
+        vx = np.array([split_sanity[k]["var_frac_gx_low_mean"] for k in ks], dtype=np.float64)
+        vy = np.array([split_sanity[k]["var_frac_gy_low_mean"] for k in ks], dtype=np.float64)
+        ax.plot(ks, vx, "-o", label="var_frac gx_low/full")
+        ax.plot(ks, vy, "-o", label="var_frac gy_low/full")
+        ax.set_xlabel("k0_frac")
+        ax.set_ylabel("variance fraction")
+        ax.set_title("E30 band-split sanity (field-avg)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        sanity_png = paths.run_dir / "band_split_sanity_varfrac.png"
+        fig.tight_layout()
+        fig.savefig(sanity_png, dpi=150)
+        plt.close(fig)
+
+        # LOFO fits (Ridge multi-output), with permutation placebo for the annulus block.
+        rows_summary: list[dict[str, Any]] = []
+        for k0 in sorted(y_by_k0_field.keys()):
+            y_by_field = y_by_k0_field[k0]
+            for variant, k in variants:
+                fold_rows: list[dict[str, Any]] = []
+                pvals: list[float] = []
+
+                for test_field in range(n_fields):
+                    train_fields = [i for i in range(n_fields) if i != test_field]
+
+                    Btr = np.concatenate([B_by_field[fid] for fid in train_fields], axis=0)
+                    Ftr_raw_full = np.concatenate([Ffull_by_field[fid] for fid in train_fields], axis=0)
+                    ytr = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0)
+
+                    Bte = B_by_field[test_field]
+                    Fte_raw_full = Ffull_by_field[test_field]
+                    yte = y_by_field[test_field]
+
+                    # Standardize on train only.
+                    B_mu = Btr.mean(axis=0)
+                    B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                    Btr_s = (Btr - B_mu) / B_sd
+                    Bte_s = (Bte - B_mu) / B_sd
+
+                    F_mu = Ftr_raw_full.mean(axis=0)
+                    F_sd = np.where(Ftr_raw_full.std(axis=0) > 0, Ftr_raw_full.std(axis=0), 1.0)
+                    Ftr_s_full = (Ftr_raw_full - F_mu) / F_sd
+                    Fte_s_full = (Fte_raw_full - F_mu) / F_sd
+
+                    y_mu = ytr.mean(axis=0)
+                    yc = ytr - y_mu
+
+                    # Baseline B_low.
+                    A = Btr_s.T @ Btr_s
+                    U = Btr_s.T @ yc
+                    wB = solve_ridge(A, U)
+                    yB_te = Bte_s @ wB + y_mu
+                    pB = pearson_mean_2d(yte, yB_te)
+                    rrB = relrmse_mean_2d(yte, yB_te)
+
+                    # Candidate Ck.
+                    Ftr_s = Ftr_s_full[:, :k]
+                    Fte_s = Fte_s_full[:, :k]
+                    Xtr = np.concatenate([Btr_s, Ftr_s], axis=1)
+                    Xte = np.concatenate([Bte_s, Fte_s], axis=1)
+                    XtX = Xtr.T @ Xtr
+                    Xty = Xtr.T @ yc
+                    wC = solve_ridge(XtX, Xty)
+                    yC_te = Xte @ wC + y_mu
+                    pC = pearson_mean_2d(yte, yC_te)
+                    rrC = relrmse_mean_2d(yte, yC_te)
+
+                    deltaP = float(pC - pB)
+                    deltaR = float(rrC - rrB)
+
+                    # Placebo permutations: shuffle annulus features (TRAIN rows only), reuse full block.
+                    Cmat_full = Ftr_s_full.T @ Ftr_s_full
+                    null_dP: list[float] = []
+                    for _ in range(n_perms):
+                        pidx = rng_null.permutation(Ftr_s_full.shape[0])
+                        Fp_full = Ftr_s_full[pidx]
+                        D_full = Btr_s.T @ Fp_full
+                        V_full = Fp_full.T @ yc
+
+                        D = D_full[:, :k]
+                        V = V_full[:k, :]
+                        Cmat = Cmat_full[:k, :k]
+                        XtX_p = np.block([[A, D], [D.T, Cmat]])
+                        Xty_p = np.vstack([U, V])
+                        wP = solve_ridge(XtX_p, Xty_p)
+                        yP_te = Xte @ wP + y_mu
+                        pP = pearson_mean_2d(yte, yP_te)
+                        null_dP.append(float(pP - pB))
+                    null = np.asarray(null_dP, dtype=np.float64)
+                    p_emp = float((np.sum(null >= deltaP) + 1.0) / (float(n_perms) + 1.0))
+                    pvals.append(p_emp)
+
+                    fold_rows.append(
+                        {
+                            "field_id": int(test_field),
+                            "pearson_B": float(pB),
+                            "relRMSE_B": float(rrB),
+                            "pearson_C": float(pC),
+                            "relRMSE_C": float(rrC),
+                            "deltaP": float(deltaP),
+                            "deltaR": float(deltaR),
+                            "p_emp": float(p_emp),
+                        }
+                    )
+
+                dp = np.asarray([r0["deltaP"] for r0 in fold_rows], dtype=np.float64)
+                dr = np.asarray([r0["deltaR"] for r0 in fold_rows], dtype=np.float64)
+                pBv = np.asarray([r0["pearson_B"] for r0 in fold_rows], dtype=np.float64)
+                pCv = np.asarray([r0["pearson_C"] for r0 in fold_rows], dtype=np.float64)
+                rrBv = np.asarray([r0["relRMSE_B"] for r0 in fold_rows], dtype=np.float64)
+                rrCv = np.asarray([r0["relRMSE_C"] for r0 in fold_rows], dtype=np.float64)
+                n_pos = int(np.sum(dp > 0.0))
+                fp = fisher_p(pvals)
+                verdict = (float(dp.mean()) > 0.0) and (float(dr.mean()) < 0.0) and (fp < 0.05) and (n_pos >= 7)
+
+                rows_summary.append(
+                    {
+                        "k0_frac": float(k0),
+                        "variant": str(variant),
+                        "pearson_B_mean": float(pBv.mean()),
+                        "pearson_B_std": float(pBv.std(ddof=1)) if len(pBv) > 1 else 0.0,
+                        "pearson_C_mean": float(pCv.mean()),
+                        "pearson_C_std": float(pCv.std(ddof=1)) if len(pCv) > 1 else 0.0,
+                        "relRMSE_B_mean": float(rrBv.mean()),
+                        "relRMSE_B_std": float(rrBv.std(ddof=1)) if len(rrBv) > 1 else 0.0,
+                        "relRMSE_C_mean": float(rrCv.mean()),
+                        "relRMSE_C_std": float(rrCv.std(ddof=1)) if len(rrCv) > 1 else 0.0,
+                        "deltaP_mean": float(dp.mean()),
+                        "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                        "deltaR_mean": float(dr.mean()),
+                        "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                        "fisher_p": float(fp),
+                        "n_pos": int(n_pos),
+                        "verdict": bool(verdict),
+                    }
+                )
+
+        md_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_rows.append(
+                {
+                    "k0_frac": f"{float(r0['k0_frac']):.2f}",
+                    "variant": str(r0["variant"]),
+                    "Pearson_B mean±std": f"{float(r0['pearson_B_mean']):.4f} ± {float(r0['pearson_B_std']):.4f}",
+                    "Pearson_C mean±std": f"{float(r0['pearson_C_mean']):.4f} ± {float(r0['pearson_C_std']):.4f}",
+                    "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                    "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                    "Fisher p": fmt(float(r0["fisher_p"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos'])}/{n_fields}",
+                    "verdict": "PASS" if bool(r0["verdict"]) else "FAIL",
+                }
+            )
+
+        sanity_lines = "\n".join(
+            [
+                f"- k0_frac={k:.2f}: rel_err_gx_mean={split_sanity[k]['rel_err_gx_mean']:.3e}, "
+                f"rel_err_gy_mean={split_sanity[k]['rel_err_gy_mean']:.3e}, "
+                f"var_frac_gx_low_mean={split_sanity[k]['var_frac_gx_low_mean']:.3f}, "
+                f"var_frac_gy_low_mean={split_sanity[k]['var_frac_gy_low_mean']:.3f}"
+                for k in sorted(split_sanity.keys())
+            ]
+        )
+
+        summary_md = (
+            "# E30 — Predict low-k g from annulus dipole (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_local={w_local}, w_big={w_big}, n_radial_bins={n_radial_bins}\n"
+            f"- k0_fracs={sorted(k0_fracs)} (fraction of Nyquist)\n"
+            f"- ridge_alpha={ridge_alpha}, perms={n_perms}\n"
+            f"- mask: `{mask_png}`\n"
+            f"- sanity plot: `{sanity_png}`\n\n"
+            "## Band-split sanity (field-avg)\n\n"
+            + sanity_lines
+            + "\n\n## LOFO results (targets: gx_low, gy_low)\n\n"
+            + md_table(
+                md_rows,
+                [
+                    "k0_frac",
+                    "variant",
+                    "Pearson_B mean±std",
+                    "Pearson_C mean±std",
+                    "ΔPearson mean±std",
+                    "ΔrelRMSE mean±std",
+                    "Fisher p",
+                    "#folds ΔP>0",
+                    "verdict",
+                ],
+            )
+            + "\n"
+        )
+        (paths.run_dir / "summary_e30_lowk_from_dipole.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_local": w_local,
+                "w_big": w_big,
+                "n_radial_bins": n_radial_bins,
+                "k0_fracs": sorted([float(x) for x in k0_fracs]),
+                "ridge_alpha": ridge_alpha,
+                "n_perms": n_perms,
+                "rows_summary": rows_summary,
+                "split_sanity": split_sanity,
+                "mask_png": mask_png,
+                "sanity_png": str(sanity_png),
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))

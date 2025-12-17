@@ -1,0 +1,27 @@
+experiment: e30
+exp_name: e30_lowk_from_dipole
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Annulus feature geometry (PASS case from E29)
+w_local: 65
+w_big: 129
+n_radial_bins: 6
+eps_norm: 1.0e-12
+
+# Low/high-k split (fraction of Nyquist)
+k0_fracs: [0.10, 0.15, 0.25]
+
+# Ridge + placebo permutations
+ridge_alpha: 1.0
+n_perms: 200
+
+# FFT feature validation (compare a few samples to direct patch sums)
+validate_fft_n: 1
+validate_fft_rtol: 1.0e-6
+validate_fft_atol: 1.0e-6
+
