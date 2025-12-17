@@ -7925,6 +7925,642 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e27":
+        # Nonlocal moments ablation study on full-g residual (LOFO).
+        #
+        # Pipeline:
+        # - Generate n_fields independent rho01 in [0,1] (2D 1/f) and compute full gx via Poisson FFT.
+        # - Sample patches_per_field centers per field (same centers for all w_local/w_big).
+        # - Baseline local predictor P_local: pixels-only ridge-like SGD on z-scored rho patches (w_local).
+        # - Residual target: r = gx_true - gx_pred_P_local (scalar).
+        # - Residual baseline B_resid: local_B (mass,mass2,var,max,grad_energy) on w_local patch.
+        # - Residual augmented models C_resid: B_resid + nonlocal moments computed on w_big:
+        #     C1 rings-only, C2 +dipoles, C3 +quadrupoles.
+        #
+        # For each (w_local, w_big, variant): report ΔPearson(C-B), ΔrelRMSE(C-B) on residual r (LOFO folds),
+        # and a permutation placebo (shuffle nonlocal rows in TRAIN only, P perms/fold) with Fisher p-value.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        from .data_synth import solve_poisson_periodic_fft_2d
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_locals = [int(x) for x in cfg.get("w_locals", [33, 65])]
+        w_bigs = [int(x) for x in cfg.get("w_bigs", [65, 129, 193])]
+
+        n_perms = int(cfg.get("n_perms", 200))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        pixel_epochs = int(cfg.get("pixel_epochs", 2))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 1024))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if any((w <= 0) or (w % 2 == 0) for w in w_locals):
+            raise ValueError("w_locals must be odd positive ints")
+        if any((w <= 0) or (w % 2 == 0) for w in w_bigs):
+            raise ValueError("w_bigs must be odd positive ints")
+        if any(w < 65 for w in w_bigs):
+            raise ValueError("w_bigs must be >= 65 (uses fixed inner windows 33/65)")
+        if any(w > grid_size for w in w_bigs):
+            raise ValueError("w_bigs must be <= grid_size")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 101_111)
+        rng_null = np.random.default_rng(int(placebo_seed) + 101_222)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            ax = abs(float(x))
+            if ax != 0.0 and (ax < 1e-3 or ax >= 1e3):
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        # Pixel baseline: ridge-like SGD (scalar target), with fold-specific y scaling.
+        def fit_pixel_model(
+            train_fields: list[int],
+            fields_z: list[np.ndarray],
+            centers_by_field: list[np.ndarray],
+            w_local: int,
+            y_by_field: list[np.ndarray],
+        ) -> tuple[SGDRegressor, float, float]:
+            y_all = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0).astype(np.float64, copy=False)
+            y_mu = float(np.mean(y_all))
+            y_sd = float(np.std(y_all))
+            if not np.isfinite(y_sd) or y_sd <= 0:
+                y_sd = 1.0
+
+            eta0_eff = float(pixel_eta0) / float(w_local)
+            reg = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(placebo_seed) + 0,
+            )
+            rloc = w_local // 2
+            for _epoch in range(pixel_epochs):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w_local, w_local))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - rloc, cy - rloc].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg.partial_fit(Xb, (y[idx] - y_mu) / y_sd)
+            return reg, y_mu, y_sd
+
+        def predict_pixel(reg: SGDRegressor, y_mu: float, y_sd: float, field_z: np.ndarray, centers: np.ndarray, w_local: int) -> np.ndarray:
+            rloc = w_local // 2
+            win = sliding_window_view(field_z, (w_local, w_local))
+            out = np.empty((centers.shape[0],), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - rloc, cy - rloc].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx] = reg.predict(Xb) * y_sd + y_mu
+            return out
+
+        # Generate fields (rho in [0,1]) and full gx, plus z-scored rho for pixels.
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        gx_full_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            sol = solve_poisson_periodic_fft_2d(rho01)
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            gx_full_by_field.append(sol.gx.astype(np.float64, copy=False))
+
+        # Choose centers once per field, valid for all windows (avoid borders).
+        r_max = max(max(w_locals), max(w_bigs)) // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 444_444 + 1_000 * field_id)
+            cx = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_max, grid_size - r_max, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # y=gx_full at centers (independent of w_local/w_big).
+        y_gx_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            centers = centers_by_field[fid]
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            y_gx_by_field.append(gx_full_by_field[fid][cx, cy].astype(np.float64, copy=False))
+
+        # Precompute local B features on rho01 for each w_local and each field (stored per w_local).
+        B_by_w_field: dict[int, list[np.ndarray]] = {w: [] for w in w_locals}
+        for w_local in w_locals:
+            rloc = w_local // 2
+            for field_id in range(n_fields):
+                field = rho01_by_field[field_id]
+                centers = centers_by_field[field_id]
+                cx = centers[:, 0]
+                cy = centers[:, 1]
+                pref1 = _prefix_sum_2d(field)
+                pref2 = _prefix_sum_2d(field * field)
+                x0 = (cx - rloc).astype(np.int64)
+                x1 = (cx + rloc + 1).astype(np.int64)
+                y0 = (cy - rloc).astype(np.int64)
+                y1 = (cy + rloc + 1).astype(np.int64)
+                mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+                nvox = float(w_local * w_local)
+                mean = mass / nvox
+                sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+                var = np.maximum(0.0, sumsq / nvox - mean * mean)
+                mass2 = mass * mass
+                max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+                mx = max_grid[cx, cy]
+                gx_f, gy_f = np.gradient(field)
+                egrid = gx_f * gx_f + gy_f * gy_f
+                eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+                ge = eavg[cx, cy]
+                B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+                B_by_w_field[w_local].append(B)
+
+        # Nonlocal moment features are computed from nested windows:
+        # inner windows fixed at 33 and 65, outer window is w_big.
+        w_sizes = sorted(set([33, 65] + w_bigs))
+        xs = np.arange(grid_size, dtype=np.float64)[:, None]
+        ys = np.arange(grid_size, dtype=np.float64)[None, :]
+        X = np.broadcast_to(xs, (grid_size, grid_size))
+        Y = np.broadcast_to(ys, (grid_size, grid_size))
+
+        def _window_sums_at_centers(arr: np.ndarray, centers: np.ndarray, w: int) -> np.ndarray:
+            area = float(w * w)
+            grid = ndimage.uniform_filter(arr, size=w, mode="constant", cval=0.0) * area
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return grid[cx, cy].astype(np.float64, copy=False)
+
+        # Precompute full (C3) feature blocks for each w_big, per field.
+        # Column order is always: rings, dipoles, quadrupoles (nested variants are prefixes).
+        nonlocal_by_wbig_field: dict[int, list[np.ndarray]] = {w: [] for w in w_bigs}
+        nonlocal_names_by_wbig: dict[int, list[str]] = {}
+
+        for w_big in w_bigs:
+            if w_big == 65:
+                names = [
+                    "M33",
+                    "M65",
+                    "Ring1_M65m33",
+                    "Dx33",
+                    "Dy33",
+                    "DxRing1",
+                    "DyRing1",
+                    "Qxx33",
+                    "Qyy33",
+                    "Qxy33",
+                    "QxxRing1",
+                    "QyyRing1",
+                    "QxyRing1",
+                ]
+            else:
+                names = [
+                    "M33",
+                    "M65",
+                    f"M{w_big}",
+                    "Ring1_M65m33",
+                    f"Ring2_M{w_big}m65",
+                    "Dx33",
+                    "Dy33",
+                    "DxRing1",
+                    "DyRing1",
+                    "DxRing2",
+                    "DyRing2",
+                    "Qxx33",
+                    "Qyy33",
+                    "Qxy33",
+                    "QxxRing1",
+                    "QyyRing1",
+                    "QxyRing1",
+                    "QxxRing2",
+                    "QyyRing2",
+                    "QxyRing2",
+                ]
+            nonlocal_names_by_wbig[w_big] = names
+
+        for field_id in range(n_fields):
+            rho = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0].astype(np.float64)
+            cy = centers[:, 1].astype(np.float64)
+
+            rho_x = rho * X
+            rho_y = rho * Y
+            rho_x2 = rho * (X * X)
+            rho_y2 = rho * (Y * Y)
+            rho_xy = rho * (X * Y)
+
+            M: dict[int, np.ndarray] = {}
+            Sx: dict[int, np.ndarray] = {}
+            Sy: dict[int, np.ndarray] = {}
+            Sxx: dict[int, np.ndarray] = {}
+            Syy: dict[int, np.ndarray] = {}
+            Sxy: dict[int, np.ndarray] = {}
+            for w in w_sizes:
+                M[w] = _window_sums_at_centers(rho, centers, w)
+                Sx[w] = _window_sums_at_centers(rho_x, centers, w)
+                Sy[w] = _window_sums_at_centers(rho_y, centers, w)
+                Sxx[w] = _window_sums_at_centers(rho_x2, centers, w)
+                Syy[w] = _window_sums_at_centers(rho_y2, centers, w)
+                Sxy[w] = _window_sums_at_centers(rho_xy, centers, w)
+
+            Dx: dict[int, np.ndarray] = {}
+            Dy: dict[int, np.ndarray] = {}
+            Qxx: dict[int, np.ndarray] = {}
+            Qyy: dict[int, np.ndarray] = {}
+            Qxy: dict[int, np.ndarray] = {}
+            for w in w_sizes:
+                Dx[w] = (Sx[w] - cx * M[w]) / float(w)
+                Dy[w] = (Sy[w] - cy * M[w]) / float(w)
+                ww2 = float(w * w)
+                Qxx[w] = (Sxx[w] - 2.0 * cx * Sx[w] + (cx * cx) * M[w]) / ww2
+                Qyy[w] = (Syy[w] - 2.0 * cy * Sy[w] + (cy * cy) * M[w]) / ww2
+                Qxy[w] = (Sxy[w] - cx * Sy[w] - cy * Sx[w] + (cx * cy) * M[w]) / ww2
+
+            for w_big in w_bigs:
+                if w_big == 65:
+                    Ring1 = M[65] - M[33]
+                    DxRing1 = Dx[65] - Dx[33]
+                    DyRing1 = Dy[65] - Dy[33]
+                    QxxRing1 = Qxx[65] - Qxx[33]
+                    QyyRing1 = Qyy[65] - Qyy[33]
+                    QxyRing1 = Qxy[65] - Qxy[33]
+                    cols = [
+                        M[33],
+                        M[65],
+                        Ring1,
+                        Dx[33],
+                        Dy[33],
+                        DxRing1,
+                        DyRing1,
+                        Qxx[33],
+                        Qyy[33],
+                        Qxy[33],
+                        QxxRing1,
+                        QyyRing1,
+                        QxyRing1,
+                    ]
+                else:
+                    Ring1 = M[65] - M[33]
+                    Ring2 = M[w_big] - M[65]
+                    DxRing1 = Dx[65] - Dx[33]
+                    DyRing1 = Dy[65] - Dy[33]
+                    DxRing2 = Dx[w_big] - Dx[65]
+                    DyRing2 = Dy[w_big] - Dy[65]
+                    QxxRing1 = Qxx[65] - Qxx[33]
+                    QyyRing1 = Qyy[65] - Qyy[33]
+                    QxyRing1 = Qxy[65] - Qxy[33]
+                    QxxRing2 = Qxx[w_big] - Qxx[65]
+                    QyyRing2 = Qyy[w_big] - Qyy[65]
+                    QxyRing2 = Qxy[w_big] - Qxy[65]
+                    cols = [
+                        M[33],
+                        M[65],
+                        M[w_big],
+                        Ring1,
+                        Ring2,
+                        Dx[33],
+                        Dy[33],
+                        DxRing1,
+                        DyRing1,
+                        DxRing2,
+                        DyRing2,
+                        Qxx[33],
+                        Qyy[33],
+                        Qxy[33],
+                        QxxRing1,
+                        QyyRing1,
+                        QxyRing1,
+                        QxxRing2,
+                        QyyRing2,
+                        QxyRing2,
+                    ]
+                Ffull = np.column_stack(cols).astype(np.float64, copy=False)
+                assert_finite(f"nonlocal_full_w{w_big}", Ffull)
+                nonlocal_by_wbig_field[w_big].append(Ffull)
+
+        # Variant definitions: nested prefixes of the full feature block.
+        variant_order = ["C1_rings", "C2_rings+dipoles", "C3_rings+dipoles+quadrupoles"]
+        ncols_by_variant_wbig: dict[tuple[int, str], int] = {}
+        for w_big in w_bigs:
+            if w_big == 65:
+                n_ring, n_dip, n_quad = 3, 4, 6
+            else:
+                n_ring, n_dip, n_quad = 5, 6, 9
+            ncols_by_variant_wbig[(w_big, "C1_rings")] = n_ring
+            ncols_by_variant_wbig[(w_big, "C2_rings+dipoles")] = n_ring + n_dip
+            ncols_by_variant_wbig[(w_big, "C3_rings+dipoles+quadrupoles")] = n_ring + n_dip + n_quad
+
+        # Evaluate per w_local, per (w_big, variant) across LOFO folds.
+        rows_summary: list[dict[str, Any]] = []
+        for w_local in w_locals:
+            # Aggregators across folds for each combination.
+            combos = [(w_big, var) for w_big in w_bigs for var in variant_order]
+            dp_by_combo: dict[tuple[int, str], list[float]] = {c: [] for c in combos}
+            dr_by_combo: dict[tuple[int, str], list[float]] = {c: [] for c in combos}
+            pvals_by_combo: dict[tuple[int, str], list[float]] = {c: [] for c in combos}
+
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                reg, y_mu, y_sd = fit_pixel_model(train_fields, rhoz_by_field, centers_by_field, w_local, y_gx_by_field)
+
+                # residual targets
+                r_tr_list: list[np.ndarray] = []
+                Btr_list: list[np.ndarray] = []
+                for fid in train_fields:
+                    y = y_gx_by_field[fid]
+                    ypred = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[fid], centers_by_field[fid], w_local)
+                    r_tr_list.append((y - ypred).astype(np.float64, copy=False))
+                    Btr_list.append(B_by_w_field[w_local][fid])
+                r_tr = np.concatenate(r_tr_list, axis=0)
+                Btr = np.concatenate(Btr_list, axis=0)
+
+                y_te = y_gx_by_field[test_field]
+                ypred_te = predict_pixel(reg, y_mu, y_sd, rhoz_by_field[test_field], centers_by_field[test_field], w_local)
+                r_te = (y_te - ypred_te).astype(np.float64, copy=False)
+                Bte = B_by_w_field[w_local][test_field]
+
+                # Standardize B on train
+                B_mu = Btr.mean(axis=0)
+                B_sd = np.where(Btr.std(axis=0) > 0, Btr.std(axis=0), 1.0)
+                Btr_s = (Btr - B_mu) / B_sd
+                Bte_s = (Bte - B_mu) / B_sd
+
+                # Center residual target
+                r_mu = float(np.mean(r_tr))
+                rc = (r_tr - r_mu).reshape(-1, 1)
+
+                # Fit B_resid
+                A = Btr_s.T @ Btr_s
+                uB = Btr_s.T @ rc
+                wB = np.linalg.solve(A + ridge_alpha * np.eye(A.shape[0]), uB).reshape(-1)
+                rB_te = Bte_s @ wB + r_mu
+                pB = safe_corr_1d(r_te, rB_te)
+                rrB = relrmse_1d(r_te, rB_te)
+
+                # Prepare Z (for fast permutation block construction)
+                Z = np.concatenate([Btr_s, rc], axis=1)  # (n_train, dB+1)
+                ZT = Z.T
+                n_train = Btr_s.shape[0]
+
+                # For each w_big, compute real deltas and run permutations (shared perms across variants).
+                deltaP_real: dict[tuple[int, str], float] = {}
+
+                # Precompute centered r_te for correlation computations (placebo Pearson only).
+                rt = (r_te - float(r_te.mean())).astype(np.float64, copy=False)
+                norm_rt = float(np.linalg.norm(rt)) + 1e-12
+
+                # Cache per w_big to avoid recomputing in each perm loop.
+                cache_by_wbig: dict[int, dict[str, Any]] = {}
+                for w_big in w_bigs:
+                    Ftr_raw_full = np.concatenate([nonlocal_by_wbig_field[w_big][fid] for fid in train_fields], axis=0)
+                    Fte_raw_full = nonlocal_by_wbig_field[w_big][test_field]
+
+                    F_mu = Ftr_raw_full.mean(axis=0)
+                    F_sd = np.where(Ftr_raw_full.std(axis=0) > 0, Ftr_raw_full.std(axis=0), 1.0)
+                    Ftr_s_full = (Ftr_raw_full - F_mu) / F_sd
+                    Fte_s_full = (Fte_raw_full - F_mu) / F_sd
+                    assert_finite(f"Ftr_s_full_w{w_big}", Ftr_s_full)
+                    assert_finite(f"Fte_s_full_w{w_big}", Fte_s_full)
+
+                    C_full = Ftr_s_full.T @ Ftr_s_full
+
+                    # Precompute test centered cross-products for fast Pearson: Xc^T rt and Xc^T Xc.
+                    Xte_full = np.concatenate([Bte_s, Fte_s_full], axis=1)  # (n_test, dB+dF)
+                    mX = Xte_full.mean(axis=0)
+                    Xc = Xte_full - mX
+                    t_full = (Xc.T @ rt.reshape(-1, 1)).reshape(-1)
+                    S_full = Xc.T @ Xc
+                    cache_by_wbig[w_big] = {
+                        "Ftr_s_full": Ftr_s_full,
+                        "Fte_s_full": Fte_s_full,
+                        "C_full": C_full,
+                        "t_full": t_full,
+                        "S_full": S_full,
+                    }
+
+                    # Real fits per variant (explicit predictions; cheap).
+                    for var in variant_order:
+                        k = ncols_by_variant_wbig[(w_big, var)]
+                        Ftr_s = Ftr_s_full[:, :k]
+                        Fte_s = Fte_s_full[:, :k]
+
+                        XtrC = np.concatenate([Btr_s, Ftr_s], axis=1)
+                        XteC = np.concatenate([Bte_s, Fte_s], axis=1)
+                        XtX = XtrC.T @ XtrC
+                        Xty = XtrC.T @ rc
+                        wC = np.linalg.solve(XtX + ridge_alpha * np.eye(XtX.shape[0]), Xty).reshape(-1)
+                        rC_te = XteC @ wC + r_mu
+                        pC = safe_corr_1d(r_te, rC_te)
+                        rrC = relrmse_1d(r_te, rC_te)
+
+                        dp = float(pC - pB)
+                        dr = float(rrC - rrB)
+                        dp_by_combo[(w_big, var)].append(dp)
+                        dr_by_combo[(w_big, var)].append(dr)
+                        deltaP_real[(w_big, var)] = dp
+
+                # Permutation placebo: generate perms once per fold and reuse for all variants.
+                counts_ge: dict[tuple[int, str], int] = {(w_big, var): 0 for (w_big, var) in combos}
+                for _ in range(n_perms):
+                    pidx = rng_null.permutation(n_train)
+                    for w_big in w_bigs:
+                        c = cache_by_wbig[w_big]
+                        Ftr_s_full = c["Ftr_s_full"]
+                        C_full = c["C_full"]
+                        t_full = c["t_full"]
+                        S_full = c["S_full"]
+
+                        Fp_full = Ftr_s_full[pidx]
+                        M_full = ZT @ Fp_full  # (dB+1, dF_full)
+                        D_full = M_full[:-1, :]
+                        v_full = M_full[-1, :].reshape(-1, 1)
+
+                        for var in variant_order:
+                            k = ncols_by_variant_wbig[(w_big, var)]
+                            D = D_full[:, :k]
+                            v = v_full[:k, :]
+                            Cmat = C_full[:k, :k]
+
+                            XtX_p = np.block([[A, D], [D.T, Cmat]])
+                            Xty_p = np.vstack([uB, v])
+                            wP = np.linalg.solve(XtX_p + ridge_alpha * np.eye(XtX_p.shape[0]), Xty_p).reshape(-1)
+
+                            # Pearson on test without materializing predictions: corr(rt, (Xc @ wP)).
+                            # Full X columns are [B, F_full]; variant uses [B, F_prefix(k)].
+                            dB = Bte_s.shape[1]
+                            idx = np.r_[np.arange(dB), dB + np.arange(k)]
+                            t_sub = t_full[idx]
+                            S_sub = S_full[np.ix_(idx, idx)]
+                            denom = norm_rt * (float(np.sqrt(max(0.0, wP @ (S_sub @ wP)))) + 1e-12)
+                            pP = float((t_sub @ wP) / denom)
+
+                            null_delta = pP - pB
+                            if null_delta >= float(deltaP_real[(w_big, var)]):
+                                counts_ge[(w_big, var)] += 1
+
+                # Store fold p-values per combo (empirical, with +1 smoothing).
+                for w_big, var in combos:
+                    cge = counts_ge[(w_big, var)]
+                    p_emp = float((cge + 1.0) / (float(n_perms) + 1.0))
+                    pvals_by_combo[(w_big, var)].append(p_emp)
+
+            # Aggregate across folds for this w_local and emit rows for all combos.
+            for w_big, var in combos:
+                dp = np.asarray(dp_by_combo[(w_big, var)], dtype=np.float64)
+                dr = np.asarray(dr_by_combo[(w_big, var)], dtype=np.float64)
+                n_pos = int(np.sum(dp > 0.0))
+                fp = fisher_p(pvals_by_combo[(w_big, var)])
+                verdict = (float(dp.mean()) > 0.0) and (float(dr.mean()) < 0.0) and (fp < 0.05) and (n_pos >= 7)
+                rows_summary.append(
+                    {
+                        "w_local": int(w_local),
+                        "w_big": int(w_big),
+                        "variant": str(var),
+                        "deltaP_mean": float(dp.mean()),
+                        "deltaP_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                        "deltaR_mean": float(dr.mean()),
+                        "deltaR_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                        "fisher_p": float(fp),
+                        "n_pos": int(n_pos),
+                        "verdict": bool(verdict),
+                    }
+                )
+
+        # Winner lines: smallest (w_big, variant) that PASS, per w_local.
+        winner_lines: list[str] = []
+        for w_local in w_locals:
+            passed = [r0 for r0 in rows_summary if int(r0["w_local"]) == int(w_local) and bool(r0["verdict"])]
+            if not passed:
+                winner_lines.append(f"- w_local={w_local}: no PASS")
+                continue
+            order_v = {v: i for i, v in enumerate(variant_order)}
+            passed.sort(key=lambda r0: (int(r0["w_big"]), order_v.get(str(r0["variant"]), 999)))
+            best = passed[0]
+            winner_lines.append(
+                f"- w_local={w_local}: best={best['variant']} at w_big={best['w_big']} (ΔPearson_mean={fmt(best['deltaP_mean'])}, Fisher p={fmt(best['fisher_p'])})"
+            )
+
+        # Summary markdown
+        md_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_rows.append(
+                {
+                    "w_local": str(int(r0["w_local"])),
+                    "w_big": str(int(r0["w_big"])),
+                    "variant": str(r0["variant"]),
+                    "ΔPearson mean±std": f"{float(r0['deltaP_mean']):.4f} ± {float(r0['deltaP_std']):.4f}",
+                    "ΔrelRMSE mean±std": f"{float(r0['deltaR_mean']):.4f} ± {float(r0['deltaR_std']):.4f}",
+                    "Fisher p": fmt(float(r0["fisher_p"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos'])}/{n_fields}",
+                    "verdict": "PASS" if bool(r0["verdict"]) else "FAIL",
+                }
+            )
+
+        summary_md = (
+            "# E27 — Nonlocal moments ablation (full-g residual, LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_locals={w_locals}, w_bigs={w_bigs}\n"
+            f"- pixel: SGD L2 (ridge-like) alpha={pixel_alpha}, epochs={pixel_epochs}, batch={pixel_batch_size}\n"
+            f"- residual ridge_alpha={ridge_alpha}, perms={n_perms}\n\n"
+            + md_table(
+                md_rows,
+                ["w_local", "w_big", "variant", "ΔPearson mean±std", "ΔrelRMSE mean±std", "Fisher p", "#folds ΔP>0", "verdict"],
+            )
+            + "\n\n## Winners\n\n"
+            + "\n".join(winner_lines)
+            + "\n"
+        )
+        (paths.run_dir / "summary_e27_nonlocal_ablation.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_locals": w_locals,
+                "w_bigs": w_bigs,
+                "pixel": {
+                    "solver": "sgd_l2",
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "residual": {"ridge_alpha": ridge_alpha, "n_perms": n_perms},
+                "rows_summary": rows_summary,
+                "nonlocal_names_by_wbig": nonlocal_names_by_wbig,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
@@ -8007,7 +8643,7 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         return paths
 
     raise ValueError(
-        f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e10/e11/e12/e13/e14/e15/e15b/e15c/e16/e17/e18/e19/e20/e21/e21b/e22/e23/e24/e25/e26)"
+        f"Unknown experiment: {experiment} (expected e0/e1/e2/e3/e4/e5/e6/e7/e8/e10/e11/e12/e13/e14/e15/e15b/e15c/e16/e17/e18/e19/e20/e21/e21b/e22/e23/e24/e25/e26/e27)"
     )
 
 

@@ -1,0 +1,23 @@
+experiment: e27
+exp_name: e27_nonlocal_ablation
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+w_locals: [33, 65]
+w_bigs: [65, 129, 193]
+
+# Pixels-only baseline (ridge-like SGD L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 2
+pixel_batch_size: 1024
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# Residual ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
