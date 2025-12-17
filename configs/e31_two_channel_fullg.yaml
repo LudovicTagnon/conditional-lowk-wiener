@@ -1,0 +1,35 @@
+experiment: e31
+exp_name: e31_two_channel_fullg
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split
+k0_frac: 0.15
+
+# Geometry (sweet spot from E29/E30)
+w_local: 65
+w_big: 129
+n_radial_bins: 6
+eps_norm: 1.0e-12
+
+# Ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
+# Pixels-only SGD baselines (vector)
+pixel_alpha: 1.0e-4
+pixel_batch_size: 1024
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+pixel_epochs_full: 1
+pixel_epochs_high: 1
+
+# FFT annulus validation (compare a few samples to direct patch sums)
+validate_fft_n: 1
+validate_fft_rtol: 1.0e-6
+validate_fft_atol: 1.0e-6
+

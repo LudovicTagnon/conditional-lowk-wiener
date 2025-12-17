@@ -10080,11 +10080,12 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
 
         # Local_B features (w_local) on rho01.
-        def _prefix_sum_2d(x: np.ndarray) -> np.ndarray:
+        # NOTE: avoid shadowing module-level helpers used by other experiments.
+        def _prefix_sum_2d_local(x: np.ndarray) -> np.ndarray:
             x = np.asarray(x, dtype=np.float64)
             return np.pad(x, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
 
-        def _box_sum_2d(pref: np.ndarray, x0: np.ndarray, x1: np.ndarray, y0: np.ndarray, y1: np.ndarray) -> np.ndarray:
+        def _box_sum_2d_local(pref: np.ndarray, x0: np.ndarray, x1: np.ndarray, y0: np.ndarray, y1: np.ndarray) -> np.ndarray:
             return pref[x1, y1] - pref[x0, y1] - pref[x1, y0] + pref[x0, y0]
 
         B_by_field: list[np.ndarray] = []
@@ -10094,16 +10095,16 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
             centers = centers_by_field[field_id]
             cx = centers[:, 0]
             cy = centers[:, 1]
-            pref1 = _prefix_sum_2d(field)
-            pref2 = _prefix_sum_2d(field * field)
+            pref1 = _prefix_sum_2d_local(field)
+            pref2 = _prefix_sum_2d_local(field * field)
             x0 = (cx - rloc).astype(np.int64)
             x1 = (cx + rloc + 1).astype(np.int64)
             y0 = (cy - rloc).astype(np.int64)
             y1 = (cy + rloc + 1).astype(np.int64)
-            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            mass = _box_sum_2d_local(pref1, x0, x1, y0, y1)
             nvox = float(w_local * w_local)
             mean = mass / nvox
-            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            sumsq = _box_sum_2d_local(pref2, x0, x1, y0, y1)
             var = np.maximum(0.0, sumsq / nvox - mean * mean)
             mass2 = mass * mass
             max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
@@ -10562,6 +10563,916 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 "split_sanity": split_sanity,
                 "mask_png": mask_png,
                 "sanity_png": str(sanity_png),
+            },
+        )
+        return paths
+
+    if experiment == "e31":
+        # E31 — Two-channel LOFO model: g_full = g_high(local) + g_low(dipole).
+        #
+        # Decompose g via band-split in Fourier (k0_frac) and fit:
+        # - low-k channel: ridge on local_B + annulus rings+dipole (and rings-only control)
+        # - high-k channel: pixels-only ridge-like SGD on rho_high patches (and fixed truncated kernel control)
+        # Recompose: g_full_pred = g_low_pred + g_high_pred, evaluate LOFO on g_full.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        import matplotlib.pyplot as plt
+
+        from .features import nonlocal_annulus_moments
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 65)))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 129)))
+        n_radial_bins = int(cfg.get("n_radial_bins", 6))
+        eps_norm = float(cfg.get("eps_norm", 1e-12))
+
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        n_perms = int(cfg.get("n_perms", 200))
+
+        pixel_epochs_full = int(cfg.get("pixel_epochs_full", 1))
+        pixel_epochs_high = int(cfg.get("pixel_epochs_high", 1))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 1024))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        validate_fft_n = int(cfg.get("validate_fft_n", 1))
+        validate_fft_rtol = float(cfg.get("validate_fft_rtol", 1e-6))
+        validate_fft_atol = float(cfg.get("validate_fft_atol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_local > w_big:
+            raise ValueError("w_local must be <= w_big")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if n_radial_bins <= 0:
+            raise ValueError("n_radial_bins must be > 0")
+        if eps_norm <= 0:
+            raise ValueError("eps_norm must be > 0")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if pixel_epochs_full <= 0 or pixel_epochs_high <= 0:
+            raise ValueError("pixel_epochs_full/high must be > 0")
+        if pixel_batch_size <= 0:
+            raise ValueError("pixel_batch_size must be > 0")
+        if pixel_alpha <= 0:
+            raise ValueError("pixel_alpha must be > 0")
+        if pixel_eta0 <= 0:
+            raise ValueError("pixel_eta0 must be > 0")
+        if validate_fft_n < 0:
+            raise ValueError("validate_fft_n must be >= 0")
+        if validate_fft_rtol < 0 or validate_fft_atol < 0:
+            raise ValueError("validate_fft_rtol/atol must be >= 0")
+
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 311_311)
+        rng_null = np.random.default_rng(int(placebo_seed) + 322_322)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            if abs(float(x)) < 1e-3:
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            if y_true.shape != y_pred.shape or y_true.ndim != 2 or y_true.shape[1] != 2:
+                raise ValueError(f"invalid 2D targets shapes: {y_true.shape} vs {y_pred.shape}")
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(XtX: np.ndarray, Xty: np.ndarray) -> np.ndarray:
+            d = int(XtX.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(XtX + ridge_alpha * I, Xty)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(XtX + ridge_alpha * I, Xty, rcond=None)
+                return w
+
+        def standardize(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            mu = train.mean(axis=0)
+            sd = train.std(axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            return (train - mu) / sd, (test - mu) / sd, mu, sd
+
+        # Data generation + band split.
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        rho_high_by_field: list[np.ndarray] = []
+        rho_high_z_by_field: list[np.ndarray] = []
+        gx_full_by_field: list[np.ndarray] = []
+        gy_full_by_field: list[np.ndarray] = []
+        gx_low_by_field: list[np.ndarray] = []
+        gy_low_by_field: list[np.ndarray] = []
+        gx_high_by_field: list[np.ndarray] = []
+        gy_high_by_field: list[np.ndarray] = []
+
+        rel_recon_gx: list[float] = []
+        rel_recon_gy: list[float] = []
+        var_frac_gx_low: list[float] = []
+        var_frac_gy_low: list[float] = []
+
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            rho_high_by_field.append(np.asarray(split.rho_high, dtype=np.float64))
+            rho_high_z_by_field.append(_zscore_field(split.rho_high).astype(np.float64, copy=False))
+            gx_full_by_field.append(np.asarray(split.full.gx, dtype=np.float64))
+            gy_full_by_field.append(np.asarray(split.full.gy, dtype=np.float64))
+            gx_low_by_field.append(np.asarray(split.low.gx, dtype=np.float64))
+            gy_low_by_field.append(np.asarray(split.low.gy, dtype=np.float64))
+            gx_high_by_field.append(np.asarray(split.high.gx, dtype=np.float64))
+            gy_high_by_field.append(np.asarray(split.high.gy, dtype=np.float64))
+
+            denom_gx = float(np.mean(np.abs(split.full.gx))) + 1e-12
+            denom_gy = float(np.mean(np.abs(split.full.gy))) + 1e-12
+            rel_recon_gx.append(float(np.mean(np.abs(split.full.gx - (split.low.gx + split.high.gx))) / denom_gx))
+            rel_recon_gy.append(float(np.mean(np.abs(split.full.gy - (split.low.gy + split.high.gy))) / denom_gy))
+            var_frac_gx_low.append(float(np.var(split.low.gx) / (np.var(split.full.gx) + 1e-12)))
+            var_frac_gy_low.append(float(np.var(split.low.gy) / (np.var(split.full.gy) + 1e-12)))
+
+        # Centers: valid for w_big.
+        r_big = w_big // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 444_444 + 1_000 * field_id)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        y_full_by_field: list[np.ndarray] = []
+        y_low_by_field: list[np.ndarray] = []
+        y_high_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            centers = centers_by_field[fid]
+            y_full_by_field.append(sample_vec_at_centers(gx_full_by_field[fid], gy_full_by_field[fid], centers))
+            y_low_by_field.append(sample_vec_at_centers(gx_low_by_field[fid], gy_low_by_field[fid], centers))
+            y_high_by_field.append(sample_vec_at_centers(gx_high_by_field[fid], gy_high_by_field[fid], centers))
+
+        # Local_B features on rho01 (w_local).
+        rloc = w_local // 2
+        B_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0]
+            cy = centers[:, 1]
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - rloc).astype(np.int64)
+            x1 = (cx + rloc + 1).astype(np.int64)
+            y0 = (cy - rloc).astype(np.int64)
+            y1 = (cy + rloc + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(w_local * w_local)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+            assert_finite("B_local", B)
+            B_by_field.append(B)
+
+        # Annulus feature block: [M0, ring_sum..., ring_frac..., Dx,Dy,Dx_n,Dy_n, Qxx,Qxy,Qxx_n,Qxy_n]
+        rings_end = 1 + 2 * n_radial_bins
+        dip_end = rings_end + 4
+        quad_end = dip_end + 4
+        n_full = quad_end
+
+        def kernel_fft_centered(kernel: np.ndarray) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            wb = int(kernel.shape[0])
+            if (wb % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {wb}")
+            if wb > grid_size:
+                raise ValueError(f"kernel size {wb} exceeds grid_size {grid_size}")
+            r = wb // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def build_annulus_kernels() -> dict[str, np.ndarray]:
+            r_local = w_local // 2
+            coords = np.arange(w_big, dtype=np.float64) - float(r_big)
+            dx = coords[:, None]
+            dy = coords[None, :]
+            core = (np.abs(dx) <= float(r_local)) & (np.abs(dy) <= float(r_local))
+            outer = ~core
+            outer_f = outer.astype(np.float64)
+            r = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+
+            kernels: dict[str, np.ndarray] = {"M0": outer_f}
+            edges = np.linspace(float(r_local), float(r_big) + 1e-9, n_radial_bins + 1, dtype=np.float64)
+            for k in range(n_radial_bins):
+                lo = edges[k]
+                hi = edges[k + 1]
+                if k == n_radial_bins - 1:
+                    m = outer & (r >= lo) & (r <= hi)
+                else:
+                    m = outer & (r >= lo) & (r < hi)
+                kernels[f"ring{k}"] = m.astype(np.float64)
+
+            kernels["Dx"] = (dx * outer_f).astype(np.float64, copy=False)
+            kernels["Dy"] = (dy * outer_f).astype(np.float64, copy=False)
+            kernels["Qxx"] = ((dx * dx - dy * dy) * outer_f).astype(np.float64, copy=False)
+            kernels["Qxy"] = ((2.0 * dx * dy) * outer_f).astype(np.float64, copy=False)
+            return kernels
+
+        def plot_annulus_masks() -> Path:
+            r_local = w_local // 2
+            coords = np.arange(w_big, dtype=np.float64) - float(r_big)
+            dx = coords[:, None]
+            dy = coords[None, :]
+            core = (np.abs(dx) <= float(r_local)) & (np.abs(dy) <= float(r_local))
+            outer = (~core).astype(np.float64)
+            r = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+
+            edges = np.linspace(float(r_local), float(r_big) + 1e-9, n_radial_bins + 1, dtype=np.float64)
+            bins: list[np.ndarray] = []
+            for k in range(n_radial_bins):
+                lo = edges[k]
+                hi = edges[k + 1]
+                if k == n_radial_bins - 1:
+                    m = (r >= lo) & (r <= hi) & (~core)
+                else:
+                    m = (r >= lo) & (r < hi) & (~core)
+                bins.append(m.astype(np.float64))
+
+            ncols = 1 + len(bins)
+            fig, axes = plt.subplots(1, ncols, figsize=(3.0 * ncols, 3.0))
+            if ncols == 1:
+                axes = [axes]
+            axes[0].imshow(outer, cmap="gray", interpolation="nearest")
+            axes[0].set_title(f"outer (w_big={w_big}, w_local={w_local})")
+            axes[0].set_xticks([])
+            axes[0].set_yticks([])
+            for k, m in enumerate(bins):
+                axes[k + 1].imshow(m, cmap="gray", interpolation="nearest")
+                axes[k + 1].set_title(f"ring {k}")
+                axes[k + 1].set_xticks([])
+                axes[k + 1].set_yticks([])
+            fig.suptitle("E31 annulus + radial bins (outer-only)")
+            out = paths.run_dir / f"annulus_masks_wlocal{w_local}_wbig{w_big}.png"
+            fig.tight_layout()
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+            return out
+
+        mask_png = str(plot_annulus_masks())
+        kernels = build_annulus_kernels()
+        kernel_ffts = {name: kernel_fft_centered(k) for name, k in kernels.items()}
+
+        Ffull_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            field = rho01_by_field[field_id]
+            centers = centers_by_field[field_id]
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            F = np.zeros((patches_per_field, n_full), dtype=np.float64)
+            field_fft = np.fft.fftn(field)
+
+            m0_grid = np.fft.ifftn(field_fft * kernel_ffts["M0"]).real
+            M0 = m0_grid[cx, cy].astype(np.float64, copy=False)
+            denom = M0 + eps_norm
+            F[:, 0] = M0
+
+            ring_sums = np.zeros((patches_per_field, n_radial_bins), dtype=np.float64)
+            for k in range(n_radial_bins):
+                gk = np.fft.ifftn(field_fft * kernel_ffts[f"ring{k}"]).real
+                ring_sums[:, k] = gk[cx, cy].astype(np.float64, copy=False)
+            ring_fracs = ring_sums / denom[:, None]
+            F[:, 1 : 1 + n_radial_bins] = ring_sums
+            F[:, 1 + n_radial_bins : 1 + 2 * n_radial_bins] = ring_fracs
+
+            dx_grid = np.fft.ifftn(field_fft * kernel_ffts["Dx"]).real
+            dy_grid = np.fft.ifftn(field_fft * kernel_ffts["Dy"]).real
+            qxx_grid = np.fft.ifftn(field_fft * kernel_ffts["Qxx"]).real
+            qxy_grid = np.fft.ifftn(field_fft * kernel_ffts["Qxy"]).real
+            Dx = dx_grid[cx, cy].astype(np.float64, copy=False)
+            Dy = dy_grid[cx, cy].astype(np.float64, copy=False)
+            Qxx = qxx_grid[cx, cy].astype(np.float64, copy=False)
+            Qxy = qxy_grid[cx, cy].astype(np.float64, copy=False)
+
+            F[:, rings_end + 0] = Dx
+            F[:, rings_end + 1] = Dy
+            F[:, rings_end + 2] = Dx / denom
+            F[:, rings_end + 3] = Dy / denom
+
+            F[:, dip_end + 0] = Qxx
+            F[:, dip_end + 1] = Qxy
+            F[:, dip_end + 2] = Qxx / denom
+            F[:, dip_end + 3] = Qxy / denom
+
+            if field_id == 0 and validate_fft_n > 0:
+                n_check = min(int(validate_fft_n), patches_per_field)
+                feat_names = (
+                    ["M0"]
+                    + [f"ring_sum_{k}" for k in range(n_radial_bins)]
+                    + [f"ring_frac_{k}" for k in range(n_radial_bins)]
+                    + ["Dx", "Dy", "Dx_n", "Dy_n", "Qxx", "Qxy", "Qxx_n", "Qxy_n"]
+                )
+                for j in range(n_check):
+                    cxi = int(cx[j])
+                    cyi = int(cy[j])
+                    patch_big = field[cxi - r_big : cxi + r_big + 1, cyi - r_big : cyi + r_big + 1]
+                    d = nonlocal_annulus_moments(
+                        patch_big,
+                        w_local=w_local,
+                        n_radial_bins=n_radial_bins,
+                        include_dipole=True,
+                        include_quadrupole=True,
+                        eps=eps_norm,
+                    )
+                    row_d = np.zeros((n_full,), dtype=np.float64)
+                    row_d[0] = float(d["M0"])
+                    for k in range(n_radial_bins):
+                        row_d[1 + k] = float(d[f"ring_sum_{k}"])
+                        row_d[1 + n_radial_bins + k] = float(d[f"ring_frac_{k}"])
+                    row_d[rings_end + 0] = float(d["Dx"])
+                    row_d[rings_end + 1] = float(d["Dy"])
+                    row_d[rings_end + 2] = float(d["Dx_n"])
+                    row_d[rings_end + 3] = float(d["Dy_n"])
+                    row_d[dip_end + 0] = float(d["Qxx"])
+                    row_d[dip_end + 1] = float(d["Qxy"])
+                    row_d[dip_end + 2] = float(d["Qxx_n"])
+                    row_d[dip_end + 3] = float(d["Qxy_n"])
+
+                    for idx, name in enumerate(feat_names):
+                        a = float(F[j, idx])
+                        b = float(row_d[idx])
+                        if not np.isclose(a, b, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                            raise RuntimeError(
+                                "E31 annulus FFT feature mismatch "
+                                f"(field_id={field_id}, sample={j}, {name}): fft={a:.6g} direct={b:.6g}"
+                            )
+
+            assert_finite("annulus_F", F)
+            Ffull_by_field.append(F)
+
+        # High-k fixed kernel (truncated to w_local) via impulse response through the *exact* pipeline.
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c0 = grid_size // 2
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+        r = w_local // 2
+        kcorr_gx = split_delta.high.gx[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1][::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_gy = split_delta.high.gy[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1][::-1, ::-1].astype(np.float64, copy=False)
+        kfft_gx = kernel_fft_centered(kcorr_gx)
+        kfft_gy = kernel_fft_centered(kcorr_gy)
+
+        y_high_kern_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            rho0 = rho01_by_field[fid] - float(rho01_by_field[fid].mean())
+            field_fft = np.fft.fftn(rho0)
+            gx_pred = np.fft.ifftn(field_fft * kfft_gx).real
+            gy_pred = np.fft.ifftn(field_fft * kfft_gy).real
+            y_high_kern_by_field.append(sample_vec_at_centers(gx_pred, gy_pred, centers_by_field[fid]))
+
+        # Pixel baselines (vector), streamed per fold.
+        def fit_pixel_model_vec(
+            train_fields: list[int],
+            fields_z: list[np.ndarray],
+            centers_by_field: list[np.ndarray],
+            w: int,
+            y_by_field: list[np.ndarray],
+            *,
+            epochs: int,
+            random_state_base: int,
+        ) -> tuple[tuple[SGDRegressor, SGDRegressor], np.ndarray, np.ndarray]:
+            y_all = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0).astype(np.float64, copy=False)
+            y_mu = y_all.mean(axis=0)
+            y_sd = y_all.std(axis=0)
+            y_sd = np.where((~np.isfinite(y_sd)) | (y_sd <= 0), 1.0, y_sd)
+
+            eta0_eff = float(pixel_eta0) / float(w)
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(random_state_base) + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(random_state_base) + 1,
+            )
+
+            rloc = w // 2
+            for _epoch in range(int(epochs)):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w, w))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - rloc, cy - rloc].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg_gx.partial_fit(Xb, (y[idx, 0] - y_mu[0]) / y_sd[0])
+                        reg_gy.partial_fit(Xb, (y[idx, 1] - y_mu[1]) / y_sd[1])
+            return (reg_gx, reg_gy), y_mu, y_sd
+
+        def predict_pixel_vec(
+            regs: tuple[SGDRegressor, SGDRegressor],
+            y_mu: np.ndarray,
+            y_sd: np.ndarray,
+            field_z: np.ndarray,
+            centers: np.ndarray,
+            w: int,
+        ) -> np.ndarray:
+            reg_gx, reg_gy = regs
+            rloc = w // 2
+            win = sliding_window_view(field_z, (w, w))
+            out = np.empty((centers.shape[0], 2), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - rloc, cy - rloc].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx, 0] = reg_gx.predict(Xb) * y_sd[0] + y_mu[0]
+                out[idx, 1] = reg_gy.predict(Xb) * y_sd[1] + y_mu[1]
+            return out
+
+        # LOFO evaluation.
+        fold_rows_low: dict[str, list[dict[str, Any]]] = {"C1": [], "C2": []}
+        fold_rows_high: dict[str, list[dict[str, Any]]] = {"P_high": [], "K_high": []}
+        fold_rows_full: dict[str, list[dict[str, Any]]] = {"B_full": [], "P_full": [], "two_Phigh": [], "two_Khigh": []}
+
+        pvals_low_C2: list[float] = []
+        pvals_full_two_Phigh: list[float] = []
+        pvals_full_two_Khigh: list[float] = []
+
+        for test_field in range(n_fields):
+            train_fields = [i for i in range(n_fields) if i != test_field]
+
+            # Assemble train/test blocks.
+            Btr_raw = np.concatenate([B_by_field[fid] for fid in train_fields], axis=0)
+            Bte_raw = B_by_field[test_field]
+            Ftr_raw_full = np.concatenate([Ffull_by_field[fid] for fid in train_fields], axis=0)
+            Fte_raw_full = Ffull_by_field[test_field]
+
+            y_low_tr = np.concatenate([y_low_by_field[fid] for fid in train_fields], axis=0)
+            y_low_te = y_low_by_field[test_field]
+            y_high_te = y_high_by_field[test_field]
+            y_full_tr = np.concatenate([y_full_by_field[fid] for fid in train_fields], axis=0)
+            y_full_te = y_full_by_field[test_field]
+
+            # Standardize features on train only.
+            Btr, Bte, _, _ = standardize(Btr_raw, Bte_raw)
+            Ftr_full, Fte_full, _, _ = standardize(Ftr_raw_full, Fte_raw_full)
+
+            ymu_low = y_low_tr.mean(axis=0)
+            yclow = y_low_tr - ymu_low
+            ymu_full = y_full_tr.mean(axis=0)
+            ycfull = y_full_tr - ymu_full
+
+            # Low-k baseline B_low.
+            A = Btr.T @ Btr
+            U_low = Btr.T @ yclow
+            wB_low = solve_ridge(A, U_low)
+            y_low_B_te = Bte @ wB_low + ymu_low
+            pB_low = pearson_mean_2d(y_low_te, y_low_B_te)
+            rrB_low = relrmse_mean_2d(y_low_te, y_low_B_te)
+
+            # Low-k C1 rings-only.
+            k1 = rings_end
+            Xtr1 = np.concatenate([Btr, Ftr_full[:, :k1]], axis=1)
+            Xte1 = np.concatenate([Bte, Fte_full[:, :k1]], axis=1)
+            wC1 = solve_ridge(Xtr1.T @ Xtr1, Xtr1.T @ yclow)
+            y_low_C1_te = Xte1 @ wC1 + ymu_low
+            pC1 = pearson_mean_2d(y_low_te, y_low_C1_te)
+            rrC1 = relrmse_mean_2d(y_low_te, y_low_C1_te)
+
+            # Low-k C2 rings+dipole (for two-channel).
+            k2 = dip_end
+            Xtr2 = np.concatenate([Btr, Ftr_full[:, :k2]], axis=1)
+            Xte2 = np.concatenate([Bte, Fte_full[:, :k2]], axis=1)
+            wC2 = solve_ridge(Xtr2.T @ Xtr2, Xtr2.T @ yclow)
+            y_low_C2_te = Xte2 @ wC2 + ymu_low
+            pC2 = pearson_mean_2d(y_low_te, y_low_C2_te)
+            rrC2 = relrmse_mean_2d(y_low_te, y_low_C2_te)
+
+            fold_rows_low["C1"].append(
+                {
+                    "field_id": int(test_field),
+                    "pearson_B_low": float(pB_low),
+                    "relRMSE_B_low": float(rrB_low),
+                    "pearson_C1": float(pC1),
+                    "relRMSE_C1": float(rrC1),
+                    "deltaP_C1_vs_B": float(pC1 - pB_low),
+                    "deltaR_C1_vs_B": float(rrC1 - rrB_low),
+                }
+            )
+            fold_rows_low["C2"].append(
+                {
+                    "field_id": int(test_field),
+                    "pearson_B_low": float(pB_low),
+                    "relRMSE_B_low": float(rrB_low),
+                    "pearson_C2": float(pC2),
+                    "relRMSE_C2": float(rrC2),
+                    "deltaP_C2_vs_B": float(pC2 - pB_low),
+                    "deltaR_C2_vs_B": float(rrC2 - rrB_low),
+                }
+            )
+
+            # High-k channel: pixels-only on rho_high, and fixed kernel (local truncation).
+            regs_high, ymu_high_tr, ysd_high_tr = fit_pixel_model_vec(
+                train_fields,
+                rho_high_z_by_field,
+                centers_by_field,
+                w_local,
+                y_high_by_field,
+                epochs=pixel_epochs_high,
+                random_state_base=int(placebo_seed) + 4000 + 10_000 * test_field,
+            )
+            y_high_P_te = predict_pixel_vec(
+                regs_high,
+                ymu_high_tr,
+                ysd_high_tr,
+                rho_high_z_by_field[test_field],
+                centers_by_field[test_field],
+                w_local,
+            )
+            y_high_K_te = y_high_kern_by_field[test_field]
+
+            p_high_P = pearson_mean_2d(y_high_te, y_high_P_te)
+            rr_high_P = relrmse_mean_2d(y_high_te, y_high_P_te)
+            p_high_K = pearson_mean_2d(y_high_te, y_high_K_te)
+            rr_high_K = relrmse_mean_2d(y_high_te, y_high_K_te)
+            fold_rows_high["P_high"].append({"field_id": int(test_field), "pearson": float(p_high_P), "relRMSE": float(rr_high_P)})
+            fold_rows_high["K_high"].append({"field_id": int(test_field), "pearson": float(p_high_K), "relRMSE": float(rr_high_K)})
+
+            # Full-g baselines: B_full (local_B) and P_full (pixels on rho01 z-scored).
+            U_full = Btr.T @ ycfull
+            wB_full = solve_ridge(A, U_full)
+            y_full_B_te = Bte @ wB_full + ymu_full
+            pB_full = pearson_mean_2d(y_full_te, y_full_B_te)
+            rrB_full = relrmse_mean_2d(y_full_te, y_full_B_te)
+
+            regs_full, ymu_full_tr, ysd_full_tr = fit_pixel_model_vec(
+                train_fields,
+                rhoz_by_field,
+                centers_by_field,
+                w_local,
+                y_full_by_field,
+                epochs=pixel_epochs_full,
+                random_state_base=int(placebo_seed) + 5000 + 10_000 * test_field,
+            )
+            y_full_P_te = predict_pixel_vec(
+                regs_full,
+                ymu_full_tr,
+                ysd_full_tr,
+                rhoz_by_field[test_field],
+                centers_by_field[test_field],
+                w_local,
+            )
+            pP_full = pearson_mean_2d(y_full_te, y_full_P_te)
+            rrP_full = relrmse_mean_2d(y_full_te, y_full_P_te)
+
+            # Two-channel recomposition (use low=C2, high={P,K}).
+            y_full_two_P = y_low_C2_te + y_high_P_te
+            y_full_two_K = y_low_C2_te + y_high_K_te
+            p_two_P = pearson_mean_2d(y_full_te, y_full_two_P)
+            rr_two_P = relrmse_mean_2d(y_full_te, y_full_two_P)
+            p_two_K = pearson_mean_2d(y_full_te, y_full_two_K)
+            rr_two_K = relrmse_mean_2d(y_full_te, y_full_two_K)
+
+            fold_rows_full["B_full"].append({"field_id": int(test_field), "pearson": float(pB_full), "relRMSE": float(rrB_full)})
+            fold_rows_full["P_full"].append({"field_id": int(test_field), "pearson": float(pP_full), "relRMSE": float(rrP_full)})
+            fold_rows_full["two_Phigh"].append(
+                {
+                    "field_id": int(test_field),
+                    "pearson": float(p_two_P),
+                    "relRMSE": float(rr_two_P),
+                    "deltaP_vs_Pfull": float(p_two_P - pP_full),
+                    "deltaR_vs_Pfull": float(rr_two_P - rrP_full),
+                }
+            )
+            fold_rows_full["two_Khigh"].append(
+                {
+                    "field_id": int(test_field),
+                    "pearson": float(p_two_K),
+                    "relRMSE": float(rr_two_K),
+                    "deltaP_vs_Pfull": float(p_two_K - pP_full),
+                    "deltaR_vs_Pfull": float(rr_two_K - rrP_full),
+                }
+            )
+
+            # Placebo on low channel (shuffle annulus features in TRAIN), and propagate to full recomposition deltas vs P_full.
+            delta_low_real = float(pC2 - pB_low)
+            delta_full_P_real = float(p_two_P - pP_full)
+            delta_full_K_real = float(p_two_K - pP_full)
+
+            # Precompute blocks for fast permuted solves.
+            Z_low = np.concatenate([Btr, yclow], axis=1)  # (n_train, 5+2)
+            Cmat = (Ftr_full[:, :k2]).T @ (Ftr_full[:, :k2])
+            null_dP_low: list[float] = []
+            null_dP_full_P: list[float] = []
+            null_dP_full_K: list[float] = []
+            for _ in range(n_perms):
+                pidx = rng_null.permutation(Ftr_full.shape[0])
+                Fp = Ftr_full[pidx, :k2]
+                M = Z_low.T @ Fp  # (7,k2) => [D; Yc^T Fp]
+                D = M[: Btr.shape[1], :]
+                V = M[Btr.shape[1] :, :].T  # (k2,2)
+                XtX_p = np.block([[A, D], [D.T, Cmat]])
+                Xty_p = np.vstack([U_low, V])
+                wP = solve_ridge(XtX_p, Xty_p)
+                y_low_perm_te = Xte2 @ wP + ymu_low
+                p_low_perm = pearson_mean_2d(y_low_te, y_low_perm_te)
+                null_dP_low.append(float(p_low_perm - pB_low))
+
+                y_full_perm_P = y_low_perm_te + y_high_P_te
+                y_full_perm_K = y_low_perm_te + y_high_K_te
+                p_full_perm_P = pearson_mean_2d(y_full_te, y_full_perm_P)
+                p_full_perm_K = pearson_mean_2d(y_full_te, y_full_perm_K)
+                null_dP_full_P.append(float(p_full_perm_P - pP_full))
+                null_dP_full_K.append(float(p_full_perm_K - pP_full))
+
+            null_low = np.asarray(null_dP_low, dtype=np.float64)
+            null_full_P = np.asarray(null_dP_full_P, dtype=np.float64)
+            null_full_K = np.asarray(null_dP_full_K, dtype=np.float64)
+
+            p_emp_low = float((np.sum(null_low >= delta_low_real) + 1.0) / (float(n_perms) + 1.0))
+            p_emp_full_P = float((np.sum(null_full_P >= delta_full_P_real) + 1.0) / (float(n_perms) + 1.0))
+            p_emp_full_K = float((np.sum(null_full_K >= delta_full_K_real) + 1.0) / (float(n_perms) + 1.0))
+            pvals_low_C2.append(p_emp_low)
+            pvals_full_two_Phigh.append(p_emp_full_P)
+            pvals_full_two_Khigh.append(p_emp_full_K)
+
+        # Aggregate fold metrics.
+        def agg(rows: list[dict[str, Any]], key: str) -> tuple[float, float]:
+            v = np.asarray([float(r0[key]) for r0 in rows], dtype=np.float64)
+            return float(v.mean()), float(v.std(ddof=1)) if len(v) > 1 else 0.0
+
+        # Low channel summary (C2 vs B).
+        low_C2_dp = np.asarray([r0["deltaP_C2_vs_B"] for r0 in fold_rows_low["C2"]], dtype=np.float64)
+        low_C2_dr = np.asarray([r0["deltaR_C2_vs_B"] for r0 in fold_rows_low["C2"]], dtype=np.float64)
+        low_C2_npos = int(np.sum(low_C2_dp > 0))
+        low_C2_fp = fisher_p(pvals_low_C2)
+        low_C2_verdict = (float(low_C2_dp.mean()) > 0.0) and (float(low_C2_dr.mean()) < 0.0) and (low_C2_fp < 0.05) and (low_C2_npos >= 7)
+
+        # Full channel improvements vs P_full.
+        full_twoP_dp = np.asarray([r0["deltaP_vs_Pfull"] for r0 in fold_rows_full["two_Phigh"]], dtype=np.float64)
+        full_twoP_dr = np.asarray([r0["deltaR_vs_Pfull"] for r0 in fold_rows_full["two_Phigh"]], dtype=np.float64)
+        full_twoP_npos = int(np.sum(full_twoP_dp > 0))
+        full_twoP_fp = fisher_p(pvals_full_two_Phigh)
+
+        full_twoK_dp = np.asarray([r0["deltaP_vs_Pfull"] for r0 in fold_rows_full["two_Khigh"]], dtype=np.float64)
+        full_twoK_dr = np.asarray([r0["deltaR_vs_Pfull"] for r0 in fold_rows_full["two_Khigh"]], dtype=np.float64)
+        full_twoK_npos = int(np.sum(full_twoK_dp > 0))
+        full_twoK_fp = fisher_p(pvals_full_two_Khigh)
+
+        # Tables.
+        md_low = [
+            {
+                "model": "B_low (local_B)",
+                "Pearson mean±std": f"{agg([{'pearson': r['pearson_B_low']} for r in fold_rows_low['C2']], 'pearson')[0]:.4f} ± {agg([{'pearson': r['pearson_B_low']} for r in fold_rows_low['C2']], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg([{'rel': r['relRMSE_B_low']} for r in fold_rows_low['C2']], 'rel')[0]:.4f} ± {agg([{'rel': r['relRMSE_B_low']} for r in fold_rows_low['C2']], 'rel')[1]:.4f}",
+            },
+            {
+                "model": "C1_low (rings)",
+                "Pearson mean±std": f"{agg([{'pearson': r['pearson_C1']} for r in fold_rows_low['C1']], 'pearson')[0]:.4f} ± {agg([{'pearson': r['pearson_C1']} for r in fold_rows_low['C1']], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg([{'rel': r['relRMSE_C1']} for r in fold_rows_low['C1']], 'rel')[0]:.4f} ± {agg([{'rel': r['relRMSE_C1']} for r in fold_rows_low['C1']], 'rel')[1]:.4f}",
+            },
+            {
+                "model": "C2_low (rings+dipole)",
+                "Pearson mean±std": f"{agg([{'pearson': r['pearson_C2']} for r in fold_rows_low['C2']], 'pearson')[0]:.4f} ± {agg([{'pearson': r['pearson_C2']} for r in fold_rows_low['C2']], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg([{'rel': r['relRMSE_C2']} for r in fold_rows_low['C2']], 'rel')[0]:.4f} ± {agg([{'rel': r['relRMSE_C2']} for r in fold_rows_low['C2']], 'rel')[1]:.4f}",
+            },
+            {
+                "model": "Δ(C2-B_low) + placebo",
+                "Pearson mean±std": f"{float(low_C2_dp.mean()):.4f} ± {float(low_C2_dp.std(ddof=1)):.4f}",
+                "relRMSE mean±std": f"{float(low_C2_dr.mean()):.4f} ± {float(low_C2_dr.std(ddof=1)):.4f} (Fisher p={fmt(low_C2_fp)}, {low_C2_npos}/{n_fields}, {('PASS' if low_C2_verdict else 'FAIL')})",
+            },
+        ]
+
+        md_high = [
+            {
+                "model": "P_high (pixels on rho_high)",
+                "Pearson mean±std": f"{agg(fold_rows_high['P_high'], 'pearson')[0]:.4f} ± {agg(fold_rows_high['P_high'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_high['P_high'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_high['P_high'], 'relRMSE')[1]:.4f}",
+            },
+            {
+                "model": "K_high (fixed kernel, w_local)",
+                "Pearson mean±std": f"{agg(fold_rows_high['K_high'], 'pearson')[0]:.4f} ± {agg(fold_rows_high['K_high'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_high['K_high'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_high['K_high'], 'relRMSE')[1]:.4f}",
+            },
+        ]
+
+        md_full = [
+            {
+                "model": "B_full (local_B)",
+                "Pearson mean±std": f"{agg(fold_rows_full['B_full'], 'pearson')[0]:.4f} ± {agg(fold_rows_full['B_full'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_full['B_full'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_full['B_full'], 'relRMSE')[1]:.4f}",
+            },
+            {
+                "model": "P_full (pixels on rho)",
+                "Pearson mean±std": f"{agg(fold_rows_full['P_full'], 'pearson')[0]:.4f} ± {agg(fold_rows_full['P_full'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_full['P_full'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_full['P_full'], 'relRMSE')[1]:.4f}",
+            },
+            {
+                "model": "two-channel (low=C2, high=P_high)",
+                "Pearson mean±std": f"{agg(fold_rows_full['two_Phigh'], 'pearson')[0]:.4f} ± {agg(fold_rows_full['two_Phigh'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_full['two_Phigh'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_full['two_Phigh'], 'relRMSE')[1]:.4f}",
+            },
+            {
+                "model": "Δ(two-P_high vs P_full) + placebo",
+                "Pearson mean±std": f"{float(full_twoP_dp.mean()):.4f} ± {float(full_twoP_dp.std(ddof=1)):.4f}",
+                "relRMSE mean±std": f"{float(full_twoP_dr.mean()):.4f} ± {float(full_twoP_dr.std(ddof=1)):.4f} (Fisher p={fmt(full_twoP_fp)}, {full_twoP_npos}/{n_fields})",
+            },
+            {
+                "model": "two-channel (low=C2, high=K_high)",
+                "Pearson mean±std": f"{agg(fold_rows_full['two_Khigh'], 'pearson')[0]:.4f} ± {agg(fold_rows_full['two_Khigh'], 'pearson')[1]:.4f}",
+                "relRMSE mean±std": f"{agg(fold_rows_full['two_Khigh'], 'relRMSE')[0]:.4f} ± {agg(fold_rows_full['two_Khigh'], 'relRMSE')[1]:.4f}",
+            },
+            {
+                "model": "Δ(two-K_high vs P_full) + placebo",
+                "Pearson mean±std": f"{float(full_twoK_dp.mean()):.4f} ± {float(full_twoK_dp.std(ddof=1)):.4f}",
+                "relRMSE mean±std": f"{float(full_twoK_dr.mean()):.4f} ± {float(full_twoK_dr.std(ddof=1)):.4f} (Fisher p={fmt(full_twoK_fp)}, {full_twoK_npos}/{n_fields})",
+            },
+        ]
+
+        # Save a quick plot of recon sanity + variance fractions (field-avg).
+        fig, ax = plt.subplots(1, 1, figsize=(6, 3))
+        ax.plot([1], [float(np.mean(rel_recon_gx))], "o", label="rel_recon_gx_mean")
+        ax.plot([2], [float(np.mean(rel_recon_gy))], "o", label="rel_recon_gy_mean")
+        ax.plot([3], [float(np.mean(var_frac_gx_low))], "o", label="var_frac_gx_low_mean")
+        ax.plot([4], [float(np.mean(var_frac_gy_low))], "o", label="var_frac_gy_low_mean")
+        ax.set_xticks([1, 2, 3, 4])
+        ax.set_xticklabels(["recon_gx", "recon_gy", "varfrac_gx", "varfrac_gy"])
+        ax.set_ylabel("value")
+        ax.set_title("E31 band-split sanity (field-avg)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+        sanity_png = paths.run_dir / "band_split_sanity.png"
+        fig.tight_layout()
+        fig.savefig(sanity_png, dpi=150)
+        plt.close(fig)
+
+        summary_md = (
+            "# E31 — Two-channel full-g predictor (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- k0_frac={k0_frac}, w_local={w_local}, w_big={w_big}, n_radial_bins={n_radial_bins}\n"
+            f"- ridge_alpha={ridge_alpha}, perms={n_perms}\n"
+            f"- pixels: alpha={pixel_alpha}, batch={pixel_batch_size}, epochs_full={pixel_epochs_full}, epochs_high={pixel_epochs_high}\n"
+            f"- mask: `{mask_png}`\n"
+            f"- sanity: `{sanity_png}`\n\n"
+            "## Decomposition sanity (field-avg)\n\n"
+            f"- rel_recon_gx_mean={float(np.mean(rel_recon_gx)):.3e}, rel_recon_gy_mean={float(np.mean(rel_recon_gy)):.3e}\n"
+            f"- var_frac_gx_low_mean={float(np.mean(var_frac_gx_low)):.3f}, var_frac_gy_low_mean={float(np.mean(var_frac_gy_low)):.3f}\n\n"
+            "## Low-k channel (targets: gx_low, gy_low)\n\n"
+            + md_table(md_low, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## High-k channel (targets: gx_high, gy_high)\n\n"
+            + md_table(md_high, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## Full g (targets: gx_full, gy_full)\n\n"
+            + md_table(md_full, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n"
+        )
+        (paths.run_dir / "summary_e31_two_channel_fullg.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "k0_frac": k0_frac,
+                "w_local": w_local,
+                "w_big": w_big,
+                "n_radial_bins": n_radial_bins,
+                "ridge_alpha": ridge_alpha,
+                "n_perms": n_perms,
+                "pixels": {
+                    "alpha": pixel_alpha,
+                    "batch_size": pixel_batch_size,
+                    "epochs_full": pixel_epochs_full,
+                    "epochs_high": pixel_epochs_high,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "split_sanity": {
+                    "rel_recon_gx_mean": float(np.mean(rel_recon_gx)),
+                    "rel_recon_gy_mean": float(np.mean(rel_recon_gy)),
+                    "var_frac_gx_low_mean": float(np.mean(var_frac_gx_low)),
+                    "var_frac_gy_low_mean": float(np.mean(var_frac_gy_low)),
+                },
+                "fisher_p_low_C2": float(low_C2_fp),
+                "fisher_p_full_two_Phigh": float(full_twoP_fp),
+                "fisher_p_full_two_Khigh": float(full_twoK_fp),
+                "fold_rows": {
+                    "low_C1": fold_rows_low["C1"],
+                    "low_C2": fold_rows_low["C2"],
+                    "high_P": fold_rows_high["P_high"],
+                    "high_K": fold_rows_high["K_high"],
+                    "full_B": fold_rows_full["B_full"],
+                    "full_P": fold_rows_full["P_full"],
+                    "full_two_Phigh": fold_rows_full["two_Phigh"],
+                    "full_two_Khigh": fold_rows_full["two_Khigh"],
+                },
+                "paths": {
+                    "mask_png": mask_png,
+                    "sanity_png": str(sanity_png),
+                },
             },
         )
         return paths
