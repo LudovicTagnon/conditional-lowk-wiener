@@ -85,3 +85,101 @@ def patch_basic_stats(patch: np.ndarray) -> tuple[float, float, float, float]:
     var = float(patch.var())
     mx = float(patch.max())
     return mass, mass2, var, mx
+
+
+def nonlocal_annulus_moments(
+    patch_big: np.ndarray,
+    *,
+    w_local: int,
+    n_radial_bins: int = 6,
+    include_dipole: bool = True,
+    include_quadrupole: bool = True,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """
+    Compute "outer annulus" moments on a big patch, excluding the inner local square core.
+
+    Definitions:
+    - Inner core: |dx| <= r_local AND |dy| <= r_local (square, consistent with w_local patches)
+    - Outer mask: NOT(core) within patch_big
+    - Coordinates dx,dy are integers centered at the patch center.
+    - Radial rings are computed by binning r = sqrt(dx^2+dy^2) on the outer mask.
+
+    Returns a dict with:
+    - M0: sum(rho_outer)
+    - ring_sum_k and ring_frac_k for k in [0..n_radial_bins-1]
+    - optional dipole: Dx,Dy and normalized Dx_n,Dy_n
+    - optional quadrupole (traceless): Qxx,Qxy and normalized Qxx_n,Qxy_n
+    """
+    patch_big = np.asarray(patch_big, dtype=np.float64)
+    if patch_big.ndim != 2 or patch_big.shape[0] != patch_big.shape[1]:
+        raise ValueError(f"patch_big must be square 2D, got {patch_big.shape}")
+    w_big = int(patch_big.shape[0])
+    if w_big <= 0 or (w_big % 2) == 0:
+        raise ValueError(f"patch_big size must be positive odd, got {w_big}")
+    w_local = int(w_local)
+    if w_local <= 0 or (w_local % 2) == 0:
+        raise ValueError(f"w_local must be positive odd, got {w_local}")
+    if w_local > w_big:
+        raise ValueError(f"w_local must be <= w_big, got {w_local} > {w_big}")
+    n_radial_bins = int(n_radial_bins)
+    if n_radial_bins <= 0:
+        raise ValueError("n_radial_bins must be > 0")
+    eps = float(eps)
+    if eps <= 0:
+        raise ValueError("eps must be > 0")
+    assert_finite("patch_big", patch_big)
+
+    r_big = w_big // 2
+    r_local = w_local // 2
+    coords = np.arange(w_big, dtype=np.float64) - float(r_big)
+    dx = coords[:, None]
+    dy = coords[None, :]
+    core = (np.abs(dx) <= float(r_local)) & (np.abs(dy) <= float(r_local))
+    outer = ~core
+
+    rho_outer = patch_big * outer
+    M0 = float(rho_outer.sum())
+    denom = M0 + eps
+
+    out: dict[str, float] = {"M0": M0}
+
+    # Radial rings on the outer mask (equal-width bins in r).
+    if r_big <= r_local or not outer.any():
+        for k in range(n_radial_bins):
+            out[f"ring_sum_{k}"] = 0.0
+            out[f"ring_frac_{k}"] = 0.0
+    else:
+        r = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+        edges = np.linspace(float(r_local), float(r_big) + 1e-9, n_radial_bins + 1, dtype=np.float64)
+        for k in range(n_radial_bins):
+            lo = edges[k]
+            hi = edges[k + 1]
+            if k == n_radial_bins - 1:
+                m = outer & (r >= lo) & (r <= hi)
+            else:
+                m = outer & (r >= lo) & (r < hi)
+            s = float(patch_big[m].sum()) if m.any() else 0.0
+            out[f"ring_sum_{k}"] = s
+            out[f"ring_frac_{k}"] = float(s / denom)
+
+    if include_dipole:
+        Dx = float((rho_outer * dx).sum())
+        Dy = float((rho_outer * dy).sum())
+        out["Dx"] = Dx
+        out["Dy"] = Dy
+        out["Dx_n"] = float(Dx / denom)
+        out["Dy_n"] = float(Dy / denom)
+
+    if include_quadrupole:
+        qxx = float((rho_outer * (dx * dx - dy * dy)).sum())
+        qxy = float((rho_outer * (2.0 * dx * dy)).sum())
+        out["Qxx"] = qxx
+        out["Qxy"] = qxy
+        out["Qxx_n"] = float(qxx / denom)
+        out["Qxy_n"] = float(qxy / denom)
+
+    for k, v in out.items():
+        if not np.isfinite(v):
+            raise ValueError(f"nonlocal_annulus_moments produced non-finite {k}: {v}")
+    return out
