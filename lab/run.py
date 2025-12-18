@@ -12180,6 +12180,824 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e33":
+        # E33 — Low-k: push multi-annulus dipole toward the pixels-only upper bound (LOFO).
+        #
+        # Sweep over (w_big, M):
+        # - Feature models: multi-annulus dipole-only and dipole+quad, with/without local_B.
+        # - Baseline: C2 single-annulus dipole (E32-style outer-only annulus) for each w_big.
+        # - Pixels ceiling: P_low(w_big) pixels-only SGD on rho patches of size w_big.
+        from numpy.lib.stride_tricks import sliding_window_view
+        from scipy import ndimage, stats
+        from sklearn.linear_model import SGDRegressor
+
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 65)))
+
+        w_bigs = [_require_odd("w_big", int(w)) for w in cfg.get("w_bigs", [129, 193])]
+        M_list = [int(m) for m in cfg.get("M_list", [8, 16])]
+        ring_bin_mode = str(cfg.get("ring_bin_mode", "uniform_r")).lower()
+
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        n_perms = int(cfg.get("n_perms", 200))
+
+        # Pixels-only ceiling.
+        pixel_epochs = int(cfg.get("pixel_epochs", 1))
+        pixel_batch_size = int(cfg.get("pixel_batch_size", 256))
+        pixel_alpha = float(cfg.get("pixel_alpha", 1e-4))
+        pixel_eta0 = float(cfg.get("pixel_eta0", 0.01))
+        pixel_power_t = float(cfg.get("pixel_power_t", 0.25))
+
+        validate_fft_n = int(cfg.get("validate_fft_n", 1))
+        validate_fft_rtol = float(cfg.get("validate_fft_rtol", 1e-6))
+        validate_fft_atol = float(cfg.get("validate_fft_atol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if not w_bigs:
+            raise ValueError("w_bigs must be non-empty")
+        if any(wb < w_local for wb in w_bigs):
+            raise ValueError("All w_bigs must be >= w_local")
+        if any(wb > grid_size for wb in w_bigs):
+            raise ValueError("All w_bigs must be <= grid_size")
+        if not M_list or any(m <= 0 for m in M_list):
+            raise ValueError("M_list must contain positive ints")
+        if ring_bin_mode not in {"uniform_r", "equal_area"}:
+            raise ValueError("ring_bin_mode must be 'uniform_r' or 'equal_area'")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if pixel_epochs <= 0:
+            raise ValueError("pixel_epochs must be > 0")
+        if pixel_batch_size <= 0:
+            raise ValueError("pixel_batch_size must be > 0")
+        if pixel_alpha <= 0:
+            raise ValueError("pixel_alpha must be > 0")
+        if pixel_eta0 <= 0:
+            raise ValueError("pixel_eta0 must be > 0")
+        if validate_fft_n < 0:
+            raise ValueError("validate_fft_n must be >= 0")
+        if validate_fft_rtol < 0 or validate_fft_atol < 0:
+            raise ValueError("validate_fft_rtol/atol must be >= 0")
+
+        rng_null = np.random.default_rng(int(placebo_seed) + 333_333)
+        rng_pixel = np.random.default_rng(int(placebo_seed) + 344_444)
+
+        def fisher_p(ps: list[float]) -> float:
+            if not ps:
+                return float("nan")
+            eps = 1.0 / float(n_perms + 1)
+            ps2 = [min(1.0, max(float(p), eps)) for p in ps]
+            stat = -2.0 * float(np.sum(np.log(ps2)))
+            return float(stats.chi2.sf(stat, 2 * len(ps2)))
+
+        def fmt(x: float) -> str:
+            if not np.isfinite(x):
+                return "nan"
+            if abs(float(x)) < 1e-3:
+                return f"{x:.3e}"
+            return f"{x:.4f}"
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(XtX: np.ndarray, Xty: np.ndarray) -> np.ndarray:
+            d = int(XtX.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(XtX + ridge_alpha * I, Xty)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(XtX + ridge_alpha * I, Xty, rcond=None)
+                return w
+
+        def standardize(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            mu = train.mean(axis=0)
+            sd = train.std(axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            return (train - mu) / sd, (test - mu) / sd, mu, sd
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            wb = int(kernel.shape[0])
+            if (wb % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {wb}")
+            if wb > grid_size:
+                raise ValueError(f"kernel size {wb} exceeds grid_size {grid_size}")
+            r = wb // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def annulus_edges(r_min: float, r_max: float, n_bins: int) -> np.ndarray:
+            if ring_bin_mode == "uniform_r":
+                return np.linspace(r_min, r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            rsq = np.linspace(r_min * r_min, r_max * r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            return np.sqrt(rsq, dtype=np.float64)
+
+        # Shared fields and band-split cache.
+        rho01_by_field: list[np.ndarray] = []
+        rhoz_by_field: list[np.ndarray] = []
+        split_cache: list[BandSplit2D] = []
+        rel_recon_gx: list[float] = []
+        rel_recon_gy: list[float] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rhoz_by_field.append(_zscore_field(rho01).astype(np.float64, copy=False))
+            split_cache.append(split)
+            rel_recon_gx.append(float(split.rel_err_gx))
+            rel_recon_gy.append(float(split.rel_err_gy))
+
+        def sample_low_at_centers(split: BandSplit2D, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([split.low.gx[cx, cy], split.low.gy[cx, cy]]).astype(np.float64, copy=False)
+
+        def build_local_B(field: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            rloc = w_local // 2
+            cx = centers[:, 0]
+            cy = centers[:, 1]
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - rloc).astype(np.int64)
+            x1 = (cx + rloc + 1).astype(np.int64)
+            y0 = (cy - rloc).astype(np.int64)
+            y1 = (cy + rloc + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(w_local * w_local)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=w_local, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=w_local, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+            assert_finite("B_local", B)
+            return B
+
+        # Pixels-only ceiling (vector), streamed per fold.
+        def fit_pixel_model_vec(
+            train_fields: list[int],
+            fields_z: list[np.ndarray],
+            centers_by_field: list[np.ndarray],
+            w: int,
+            y_by_field: list[np.ndarray],
+            *,
+            random_state_base: int,
+        ) -> tuple[tuple[SGDRegressor, SGDRegressor], np.ndarray, np.ndarray]:
+            y_all = np.concatenate([y_by_field[fid] for fid in train_fields], axis=0).astype(np.float64, copy=False)
+            y_mu = y_all.mean(axis=0)
+            y_sd = y_all.std(axis=0)
+            y_sd = np.where((~np.isfinite(y_sd)) | (y_sd <= 0), 1.0, y_sd)
+
+            eta0_eff = float(pixel_eta0) / float(w)
+            reg_gx = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(random_state_base) + 0,
+            )
+            reg_gy = SGDRegressor(
+                loss="squared_error",
+                penalty="l2",
+                alpha=float(pixel_alpha),
+                learning_rate="invscaling",
+                eta0=float(eta0_eff),
+                power_t=float(pixel_power_t),
+                max_iter=1,
+                tol=None,
+                fit_intercept=True,
+                average=True,
+                random_state=int(random_state_base) + 1,
+            )
+
+            r = w // 2
+            for _epoch in range(int(pixel_epochs)):
+                for fid in train_fields:
+                    field = fields_z[fid]
+                    centers = centers_by_field[fid]
+                    y = y_by_field[fid]
+                    win = sliding_window_view(field, (w, w))
+                    perm = rng_pixel.permutation(centers.shape[0])
+                    for start in range(0, centers.shape[0], pixel_batch_size):
+                        idx = perm[start : start + pixel_batch_size]
+                        cx = centers[idx, 0].astype(np.int64)
+                        cy = centers[idx, 1].astype(np.int64)
+                        Xb = win[cx - r, cy - r].reshape(len(idx), -1).astype(np.float32, copy=False)
+                        reg_gx.partial_fit(Xb, (y[idx, 0] - y_mu[0]) / y_sd[0])
+                        reg_gy.partial_fit(Xb, (y[idx, 1] - y_mu[1]) / y_sd[1])
+            return (reg_gx, reg_gy), y_mu, y_sd
+
+        def predict_pixel_vec(
+            regs: tuple[SGDRegressor, SGDRegressor],
+            y_mu: np.ndarray,
+            y_sd: np.ndarray,
+            field_z: np.ndarray,
+            centers: np.ndarray,
+            w: int,
+        ) -> np.ndarray:
+            reg_gx, reg_gy = regs
+            r = w // 2
+            win = sliding_window_view(field_z, (w, w))
+            out = np.empty((centers.shape[0], 2), dtype=np.float64)
+            for start in range(0, centers.shape[0], pixel_batch_size):
+                idx = slice(start, min(centers.shape[0], start + pixel_batch_size))
+                cx = centers[idx, 0].astype(np.int64)
+                cy = centers[idx, 1].astype(np.int64)
+                Xb = win[cx - r, cy - r].reshape(len(cx), -1).astype(np.float32, copy=False)
+                out[idx, 0] = reg_gx.predict(Xb) * y_sd[0] + y_mu[0]
+                out[idx, 1] = reg_gy.predict(Xb) * y_sd[1] + y_mu[1]
+            return out
+
+        # Compute everything per w_big (centers differ).
+        rows_summary: list[dict[str, Any]] = []
+        coeff_plots: dict[str, str] = {}
+        pixel_rows: list[dict[str, Any]] = []
+
+        for wb in w_bigs:
+            r_big = int(wb) // 2
+            rloc = w_local // 2
+
+            centers_by_field: list[np.ndarray] = []
+            for field_id in range(n_fields):
+                rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * wb + 1_000 * field_id)
+                cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+                cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+                centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+            y_low_by_field = [sample_low_at_centers(split_cache[fid], centers_by_field[fid]) for fid in range(n_fields)]
+            B_by_field = [build_local_B(rho01_by_field[fid], centers_by_field[fid]) for fid in range(n_fields)]
+
+            # C2 baseline features (outer-only annulus between r_local..r_big).
+            n_radial_bins_c2 = int(cfg.get("n_radial_bins_c2", 6))
+            edges_c2 = annulus_edges(float(rloc), float(r_big), n_radial_bins_c2)
+            coords = np.arange(int(wb), dtype=np.float64) - float(r_big)
+            dx = coords[:, None]
+            dy = coords[None, :]
+            core = (np.abs(dx) <= float(rloc)) & (np.abs(dy) <= float(rloc))
+            outer = ~core
+            rgrid = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+
+            kernels_c2: dict[str, np.ndarray] = {"M0": outer.astype(np.float64)}
+            for k in range(n_radial_bins_c2):
+                lo = edges_c2[k]
+                hi = edges_c2[k + 1]
+                if k == n_radial_bins_c2 - 1:
+                    ring = outer & (rgrid >= lo) & (rgrid <= hi)
+                else:
+                    ring = outer & (rgrid >= lo) & (rgrid < hi)
+                kernels_c2[f"ring{k}"] = ring.astype(np.float64)
+            kernels_c2["Dx"] = (dx * outer).astype(np.float64, copy=False)
+            kernels_c2["Dy"] = (dy * outer).astype(np.float64, copy=False)
+
+            kernel_ffts_c2 = {name: kernel_fft_centered(k, grid_size=grid_size) for name, k in kernels_c2.items()}
+            rings_end_c2 = 1 + 2 * n_radial_bins_c2
+            dip_end_c2 = rings_end_c2 + 4
+
+            Fc2_by_field: list[np.ndarray] = []
+            for field_id in range(n_fields):
+                field = rho01_by_field[field_id]
+                centers = centers_by_field[field_id]
+                cx = centers[:, 0].astype(np.int64)
+                cy = centers[:, 1].astype(np.int64)
+                field_fft = np.fft.fftn(field)
+                Fc2 = np.zeros((patches_per_field, dip_end_c2), dtype=np.float64)
+                m0_grid = np.fft.ifftn(field_fft * kernel_ffts_c2["M0"]).real
+                M0 = m0_grid[cx, cy].astype(np.float64, copy=False)
+                denom = M0 + 1e-12
+                Fc2[:, 0] = M0
+                ring_sums = np.zeros((patches_per_field, n_radial_bins_c2), dtype=np.float64)
+                for k in range(n_radial_bins_c2):
+                    gk = np.fft.ifftn(field_fft * kernel_ffts_c2[f"ring{k}"]).real
+                    ring_sums[:, k] = gk[cx, cy].astype(np.float64, copy=False)
+                ring_fracs = ring_sums / denom[:, None]
+                Fc2[:, 1 : 1 + n_radial_bins_c2] = ring_sums
+                Fc2[:, 1 + n_radial_bins_c2 : 1 + 2 * n_radial_bins_c2] = ring_fracs
+                dx_grid = np.fft.ifftn(field_fft * kernel_ffts_c2["Dx"]).real
+                dy_grid = np.fft.ifftn(field_fft * kernel_ffts_c2["Dy"]).real
+                Dx_all = dx_grid[cx, cy].astype(np.float64, copy=False)
+                Dy_all = dy_grid[cx, cy].astype(np.float64, copy=False)
+                Fc2[:, rings_end_c2 + 0] = Dx_all
+                Fc2[:, rings_end_c2 + 1] = Dy_all
+                Fc2[:, rings_end_c2 + 2] = Dx_all / denom
+                Fc2[:, rings_end_c2 + 3] = Dy_all / denom
+                assert_finite("Fc2", Fc2)
+                Fc2_by_field.append(Fc2)
+
+            # Pixels-only ceiling P_low(w_big).
+            pixel_fold_rows: list[dict[str, Any]] = []
+            for test_field in range(n_fields):
+                train_fields = [i for i in range(n_fields) if i != test_field]
+                regs, ymu, ysd = fit_pixel_model_vec(
+                    train_fields,
+                    rhoz_by_field,
+                    centers_by_field,
+                    int(wb),
+                    y_low_by_field,
+                    random_state_base=int(placebo_seed) + 9000 + 10_000 * wb + 100 * test_field,
+                )
+                y_pred = predict_pixel_vec(regs, ymu, ysd, rhoz_by_field[test_field], centers_by_field[test_field], int(wb))
+                p = pearson_mean_2d(y_low_by_field[test_field], y_pred)
+                rr = relrmse_mean_2d(y_low_by_field[test_field], y_pred)
+                pixel_fold_rows.append({"field_id": int(test_field), "pearson": float(p), "relRMSE": float(rr)})
+            p_mean = float(np.mean([r0["pearson"] for r0 in pixel_fold_rows]))
+            p_std = float(np.std([r0["pearson"] for r0 in pixel_fold_rows], ddof=1))
+            r_mean = float(np.mean([r0["relRMSE"] for r0 in pixel_fold_rows]))
+            r_std = float(np.std([r0["relRMSE"] for r0 in pixel_fold_rows], ddof=1))
+            pixel_rows.append(
+                {
+                    "w_big": int(wb),
+                    "model": "P_low(pixels)",
+                    "pearson_mean": p_mean,
+                    "pearson_std": p_std,
+                    "relRMSE_mean": r_mean,
+                    "relRMSE_std": r_std,
+                }
+            )
+            write_csv(
+                paths.run_dir / f"lofo_by_field_pixels_low_wbig{wb}.csv",
+                list(pixel_fold_rows[0].keys()),
+                [[r0[k] for k in pixel_fold_rows[0].keys()] for r0 in pixel_fold_rows],
+            )
+
+            # Sweep over M and build feature blocks for each.
+            for M in M_list:
+                edges = annulus_edges(0.0, float(r_big), int(M))
+                radii = 0.5 * (edges[:-1] + edges[1:])
+
+                # Multi-annulus kernels on full disk (no core exclusion).
+                kernels_dip: dict[str, np.ndarray] = {}
+                kernels_quad: dict[str, np.ndarray] = {}
+                for m in range(int(M)):
+                    lo = edges[m]
+                    hi = edges[m + 1]
+                    if m == int(M) - 1:
+                        ring = (rgrid >= lo) & (rgrid <= hi)
+                    else:
+                        ring = (rgrid >= lo) & (rgrid < hi)
+                    ring_f = ring.astype(np.float64)
+                    kernels_dip[f"dx{m}"] = (dx * ring_f).astype(np.float64, copy=False)
+                    kernels_dip[f"dy{m}"] = (dy * ring_f).astype(np.float64, copy=False)
+                    kernels_quad[f"q1{m}"] = ((dx * dx - dy * dy) * ring_f).astype(np.float64, copy=False)
+                    kernels_quad[f"q2{m}"] = ((2.0 * dx * dy) * ring_f).astype(np.float64, copy=False)
+
+                fft_dip = {name: kernel_fft_centered(k, grid_size=grid_size) for name, k in kernels_dip.items()}
+                fft_quad = {name: kernel_fft_centered(k, grid_size=grid_size) for name, k in kernels_quad.items()}
+
+                F_dip_by_field: list[np.ndarray] = []
+                F_dipquad_by_field: list[np.ndarray] = []
+                for field_id in range(n_fields):
+                    field = rho01_by_field[field_id]
+                    centers = centers_by_field[field_id]
+                    cx = centers[:, 0].astype(np.int64)
+                    cy = centers[:, 1].astype(np.int64)
+                    field_fft = np.fft.fftn(field)
+
+                    Fd = np.zeros((patches_per_field, 2 * int(M)), dtype=np.float64)
+                    Fq = np.zeros((patches_per_field, 4 * int(M)), dtype=np.float64)
+                    for m in range(int(M)):
+                        dxm_grid = np.fft.ifftn(field_fft * fft_dip[f"dx{m}"]).real
+                        dym_grid = np.fft.ifftn(field_fft * fft_dip[f"dy{m}"]).real
+                        q1m_grid = np.fft.ifftn(field_fft * fft_quad[f"q1{m}"]).real
+                        q2m_grid = np.fft.ifftn(field_fft * fft_quad[f"q2{m}"]).real
+                        Fd[:, m] = dxm_grid[cx, cy].astype(np.float64, copy=False)
+                        Fd[:, int(M) + m] = dym_grid[cx, cy].astype(np.float64, copy=False)
+                        Fq[:, m] = dxm_grid[cx, cy].astype(np.float64, copy=False)
+                        Fq[:, int(M) + m] = dym_grid[cx, cy].astype(np.float64, copy=False)
+                        Fq[:, 2 * int(M) + m] = q1m_grid[cx, cy].astype(np.float64, copy=False)
+                        Fq[:, 3 * int(M) + m] = q2m_grid[cx, cy].astype(np.float64, copy=False)
+
+                    assert_finite("Fd", Fd)
+                    assert_finite("Fq", Fq)
+
+                    # Light validation by direct computation on one sample for first/last ring.
+                    if field_id == 0 and validate_fft_n > 0:
+                        n_check = min(int(validate_fft_n), patches_per_field)
+                        for j in range(n_check):
+                            cxi = int(cx[j])
+                            cyi = int(cy[j])
+                            patch = field[cxi - r_big : cxi + r_big + 1, cyi - r_big : cyi + r_big + 1]
+                            coords_l = np.arange(int(wb), dtype=np.float64) - float(r_big)
+                            dx_l = coords_l[:, None]
+                            dy_l = coords_l[None, :]
+                            r_l = np.sqrt(dx_l * dx_l + dy_l * dy_l, dtype=np.float64)
+                            for mm in (0, int(M) - 1):
+                                lo = edges[mm]
+                                hi = edges[mm + 1]
+                                if mm == int(M) - 1:
+                                    ring = (r_l >= lo) & (r_l <= hi)
+                                else:
+                                    ring = (r_l >= lo) & (r_l < hi)
+                                dx_d = float((patch * (dx_l * ring)).sum()) if ring.any() else 0.0
+                                dy_d = float((patch * (dy_l * ring)).sum()) if ring.any() else 0.0
+                                q1_d = float((patch * ((dx_l * dx_l - dy_l * dy_l) * ring)).sum()) if ring.any() else 0.0
+                                q2_d = float((patch * ((2.0 * dx_l * dy_l) * ring)).sum()) if ring.any() else 0.0
+                                if not np.isclose(Fd[j, mm], dx_d, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                                    raise RuntimeError("E33 FFT mismatch on Dx ring validation")
+                                if not np.isclose(Fd[j, int(M) + mm], dy_d, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                                    raise RuntimeError("E33 FFT mismatch on Dy ring validation")
+                                if not np.isclose(Fq[j, 2 * int(M) + mm], q1_d, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                                    raise RuntimeError("E33 FFT mismatch on Q1 ring validation")
+                                if not np.isclose(Fq[j, 3 * int(M) + mm], q2_d, rtol=validate_fft_rtol, atol=validate_fft_atol):
+                                    raise RuntimeError("E33 FFT mismatch on Q2 ring validation")
+
+                    F_dip_by_field.append(Fd)
+                    F_dipquad_by_field.append(Fq)
+
+                # LOFO for all variants at this (w_big,M).
+                variants = [
+                    ("D", False, "dipole"),  # dipole-only, no B
+                    ("BD", True, "dipole"),  # B + dipole
+                    ("DQ", False, "dipole+quad"),
+                    ("BDQ", True, "dipole+quad"),
+                ]
+
+                # Storage for coeff plots (BD and BDQ).
+                coef_bd_folds: list[np.ndarray] = []  # (2M,2) raw coefs for Dx/Dy
+                coef_bdq_folds: list[np.ndarray] = []  # (4M,2) raw coefs for Dx/Dy/Q1/Q2
+
+                # Per-variant fold metrics + p-values vs C2.
+                variant_fold_metrics: dict[str, list[dict[str, Any]]] = {name: [] for name, *_ in variants}
+                variant_pvals_vs_c2: dict[str, list[float]] = {name: [] for name, *_ in variants}
+
+                for test_field in range(n_fields):
+                    train_fields = [i for i in range(n_fields) if i != test_field]
+
+                    # Assemble shared train/test blocks.
+                    Btr_raw = np.concatenate([B_by_field[fid] for fid in train_fields], axis=0)
+                    Bte_raw = B_by_field[test_field]
+                    Fc2_tr_raw = np.concatenate([Fc2_by_field[fid] for fid in train_fields], axis=0)
+                    Fc2_te_raw = Fc2_by_field[test_field]
+                    ytr = np.concatenate([y_low_by_field[fid] for fid in train_fields], axis=0)
+                    yte = y_low_by_field[test_field]
+
+                    # Standardize B and C2.
+                    Btr, Bte, _, _ = standardize(Btr_raw, Bte_raw)
+                    Fc2_tr, Fc2_te, _, _ = standardize(Fc2_tr_raw, Fc2_te_raw)
+                    y_mu = ytr.mean(axis=0)
+                    yc = ytr - y_mu
+
+                    # Compute C2 baseline once (Pearson/relRMSE).
+                    Xtr_c2 = np.concatenate([Btr, Fc2_tr], axis=1)
+                    Xte_c2 = np.concatenate([Bte, Fc2_te], axis=1)
+                    wC2 = solve_ridge(Xtr_c2.T @ Xtr_c2, Xtr_c2.T @ yc)
+                    yC2_te = Xte_c2 @ wC2 + y_mu
+                    pC2 = pearson_mean_2d(yte, yC2_te)
+                    rrC2 = relrmse_mean_2d(yte, yC2_te)
+
+                    # Dipole-only features (standardize per fold).
+                    Fd_tr_raw = np.concatenate([F_dip_by_field[fid] for fid in train_fields], axis=0)
+                    Fd_te_raw = F_dip_by_field[test_field]
+                    Fd_tr, Fd_te, _, sd_fd = standardize(Fd_tr_raw, Fd_te_raw)
+
+                    # Dipole+quad features.
+                    Fq_tr_raw = np.concatenate([F_dipquad_by_field[fid] for fid in train_fields], axis=0)
+                    Fq_te_raw = F_dipquad_by_field[test_field]
+                    Fq_tr, Fq_te, _, sd_fq = standardize(Fq_tr_raw, Fq_te_raw)
+
+                    # Fit each variant, compute placebo p_emp vs C2 (shuffle feature block in TRAIN only).
+                    for name, use_B, mode in variants:
+                        if mode == "dipole":
+                            Ftr = Fd_tr
+                            Fte = Fd_te
+                            sd = sd_fd
+                        else:
+                            Ftr = Fq_tr
+                            Fte = Fq_te
+                            sd = sd_fq
+
+                        if use_B:
+                            Xtr = np.concatenate([Btr, Ftr], axis=1)
+                            Xte = np.concatenate([Bte, Fte], axis=1)
+                        else:
+                            Xtr = Ftr
+                            Xte = Fte
+
+                        w = solve_ridge(Xtr.T @ Xtr, Xtr.T @ yc)
+                        y_pred = Xte @ w + y_mu
+                        p = pearson_mean_2d(yte, y_pred)
+                        rr = relrmse_mean_2d(yte, y_pred)
+                        deltaP_vs_C2 = float(p - pC2)
+                        deltaR_vs_C2 = float(rr - rrC2)
+
+                        # Placebo null: shuffle multi-annulus block rows in TRAIN only.
+                        null_dP: list[float] = []
+                        for _ in range(n_perms):
+                            pidx = rng_null.permutation(Ftr.shape[0])
+                            Fp = Ftr[pidx]
+                            if use_B:
+                                Xtrp = np.concatenate([Btr, Fp], axis=1)
+                            else:
+                                Xtrp = Fp
+                            wp = solve_ridge(Xtrp.T @ Xtrp, Xtrp.T @ yc)
+                            y_perm = Xte @ wp + y_mu
+                            p_perm = pearson_mean_2d(yte, y_perm)
+                            null_dP.append(float(p_perm - pC2))
+                        null = np.asarray(null_dP, dtype=np.float64)
+                        p_emp = float((np.sum(null >= deltaP_vs_C2) + 1.0) / (float(n_perms) + 1.0))
+                        variant_pvals_vs_c2[name].append(p_emp)
+
+                        variant_fold_metrics[name].append(
+                            {
+                                "field_id": int(test_field),
+                                "pearson": float(p),
+                                "relRMSE": float(rr),
+                                "pearson_C2": float(pC2),
+                                "relRMSE_C2": float(rrC2),
+                                "deltaP_vs_C2": float(deltaP_vs_C2),
+                                "deltaR_vs_C2": float(deltaR_vs_C2),
+                                "p_emp_vs_C2": float(p_emp),
+                            }
+                        )
+
+                        # Collect coefficients for BD / BDQ (raw units) for plotting.
+                        if name == "BD" and use_B and mode == "dipole":
+                            w_raw = w[-Ftr.shape[1] :, :] / sd[:, None]
+                            coef_bd_folds.append(w_raw)
+                        if name == "BDQ" and use_B and mode == "dipole+quad":
+                            w_raw = w[-Ftr.shape[1] :, :] / sd[:, None]
+                            coef_bdq_folds.append(w_raw)
+
+                # Aggregate per-variant.
+                for name, use_B, mode in variants:
+                    rows = variant_fold_metrics[name]
+                    pvals = variant_pvals_vs_c2[name]
+                    pv = np.asarray([r0["pearson"] for r0 in rows], dtype=np.float64)
+                    rv = np.asarray([r0["relRMSE"] for r0 in rows], dtype=np.float64)
+                    dp = np.asarray([r0["deltaP_vs_C2"] for r0 in rows], dtype=np.float64)
+                    dr = np.asarray([r0["deltaR_vs_C2"] for r0 in rows], dtype=np.float64)
+                    npos = int(np.sum(dp > 0.0))
+                    fp = fisher_p(pvals)
+                    rows_summary.append(
+                        {
+                            "w_big": int(wb),
+                            "M": int(M),
+                            "variant": name,
+                            "use_B": bool(use_B),
+                            "mode": mode,
+                            "pearson_mean": float(pv.mean()),
+                            "pearson_std": float(pv.std(ddof=1)) if len(pv) > 1 else 0.0,
+                            "relRMSE_mean": float(rv.mean()),
+                            "relRMSE_std": float(rv.std(ddof=1)) if len(rv) > 1 else 0.0,
+                            "pearson_C2_mean": float(np.mean([r0["pearson_C2"] for r0 in rows])),
+                            "relRMSE_C2_mean": float(np.mean([r0["relRMSE_C2"] for r0 in rows])),
+                            "deltaP_vs_C2_mean": float(dp.mean()),
+                            "deltaP_vs_C2_std": float(dp.std(ddof=1)) if len(dp) > 1 else 0.0,
+                            "deltaR_vs_C2_mean": float(dr.mean()),
+                            "deltaR_vs_C2_std": float(dr.std(ddof=1)) if len(dr) > 1 else 0.0,
+                            "fisher_p_vs_C2": float(fp),
+                            "n_pos_vs_C2": int(npos),
+                        }
+                    )
+
+                    tag = f"wbig{wb}_M{M}_{name}"
+                    write_csv(
+                        paths.run_dir / f"lofo_by_field_{tag}.csv",
+                        list(rows[0].keys()) if rows else [],
+                        [[r0[k] for k in rows[0].keys()] for r0 in rows] if rows else [],
+                    )
+
+                # Coefficient plots (mean±std across folds) for BD and BDQ.
+                if coef_bd_folds:
+                    coef = np.stack(coef_bd_folds, axis=0)  # (n_fields,2M,2)
+                    mean = coef.mean(axis=0)
+                    std = coef.std(axis=0, ddof=1) if coef.shape[0] > 1 else np.zeros_like(mean)
+                    Dx_gx = mean[: int(M), 0]
+                    Dx_gy = mean[: int(M), 1]
+                    Dy_gx = mean[int(M) :, 0]
+                    Dy_gy = mean[int(M) :, 1]
+                    Dx_gx_s = std[: int(M), 0]
+                    Dx_gy_s = std[: int(M), 1]
+                    Dy_gx_s = std[int(M) :, 0]
+                    Dy_gy_s = std[int(M) :, 1]
+
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=True)
+                    ax = axes[0]
+                    ax.plot(radii, Dx_gx, "-o", label="gx <- Dx")
+                    ax.fill_between(radii, Dx_gx - Dx_gx_s, Dx_gx + Dx_gx_s, alpha=0.2)
+                    ax.plot(radii, Dy_gx, "-o", label="gx <- Dy")
+                    ax.fill_between(radii, Dy_gx - Dy_gx_s, Dy_gx + Dy_gx_s, alpha=0.2)
+                    ax.set_title("BD dipole weights (gx)")
+                    ax.set_xlabel("radius")
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=8)
+
+                    ax = axes[1]
+                    ax.plot(radii, Dx_gy, "-o", label="gy <- Dx")
+                    ax.fill_between(radii, Dx_gy - Dx_gy_s, Dx_gy + Dx_gy_s, alpha=0.2)
+                    ax.plot(radii, Dy_gy, "-o", label="gy <- Dy")
+                    ax.fill_between(radii, Dy_gy - Dy_gy_s, Dy_gy + Dy_gy_s, alpha=0.2)
+                    ax.set_title("BD dipole weights (gy)")
+                    ax.set_xlabel("radius")
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=8)
+
+                    fig.suptitle(f"E33 BD dipole weights (w_big={wb}, M={M})")
+                    fig.tight_layout()
+                    out = paths.run_dir / f"coeffs_bd_wbig{wb}_M{M}.png"
+                    fig.savefig(out, dpi=150)
+                    plt.close(fig)
+                    coeff_plots[f"BD_wbig{wb}_M{M}"] = str(out)
+
+                if coef_bdq_folds:
+                    coef = np.stack(coef_bdq_folds, axis=0)  # (n_fields,4M,2)
+                    mean = coef.mean(axis=0)
+                    std = coef.std(axis=0, ddof=1) if coef.shape[0] > 1 else np.zeros_like(mean)
+                    q1 = mean[2 * int(M) : 3 * int(M), :]
+                    q2 = mean[3 * int(M) : 4 * int(M), :]
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=True)
+                    ax = axes[0]
+                    ax.plot(radii, q1[:, 0], "-o", label="gx <- Q1")
+                    ax.fill_between(radii, q1[:, 0] - std[2 * int(M) : 3 * int(M), 0], q1[:, 0] + std[2 * int(M) : 3 * int(M), 0], alpha=0.2)
+                    ax.plot(radii, q2[:, 0], "-o", label="gx <- Q2")
+                    ax.fill_between(radii, q2[:, 0] - std[3 * int(M) : 4 * int(M), 0], q2[:, 0] + std[3 * int(M) : 4 * int(M), 0], alpha=0.2)
+                    ax.set_title("BDQ quad weights (gx)")
+                    ax.set_xlabel("radius")
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=8)
+
+                    ax = axes[1]
+                    ax.plot(radii, q1[:, 1], "-o", label="gy <- Q1")
+                    ax.fill_between(radii, q1[:, 1] - std[2 * int(M) : 3 * int(M), 1], q1[:, 1] + std[2 * int(M) : 3 * int(M), 1], alpha=0.2)
+                    ax.plot(radii, q2[:, 1], "-o", label="gy <- Q2")
+                    ax.fill_between(radii, q2[:, 1] - std[3 * int(M) : 4 * int(M), 1], q2[:, 1] + std[3 * int(M) : 4 * int(M), 1], alpha=0.2)
+                    ax.set_title("BDQ quad weights (gy)")
+                    ax.set_xlabel("radius")
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=8)
+
+                    fig.suptitle(f"E33 BDQ quad weights (w_big={wb}, M={M})")
+                    fig.tight_layout()
+                    out = paths.run_dir / f"coeffs_bdq_wbig{wb}_M{M}.png"
+                    fig.savefig(out, dpi=150)
+                    plt.close(fig)
+                    coeff_plots[f"BDQ_wbig{wb}_M{M}"] = str(out)
+
+        # Build Markdown rows.
+        md_rows: list[dict[str, str]] = []
+        for r0 in rows_summary:
+            md_rows.append(
+                {
+                    "w_big": str(int(r0["w_big"])),
+                    "M": str(int(r0["M"])),
+                    "variant": str(r0["variant"]),
+                    "Pearson mean±std": f"{float(r0['pearson_mean']):.4f} ± {float(r0['pearson_std']):.4f}",
+                    "relRMSE mean±std": f"{float(r0['relRMSE_mean']):.4f} ± {float(r0['relRMSE_std']):.4f}",
+                    "Pearson_C2 (mean)": f"{float(r0['pearson_C2_mean']):.4f}",
+                    "ΔPearson vs C2 mean±std": f"{float(r0['deltaP_vs_C2_mean']):.4f} ± {float(r0['deltaP_vs_C2_std']):.4f}",
+                    "ΔrelRMSE vs C2 mean±std": f"{float(r0['deltaR_vs_C2_mean']):.4f} ± {float(r0['deltaR_vs_C2_std']):.4f}",
+                    "Fisher p (ΔP vs C2)": fmt(float(r0["fisher_p_vs_C2"])),
+                    "#folds ΔP>0": f"{int(r0['n_pos_vs_C2'])}/{n_fields}",
+                }
+            )
+
+        md_pixel: list[dict[str, str]] = []
+        for r0 in pixel_rows:
+            md_pixel.append(
+                {
+                    "w_big": str(int(r0["w_big"])),
+                    "model": str(r0["model"]),
+                    "Pearson mean±std": f"{float(r0['pearson_mean']):.4f} ± {float(r0['pearson_std']):.4f}",
+                    "relRMSE mean±std": f"{float(r0['relRMSE_mean']):.4f} ± {float(r0['relRMSE_std']):.4f}",
+                }
+            )
+
+        coef_lines = "\n".join([f"- `{k}`: `{v}`" for k, v in coeff_plots.items()])
+        summary_md = (
+            "# E33 — Low-k multi-annulus sweep (LOFO)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- k0_frac={k0_frac}, w_local={w_local}\n"
+            f"- w_bigs={w_bigs}, M_list={M_list}, ring_bin_mode={ring_bin_mode}\n"
+            f"- ridge_alpha={ridge_alpha}, perms={n_perms}\n"
+            f"- pixels ceiling: SGD L2 alpha={pixel_alpha}, epochs={pixel_epochs}, batch={pixel_batch_size}\n"
+            f"- band-split recon: rel_err_gx_mean={float(np.mean(rel_recon_gx)):.3e}, rel_err_gy_mean={float(np.mean(rel_recon_gy)):.3e}\n\n"
+            "## Pixels ceiling (P_low)\n\n"
+            + md_table(md_pixel, ["w_big", "model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## Feature sweep (targets: gx_low, gy_low)\n\n"
+            + md_table(
+                md_rows,
+                [
+                    "w_big",
+                    "M",
+                    "variant",
+                    "Pearson mean±std",
+                    "relRMSE mean±std",
+                    "Pearson_C2 (mean)",
+                    "ΔPearson vs C2 mean±std",
+                    "ΔrelRMSE vs C2 mean±std",
+                    "Fisher p (ΔP vs C2)",
+                    "#folds ΔP>0",
+                ],
+            )
+            + "\n\n## Coefficient plots\n\n"
+            + (coef_lines if coef_lines else "- (none)\n")
+            + "\n"
+        )
+        (paths.run_dir / "summary_e33_lowk_multiannulus_sweep.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "k0_frac": k0_frac,
+                "w_local": w_local,
+                "w_bigs": [int(w) for w in w_bigs],
+                "M_list": [int(m) for m in M_list],
+                "ring_bin_mode": ring_bin_mode,
+                "ridge_alpha": ridge_alpha,
+                "n_perms": n_perms,
+                "pixel": {
+                    "alpha": pixel_alpha,
+                    "epochs": pixel_epochs,
+                    "batch_size": pixel_batch_size,
+                    "eta0": pixel_eta0,
+                    "power_t": pixel_power_t,
+                },
+                "rows_summary": rows_summary,
+                "pixel_rows": pixel_rows,
+                "coef_plots": coeff_plots,
+                "split_recon": {
+                    "rel_err_gx_mean": float(np.mean(rel_recon_gx)),
+                    "rel_err_gy_mean": float(np.mean(rel_recon_gy)),
+                },
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))

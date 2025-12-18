@@ -1,0 +1,38 @@
+experiment: e33
+exp_name: e33_lowk_multiannulus_sweep
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+w_local: 65
+w_bigs: [129, 193]
+
+# Multi-annulus resolution sweep
+M_list: [8, 16]
+ring_bin_mode: uniform_r   # or: equal_area
+
+# Baseline C2 ring bins (outer-only)
+n_radial_bins_c2: 6
+
+# Ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
+# Pixels-only ceiling (SGDRegressor L2)
+pixel_alpha: 1.0e-4
+pixel_epochs: 1
+pixel_batch_size: 256
+pixel_eta0: 0.01
+pixel_power_t: 0.25
+
+# FFT validation (compare a few samples to direct patch sums)
+validate_fft_n: 1
+validate_fft_rtol: 1.0e-6
+validate_fft_atol: 1.0e-6
+
