@@ -1,0 +1,30 @@
+experiment: e32
+exp_name: e32_multiannulus_lowk
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+# Local core and big context window(s)
+w_local: 65
+w_bigs: [129]
+
+# Multi-annulus profile
+n_annuli: 12
+ring_bin_mode: uniform_r   # or: equal_area
+eps_norm: 1.0e-12
+
+# Ridge + placebo
+ridge_alpha: 1.0
+n_perms: 200
+
+# FFT validation (compare a few samples to direct patch sums)
+validate_fft_n: 1
+validate_fft_rtol: 1.0e-6
+validate_fft_atol: 1.0e-6
+
