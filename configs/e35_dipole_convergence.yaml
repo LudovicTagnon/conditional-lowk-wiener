@@ -1,0 +1,29 @@
+experiment: e35
+exp_name: e35_dipole_convergence
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+w_bigs: [129, 193]
+
+# Dipole multi-annulus resolution sweep
+M_list: [4, 8, 16, 32, 64]
+ring_bin_mode: uniform_r   # or: equal_area
+
+# Learned model (LOFO)
+ridge_alpha: 1.0
+
+# "Close to ceiling" targets
+gap_target_pearson: 0.002
+gap_target_relrmse: 0.02
+
+# Diagnostics plots
+plot_wbig: 193
+plot_M: 64
+
