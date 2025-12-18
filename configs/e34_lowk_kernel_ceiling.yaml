@@ -1,0 +1,35 @@
+experiment: e34
+exp_name: e34_lowk_kernel_ceiling
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+# Kernel truncation sizes to evaluate
+w_bigs: [129, 193]
+
+# Dipole basis (E33 best): multi-annulus dipole-only, M rings over r∈[0,r_big]
+M: 16
+ring_bin_mode: uniform_r   # or: equal_area
+ridge_alpha: 1.0
+
+# Pixel debug: show convergence issues for pixels-only at w_big=193
+pixel_debug_enabled: true
+pixel_debug_wbig: 193
+pixel_debug_test_field: 0
+pixel_debug_epochs_max: 8
+pixel_debug_eta0_bases: [0.01, 0.05]
+pixel_alpha: 1.0e-4
+pixel_batch_size: 256
+pixel_power_t: 0.25
+
+# FFT validation (compare a few samples to direct patch sums)
+validate_fft_n: 1
+validate_fft_rtol: 1.0e-6
+validate_fft_atol: 1.0e-6
+
