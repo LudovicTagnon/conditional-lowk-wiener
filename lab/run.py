@@ -18,6 +18,7 @@ from .utils import (
     RunPaths,
     assert_finite,
     make_run_paths,
+    normalize_01,
     plot_pred_vs_true,
     plot_residuals_hist,
     read_config,
@@ -22660,6 +22661,425 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 "run_lognormal": bool(run_lognormal),
                 "lognormal_sigma": float(lognormal_sigma),
                 "wiener": {"lambda_rel": lambda_rel, "cg_max_iter": cg_max_iter, "cg_tol": cg_tol},
+                "results": results,
+            },
+        )
+        return paths
+
+    if experiment == "e52":
+        # E52 — Diagnose why Wiener does not beat ceiling on BBKS.
+        from scipy import ndimage, stats
+
+        grid_size = int(cfg.get("grid_size", 256))
+        n_train_fields = int(cfg.get("n_train_fields", 10))
+        n_test_fields = int(cfg.get("n_test_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha = float(cfg.get("alpha", 2.0))
+
+        bbks_k0 = float(cfg.get("bbks_k0", 0.15 * np.pi))
+        bbks_ns = float(cfg.get("bbks_ns", 1.0))
+        lognormal_sigma = float(cfg.get("lognormal_sigma", 1.0))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_train_fields < 1 or n_test_fields < 1:
+            raise ValueError("n_train_fields and n_test_fields must be >= 1")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if bbks_k0 <= 0:
+            raise ValueError("bbks_k0 must be > 0")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if lognormal_sigma <= 0:
+            raise ValueError("lognormal_sigma must be > 0")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def make_field_raw_and_norm(
+            rng: np.random.Generator,
+            *,
+            spectrum: str,
+            lognormal: bool,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            nx, ny = grid_size, grid_size
+            kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
+            ky = 2.0 * np.pi * np.fft.rfftfreq(ny)[None, :]
+            k2 = kx * kx + ky * ky
+            k = np.sqrt(k2, dtype=np.float64)
+            scale = np.zeros_like(k, dtype=np.float64)
+            nonzero = k > 0
+            if spectrum == "powerlaw":
+                scale[nonzero] = k[nonzero] ** (-alpha / 2.0)
+            elif spectrum == "bbks":
+                q = np.zeros_like(k, dtype=np.float64)
+                q[nonzero] = k[nonzero] / float(bbks_k0)
+                x = 2.34 * q
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t0 = np.log1p(x) / np.where(x > 0, x, 1.0)
+                denom = 1.0 + 3.89 * q + (16.1 * q) ** 2 + (5.46 * q) ** 3 + (6.71 * q) ** 4
+                t = t0 * np.power(denom, -0.25)
+                p = np.zeros_like(k, dtype=np.float64)
+                p[nonzero] = (k[nonzero] ** float(bbks_ns)) * (t[nonzero] ** 2)
+                scale[nonzero] = np.sqrt(p[nonzero])
+            else:
+                raise ValueError(f"unsupported spectrum={spectrum}")
+
+            real = rng.normal(size=(nx, ny // 2 + 1))
+            imag = rng.normal(size=(nx, ny // 2 + 1))
+            coeff = (real + 1j * imag) * scale
+            coeff[0, 0] = 0.0 + 0.0j
+            field = np.fft.irfftn(coeff, s=(nx, ny), axes=(0, 1)).real
+            assert_finite("rho_raw_2d", field)
+            if lognormal:
+                field = np.exp(float(lognormal_sigma) * field)
+                assert_finite("rho_lognormal_2d", field)
+            rho = normalize_01(field)
+            return field, rho
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        def compute_B_features(field: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            field = np.asarray(field, dtype=np.float64)
+            ps = w_big
+            r = ps // 2
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - r).astype(np.int64)
+            x1 = (cx + r + 1).astype(np.int64)
+            y0 = (cy - r).astype(np.int64)
+            y1 = (cy + r + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(ps * ps)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=ps, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            B = np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+            return B, mass.astype(np.float64, copy=False), ge.astype(np.float64, copy=False)
+
+        # Centers (same across scenarios).
+        r_big = w_big // 2
+        centers_by_train_field: list[np.ndarray] = []
+        for fid in range(n_train_fields):
+            rng_cent = np.random.default_rng(seed + 444_444 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_train_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        centers_by_test_field: list[np.ndarray] = []
+        for fid in range(n_test_fields):
+            rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_test_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Ceiling kernel (truncated impulse).
+        c0 = grid_size // 2
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+        g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_low_ceiling_gx = kernel_fft_centered(kcorr_low_gx, grid_size=grid_size)
+        kfft_low_ceiling_gy = kernel_fft_centered(kcorr_low_gy, grid_size=grid_size)
+
+        def field_stats(x: np.ndarray) -> tuple[float, float, float]:
+            flat = np.asarray(x, dtype=np.float64).reshape(-1)
+            skew = float(stats.skew(flat, bias=False))
+            kurt = float(stats.kurtosis(flat, fisher=True, bias=False))
+            flat_abs = np.abs(flat)
+            p50 = float(np.percentile(flat_abs, 50))
+            p99 = float(np.percentile(flat_abs, 99))
+            ratio = p99 / (p50 + 1e-12)
+            return skew, kurt, ratio
+
+        def run_scenario(label: str, *, spectrum: str, lognormal: bool) -> dict[str, Any]:
+            stats_raw: list[tuple[float, float, float]] = []
+            stats_norm: list[tuple[float, float, float]] = []
+
+            X_train: list[np.ndarray] = []
+            y_out_train: list[np.ndarray] = []
+
+            corr_trunc_outside: list[float] = []
+            corr_mass_outside: list[float] = []
+            corr_ge_outside: list[float] = []
+            outside_var_frac: list[float] = []
+
+            X_test_by_field: list[np.ndarray] = []
+            y_out_test_by_field: list[np.ndarray] = []
+
+            # Train fields.
+            for fid in range(n_train_fields):
+                rng_field = np.random.default_rng(seed + fid)
+                raw, rho01 = make_field_raw_and_norm(rng_field, spectrum=spectrum, lognormal=lognormal)
+                stats_raw.append(field_stats(raw))
+                stats_norm.append(field_stats(rho01))
+                split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+                rho0 = rho01 - float(rho01.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_ceiling_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_ceiling_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                centers = centers_by_train_field[fid]
+                B, _, _ = compute_B_features(rho01, centers)
+                y_out = sample_vec_at_centers(outside_gx, outside_gy, centers)
+                X_train.append(B)
+                y_out_train.append(y_out)
+
+            # Test fields.
+            for fid in range(n_test_fields):
+                rng_field = np.random.default_rng(seed + n_train_fields + fid)
+                raw, rho01 = make_field_raw_and_norm(rng_field, spectrum=spectrum, lognormal=lognormal)
+                stats_raw.append(field_stats(raw))
+                stats_norm.append(field_stats(rho01))
+                split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+                rho0 = rho01 - float(rho01.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_ceiling_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_ceiling_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                frac_gx = float(np.var(outside_gx) / (np.var(split.low.gx) + 1e-12))
+                frac_gy = float(np.var(outside_gy) / (np.var(split.low.gy) + 1e-12))
+                outside_var_frac.append(0.5 * (frac_gx + frac_gy))
+
+                centers = centers_by_test_field[fid]
+                B, mass, ge = compute_B_features(rho01, centers)
+                y_out = sample_vec_at_centers(outside_gx, outside_gy, centers)
+                y_trunc = sample_vec_at_centers(gx_trunc, gy_trunc, centers)
+
+                corr_trunc = 0.5 * (safe_corr_1d(y_trunc[:, 0], y_out[:, 0]) + safe_corr_1d(y_trunc[:, 1], y_out[:, 1]))
+                corr_mass = 0.5 * (safe_corr_1d(mass, y_out[:, 0]) + safe_corr_1d(mass, y_out[:, 1]))
+                corr_ge = 0.5 * (safe_corr_1d(ge, y_out[:, 0]) + safe_corr_1d(ge, y_out[:, 1]))
+                corr_trunc_outside.append(corr_trunc)
+                corr_mass_outside.append(corr_mass)
+                corr_ge_outside.append(corr_ge)
+
+                X_test_by_field.append(B)
+                y_out_test_by_field.append(y_out)
+
+            # Ridge prediction of outside from B features.
+            Xtr = np.concatenate(X_train, axis=0)
+            ytr = np.concatenate(y_out_train, axis=0)
+            mu = Xtr.mean(axis=0)
+            sd = Xtr.std(axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            Xtr_s = (Xtr - mu) / sd
+            y_mu = ytr.mean(axis=0)
+            yctr = ytr - y_mu
+            XtX = Xtr_s.T @ Xtr_s + ridge_alpha * np.eye(Xtr_s.shape[1], dtype=np.float64)
+            w = np.linalg.solve(XtX, Xtr_s.T @ yctr)
+
+            p_out: list[float] = []
+            r_out: list[float] = []
+            for B_te, y_te in zip(X_test_by_field, y_out_test_by_field):
+                Xte_s = (B_te - mu) / sd
+                y_pred = Xte_s @ w + y_mu
+                p_out.append(pearson_mean_2d(y_te, y_pred))
+                r_out.append(relrmse_mean_2d(y_te, y_pred))
+
+            stats_raw = np.asarray(stats_raw, dtype=np.float64)
+            stats_norm = np.asarray(stats_norm, dtype=np.float64)
+            out = {
+                "label": label,
+                "outside_var_frac": (float(np.mean(outside_var_frac)), float(np.std(outside_var_frac, ddof=1)) if len(outside_var_frac) > 1 else 0.0),
+                "corr_trunc_outside": (float(np.mean(corr_trunc_outside)), float(np.std(corr_trunc_outside, ddof=1)) if len(corr_trunc_outside) > 1 else 0.0),
+                "corr_mass_outside": (float(np.mean(corr_mass_outside)), float(np.std(corr_mass_outside, ddof=1)) if len(corr_mass_outside) > 1 else 0.0),
+                "corr_ge_outside": (float(np.mean(corr_ge_outside)), float(np.std(corr_ge_outside, ddof=1)) if len(corr_ge_outside) > 1 else 0.0),
+                "outside_pred": (float(np.mean(p_out)), float(np.std(p_out, ddof=1)) if len(p_out) > 1 else 0.0, float(np.mean(r_out)), float(np.std(r_out, ddof=1)) if len(r_out) > 1 else 0.0),
+                "stats_raw": (
+                    float(np.mean(stats_raw[:, 0])),
+                    float(np.mean(stats_raw[:, 1])),
+                    float(np.mean(stats_raw[:, 2])),
+                    float(np.std(stats_raw[:, 0], ddof=1)) if stats_raw.shape[0] > 1 else 0.0,
+                    float(np.std(stats_raw[:, 1], ddof=1)) if stats_raw.shape[0] > 1 else 0.0,
+                    float(np.std(stats_raw[:, 2], ddof=1)) if stats_raw.shape[0] > 1 else 0.0,
+                ),
+                "stats_norm": (
+                    float(np.mean(stats_norm[:, 0])),
+                    float(np.mean(stats_norm[:, 1])),
+                    float(np.mean(stats_norm[:, 2])),
+                    float(np.std(stats_norm[:, 0], ddof=1)) if stats_norm.shape[0] > 1 else 0.0,
+                    float(np.std(stats_norm[:, 1], ddof=1)) if stats_norm.shape[0] > 1 else 0.0,
+                    float(np.std(stats_norm[:, 2], ddof=1)) if stats_norm.shape[0] > 1 else 0.0,
+                ),
+            }
+            return out
+
+        results: list[dict[str, Any]] = []
+        results.append(run_scenario("alpha2", spectrum="powerlaw", lognormal=False))
+        results.append(run_scenario("bbks_gauss", spectrum="bbks", lognormal=False))
+        results.append(run_scenario("bbks_lognormal", spectrum="bbks", lognormal=True))
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        diag_rows: list[dict[str, str]] = []
+        stat_rows: list[dict[str, str]] = []
+        for res in results:
+            label = res["label"]
+            ov_mean, ov_std = res["outside_var_frac"]
+            ct_mean, ct_std = res["corr_trunc_outside"]
+            cm_mean, cm_std = res["corr_mass_outside"]
+            cg_mean, cg_std = res["corr_ge_outside"]
+            p_mean, p_std, r_mean, r_std = res["outside_pred"]
+            diag_rows.append(
+                {
+                    "scenario": label,
+                    "outside_var_frac": f"{ov_mean:.4f} ± {ov_std:.4f}",
+                    "corr(trunc,outside)": f"{ct_mean:.4f} ± {ct_std:.4f}",
+                    "corr(mass,outside)": f"{cm_mean:.4f} ± {cm_std:.4f}",
+                    "corr(gradE,outside)": f"{cg_mean:.4f} ± {cg_std:.4f}",
+                    "Pearson_outside_pred": f"{p_mean:.4f} ± {p_std:.4f}",
+                    "relRMSE_outside_pred": f"{r_mean:.4f} ± {r_std:.4f}",
+                }
+            )
+            sraw = res["stats_raw"]
+            snorm = res["stats_norm"]
+            stat_rows.append(
+                {
+                    "scenario": label,
+                    "skew_raw": f"{sraw[0]:.4f} ± {sraw[3]:.4f}",
+                    "kurt_raw": f"{sraw[1]:.4f} ± {sraw[4]:.4f}",
+                    "p99/p50_raw": f"{sraw[2]:.4f} ± {sraw[5]:.4f}",
+                    "skew_norm": f"{snorm[0]:.4f} ± {snorm[3]:.4f}",
+                    "kurt_norm": f"{snorm[1]:.4f} ± {snorm[4]:.4f}",
+                    "p99/p50_norm": f"{snorm[2]:.4f} ± {snorm[5]:.4f}",
+                }
+            )
+
+        summary_md = (
+            "# E52 — Diagnose BBKS no-gain vs Wiener\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, k0_frac={k0_frac}, w_big={w_big}\n"
+            f"- n_train_fields={n_train_fields}, n_test_fields={n_test_fields}, patches_per_field={patches_per_field}\n"
+            f"- bbks_k0={bbks_k0:.4f}, bbks_ns={bbks_ns:.3f}, lognormal_sigma={lognormal_sigma}\n"
+            f"- ridge_alpha={ridge_alpha}\n"
+            "- train/test fields are independent; test fields are never used in training\n\n"
+            "## Outside diagnostics (test fields)\n\n"
+            + md_table(
+                diag_rows,
+                [
+                    "scenario",
+                    "outside_var_frac",
+                    "corr(trunc,outside)",
+                    "corr(mass,outside)",
+                    "corr(gradE,outside)",
+                    "Pearson_outside_pred",
+                    "relRMSE_outside_pred",
+                ],
+            )
+            + "\n\n## Rho distribution diagnostics (raw vs normalized)\n\n"
+            + md_table(
+                stat_rows,
+                [
+                    "scenario",
+                    "skew_raw",
+                    "kurt_raw",
+                    "p99/p50_raw",
+                    "skew_norm",
+                    "kurt_norm",
+                    "p99/p50_norm",
+                ],
+            )
+            + "\n\n## Conclusion\n\n"
+            "- If outside_var_frac is small, ceiling is already near-optimal.\n"
+            "- If outside_var_frac is sizeable but Pearson_outside_pred is low, outside is imprédictible from local B.\n"
+            "- Compare bbks_gauss vs bbks_lognormal to see if normalization erases non-Gaussianity.\n"
+            "- Compare alpha2 vs BBKS to see whether the BBKS spectrum reduces predictable outside signal.\n"
+            "- Use skew/kurtosis deltas to assess lognormal washout.\n"
+        )
+
+        (paths.run_dir / "summary_e52_diagnose_bbks_no_gain.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "w_big": int(w_big),
+                "n_train_fields": n_train_fields,
+                "n_test_fields": n_test_fields,
+                "patches_per_field": patches_per_field,
+                "bbks_k0": float(bbks_k0),
+                "bbks_ns": float(bbks_ns),
+                "lognormal_sigma": float(lognormal_sigma),
+                "ridge_alpha": float(ridge_alpha),
                 "results": results,
             },
         )

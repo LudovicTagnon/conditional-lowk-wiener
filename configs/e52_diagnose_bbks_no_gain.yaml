@@ -1,0 +1,18 @@
+experiment: e52
+exp_name: e52_diagnose_bbks_no_gain
+seed: 123
+
+grid_size: 256
+k0_frac: 0.15
+w_big: 193
+
+n_train_fields: 10
+n_test_fields: 10
+patches_per_field: 10000
+
+alpha: 2.0
+bbks_k0: 0.47123889803846897  # 0.15 * pi
+bbks_ns: 1.0
+lognormal_sigma: 1.0
+
+ridge_alpha: 1.0
