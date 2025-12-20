@@ -1,0 +1,35 @@
+experiment: e61
+exp_name: e61_regime_gainlaw_stable
+seed: 123
+
+grid_size: 256
+w_big: 193
+w_in_list: [33, 65, 97]
+
+n_train_fields: 10
+n_test_fields: 10
+patches_per_field: 10000
+
+alpha_list: [0.0, 1.0, 1.5, 2.0]
+
+beta_list: [0.0, 1.0, 2.0]
+k0_fracs: [0.20, 0.10, 0.02]
+
+bbks_ext_k0_list: [0.005, 0.01, 0.02, 0.05, 0.10]
+bbks_ext_beta_list: [0.0, 0.5, 1.0, 1.5, 2.0]
+bbks_ext_amp_scales: [0.5, 1.0, 2.0, 4.0]
+
+bbks_k0: 0.47123889803846897  # 0.15 * pi
+bbks_ns: 1.0
+bbks_k_eps: 1.0e-6
+bbks_lognormal_sigmas: [1.0]
+
+norm_mode: delta
+ridge_alpha: 1.0
+huber_eps: 1.35
+huber_alpha: 1.0e-4
+clip_log_spec: 3.0
+
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
