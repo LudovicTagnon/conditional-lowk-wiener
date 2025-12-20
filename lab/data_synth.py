@@ -41,9 +41,12 @@ def normalize_rho(field: np.ndarray, mode: str = "minmax_01") -> np.ndarray:
     - minmax_01: scale to [0,1]
     - delta: (rho - mean)/mean (per field)
     - zscore: (rho - mean)/std (per field)
+    - none: return raw field unchanged
     """
     field = np.asarray(field, dtype=np.float64)
     mode = str(mode).lower().strip()
+    if mode in {"none", "raw"}:
+        return field
     if mode == "minmax_01":
         rho = normalize_01(field)
         if (rho.min() < -1e-9) or (rho.max() > 1.0 + 1e-9):
