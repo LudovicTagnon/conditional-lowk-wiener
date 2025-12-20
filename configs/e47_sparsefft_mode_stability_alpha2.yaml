@@ -1,0 +1,18 @@
+experiment: e47
+exp_name: e47_sparsefft_mode_stability_alpha2
+seed: 123
+
+grid_size: 256
+n_fields: 10
+k0_frac: 0.15
+w_big: 193
+alpha: 2.0
+
+# Top-K sparse FFT mode sets
+k_list: [200, 400, 800]
+k_plot: 800
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6

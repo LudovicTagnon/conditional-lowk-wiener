@@ -20376,6 +20376,431 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e47":
+        # E47 — Sparse-FFT mode stability (alpha=2.0, low-k).
+        #
+        # For each LOFO fold:
+        #  - compute Wiener weights from TRAIN fields only
+        #  - symmetrize parity and select top-K conjugate FFT mode pairs
+        #  - record mode sets and scores (train-only)
+        #
+        # Metrics:
+        #  - mean/std Jaccard and IoMin across fold pairs
+        #  - overlap vs global top-K (vote + score tie-break)
+        #  - mode frequency plots (top30 and heatmap) for K_plot
+        grid_size = int(cfg.get("grid_size", 256))
+        n_fields = int(cfg.get("n_fields", 10))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha = float(cfg.get("alpha", 2.0))
+
+        k_list = [int(k) for k in cfg.get("k_list", [200, 400, 800])]
+        k_list = [k for k in k_list if k > 0]
+        if not k_list:
+            raise ValueError("k_list must be non-empty with positive integers")
+        k_plot = int(cfg.get("k_plot", max(k_list)))
+        if k_plot not in k_list:
+            raise ValueError("k_plot must be one of k_list")
+
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if alpha < 0:
+            raise ValueError("alpha must be >= 0")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def symm_gx(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float64)
+            wf_x = w[::-1, :]
+            wf_y = w[:, ::-1]
+            wf_xy = w[::-1, ::-1]
+            return 0.25 * (w - wf_x + wf_y - wf_xy)
+
+        def symm_gy(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float64)
+            wf_x = w[::-1, :]
+            wf_y = w[:, ::-1]
+            wf_xy = w[::-1, ::-1]
+            return 0.25 * (w + wf_x - wf_y - wf_xy)
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def topk_pairs(W: np.ndarray, K: int) -> list[tuple[float, tuple[int, int, int, int]]]:
+            N = W.shape[0]
+            visited = np.zeros((N, N), dtype=bool)
+            pairs: list[tuple[float, int, int, int, int]] = []
+            for i in range(N):
+                for j in range(N):
+                    if visited[i, j]:
+                        continue
+                    ic = (-i) % N
+                    jc = (-j) % N
+                    visited[i, j] = True
+                    visited[ic, jc] = True
+                    if (ic == i) and (jc == j):
+                        mag = float(np.abs(W[i, j]))
+                    else:
+                        mag = float(np.sqrt(np.abs(W[i, j]) ** 2 + np.abs(W[ic, jc]) ** 2))
+                    if (i, j) <= (ic, jc):
+                        pid = (i, j, ic, jc)
+                    else:
+                        pid = (ic, jc, i, j)
+                    pairs.append((mag, pid[0], pid[1], pid[2], pid[3]))
+            pairs.sort(key=lambda x: x[0], reverse=True)
+            K = min(int(K), len(pairs))
+            out: list[tuple[float, tuple[int, int, int, int]]] = []
+            for mag, i, j, ic, jc in pairs[:K]:
+                out.append((mag, (int(i), int(j), int(ic), int(jc))))
+            return out
+
+        def pairwise_stats(sets: list[set[tuple[int, int, int, int]]]) -> tuple[float, float, float, float]:
+            vals_j: list[float] = []
+            vals_i: list[float] = []
+            n = len(sets)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    a = sets[i]
+                    b = sets[j]
+                    if not a and not b:
+                        vals_j.append(1.0)
+                        vals_i.append(1.0)
+                        continue
+                    inter = len(a & b)
+                    union = len(a | b)
+                    jacc = float(inter) / float(union) if union > 0 else 1.0
+                    denom = float(min(len(a), len(b)))
+                    iom = float(inter) / denom if denom > 0 else 1.0
+                    vals_j.append(jacc)
+                    vals_i.append(iom)
+            j_mean = float(np.mean(vals_j)) if vals_j else 0.0
+            j_std = float(np.std(vals_j, ddof=1)) if len(vals_j) > 1 else 0.0
+            i_mean = float(np.mean(vals_i)) if vals_i else 0.0
+            i_std = float(np.std(vals_i, ddof=1)) if len(vals_i) > 1 else 0.0
+            return j_mean, j_std, i_mean, i_std
+
+        def global_topk(
+            sets: list[set[tuple[int, int, int, int]]],
+            score_map: dict[tuple[int, int, int, int], list[float]],
+            K: int,
+        ) -> tuple[set[tuple[int, int, int, int]], list[float], dict[tuple[int, int, int, int], int]]:
+            counts: dict[tuple[int, int, int, int], int] = {}
+            for s in sets:
+                for pid in s:
+                    counts[pid] = counts.get(pid, 0) + 1
+            score_mean: dict[tuple[int, int, int, int], float] = {}
+            for pid, vals in score_map.items():
+                if vals:
+                    score_mean[pid] = float(np.mean(vals))
+            order = sorted(
+                counts.keys(),
+                key=lambda pid: (-counts[pid], -score_mean.get(pid, 0.0), pid),
+            )
+            top = set(order[:K])
+            overlaps: list[float] = []
+            for s in sets:
+                if K > 0:
+                    overlaps.append(float(len(s & top)) / float(K))
+                else:
+                    overlaps.append(0.0)
+            return top, overlaps, counts
+
+        # Generate fields (alpha fixed).
+        rho0_by_field: list[np.ndarray] = []
+        rho0_fft_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=float(alpha), rng=rng_field)
+            rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+            rho0_by_field.append(rho0)
+            rho0_fft_by_field.append(np.fft.fftn(rho0))
+
+        # Fourier-domain transfer H for low-k.
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        k0 = float(k0_frac) * k_ny
+        mask_low = k <= k0
+        H_gx = np.zeros((nx, nx), dtype=np.complex128)
+        H_gy = np.zeros((nx, nx), dtype=np.complex128)
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+        H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gx[0, 0] = 0.0 + 0.0j
+        H_gy[0, 0] = 0.0 + 0.0j
+        conjH_gx = np.conj(H_gx)
+        conjH_gy = np.conj(H_gy)
+
+        r_big = w_big // 2
+        c0 = grid_size // 2
+        sx = slice(c0 - r_big, c0 + r_big + 1)
+        sy = slice(c0 - r_big, c0 + r_big + 1)
+
+        def wiener_fit_weights(train_fields: list[int]) -> tuple[np.ndarray, np.ndarray, float]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for fid in train_fields:
+                R = rho0_fft_by_field[fid]
+                acc += (R * np.conj(R)).real
+                var_acc += float(np.mean(rho0_by_field[fid] * rho0_by_field[fid]))
+            S_rr = (acc / float(len(train_fields))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(train_fields))
+            lam = float(lambda_rel) * float(var0)
+
+            r_rgx = np.fft.ifftn(S_rr * conjH_gx).real
+            r_rgy = np.fft.ifftn(S_rr * conjH_gy).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, S: np.ndarray) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float64).reshape(w_big, w_big)
+                V.fill(0.0)
+                V[sx, sy] = v
+                conv = np.fft.ifftn(np.fft.fftn(V) * S).real
+                out = conv[sx, sy].reshape(-1).astype(np.float64, copy=False)
+                return out + lam * v.reshape(-1)
+
+            wx, itx, relresx = cg_solve(lambda v: apply_A(v, S=S_rr), b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            wy, ity, relresy = cg_solve(lambda v: apply_A(v, S=S_rr), b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            info = float(max(relresx, relresy))
+            return wx.reshape(w_big, w_big), wy.reshape(w_big, w_big), info
+
+        # Collect mode sets and scores per fold.
+        mode_sets: dict[str, dict[int, list[set[tuple[int, int, int, int]]]]] = {
+            "gx": {K: [] for K in k_list},
+            "gy": {K: [] for K in k_list},
+        }
+        mode_scores: dict[str, dict[int, dict[tuple[int, int, int, int], list[float]]]] = {
+            "gx": {K: {} for K in k_list},
+            "gy": {K: {} for K in k_list},
+        }
+
+        for test_field in range(n_fields):
+            train_fields = [f for f in range(n_fields) if f != test_field]
+            w_wiener_gx, w_wiener_gy, cg_info = wiener_fit_weights(train_fields)
+            w_sym_gx = symm_gx(w_wiener_gx)
+            w_sym_gy = symm_gy(w_wiener_gy)
+            Wgx_fft = np.fft.fftn(w_sym_gx)
+            Wgy_fft = np.fft.fftn(w_sym_gy)
+
+            pairs_gx = topk_pairs(Wgx_fft, max(k_list))
+            pairs_gy = topk_pairs(Wgy_fft, max(k_list))
+
+            for K in k_list:
+                sel_gx = pairs_gx[:K]
+                sel_gy = pairs_gy[:K]
+                set_gx = {pid for _, pid in sel_gx}
+                set_gy = {pid for _, pid in sel_gy}
+                mode_sets["gx"][K].append(set_gx)
+                mode_sets["gy"][K].append(set_gy)
+                for mag, pid in sel_gx:
+                    mode_scores["gx"][K].setdefault(pid, []).append(float(mag))
+                for mag, pid in sel_gy:
+                    mode_scores["gy"][K].setdefault(pid, []).append(float(mag))
+
+        # Compute stability metrics.
+        rows_gx: list[dict[str, str]] = []
+        rows_gy: list[dict[str, str]] = []
+
+        for K in k_list:
+            j_mean, j_std, i_mean, i_std = pairwise_stats(mode_sets["gx"][K])
+            top_gx, ov_gx, counts_gx = global_topk(mode_sets["gx"][K], mode_scores["gx"][K], K)
+            ov_gx_mean = float(np.mean(ov_gx)) if ov_gx else 0.0
+            ov_gx_std = float(np.std(ov_gx, ddof=1)) if len(ov_gx) > 1 else 0.0
+            rows_gx.append(
+                {
+                    "K": str(K),
+                    "Jaccard_mean+/-std": f"{j_mean:.4f} +/- {j_std:.4f}",
+                    "IoMin_mean+/-std": f"{i_mean:.4f} +/- {i_std:.4f}",
+                    "overlap_vs_global_mean+/-std": f"{ov_gx_mean:.4f} +/- {ov_gx_std:.4f}",
+                }
+            )
+
+            j_mean, j_std, i_mean, i_std = pairwise_stats(mode_sets["gy"][K])
+            top_gy, ov_gy, counts_gy = global_topk(mode_sets["gy"][K], mode_scores["gy"][K], K)
+            ov_gy_mean = float(np.mean(ov_gy)) if ov_gy else 0.0
+            ov_gy_std = float(np.std(ov_gy, ddof=1)) if len(ov_gy) > 1 else 0.0
+            rows_gy.append(
+                {
+                    "K": str(K),
+                    "Jaccard_mean+/-std": f"{j_mean:.4f} +/- {j_std:.4f}",
+                    "IoMin_mean+/-std": f"{i_mean:.4f} +/- {i_std:.4f}",
+                    "overlap_vs_global_mean+/-std": f"{ov_gy_mean:.4f} +/- {ov_gy_std:.4f}",
+                }
+            )
+
+        # Plots for K_plot (mode frequency histogram + heatmap).
+        import matplotlib.pyplot as plt
+
+        def plot_mode_histogram(
+            counts: dict[tuple[int, int, int, int], int],
+            scores: dict[tuple[int, int, int, int], list[float]],
+            *,
+            title: str,
+            out_path: Path,
+        ) -> None:
+            items = []
+            for pid, cnt in counts.items():
+                sc = float(np.mean(scores.get(pid, [0.0])))
+                items.append((cnt, sc, pid))
+            items.sort(key=lambda x: (-x[0], -x[1], x[2]))
+            top = items[:30]
+            labels = [f"{pid[0]},{pid[1]}" for _, _, pid in top]
+            vals = [cnt for cnt, _, _ in top]
+            plt.figure(figsize=(10, 4))
+            plt.bar(range(len(vals)), vals, color="steelblue")
+            plt.xticks(range(len(vals)), labels, rotation=60, ha="right", fontsize=7)
+            plt.ylabel("count (folds)")
+            plt.title(title)
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=150)
+            plt.close()
+
+        def plot_mode_heatmap(
+            counts: dict[tuple[int, int, int, int], int],
+            *,
+            N: int,
+            title: str,
+            out_path: Path,
+        ) -> None:
+            mat = np.zeros((N, N), dtype=np.float64)
+            for pid, cnt in counts.items():
+                i, j, ic, jc = pid
+                mat[i, j] = float(cnt)
+                mat[ic, jc] = float(cnt)
+            mat = np.fft.fftshift(mat)
+            plt.figure(figsize=(5, 4))
+            plt.imshow(mat, cmap="viridis", vmin=0.0, vmax=float(n_fields))
+            plt.colorbar()
+            plt.title(title)
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=150)
+            plt.close()
+
+        top_gx, ov_gx, counts_gx = global_topk(mode_sets["gx"][k_plot], mode_scores["gx"][k_plot], k_plot)
+        top_gy, ov_gy, counts_gy = global_topk(mode_sets["gy"][k_plot], mode_scores["gy"][k_plot], k_plot)
+        plot_mode_histogram(
+            counts_gx,
+            mode_scores["gx"][k_plot],
+            title=f"Top 30 modes by frequency (gx, K={k_plot})",
+            out_path=paths.run_dir / f"mode_freq_top30_gx_k{k_plot}.png",
+        )
+        plot_mode_histogram(
+            counts_gy,
+            mode_scores["gy"][k_plot],
+            title=f"Top 30 modes by frequency (gy, K={k_plot})",
+            out_path=paths.run_dir / f"mode_freq_top30_gy_k{k_plot}.png",
+        )
+        plot_mode_heatmap(
+            counts_gx,
+            N=w_big,
+            title=f"Mode frequency map (gx, K={k_plot})",
+            out_path=paths.run_dir / f"mode_freq_map_gx_k{k_plot}.png",
+        )
+        plot_mode_heatmap(
+            counts_gy,
+            N=w_big,
+            title=f"Mode frequency map (gy, K={k_plot})",
+            out_path=paths.run_dir / f"mode_freq_map_gy_k{k_plot}.png",
+        )
+
+        summary_md = (
+            "# E47 — Sparse FFT mode stability (alpha=2.0, low-k)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, k0_frac={k0_frac}, n_fields={n_fields}\n"
+            f"- w_big={w_big}, alpha={alpha}\n"
+            f"- k_list={k_list}, k_plot={k_plot}\n"
+            f"- wiener solver: lambda_rel={lambda_rel}, cg_max_iter={cg_max_iter}, cg_tol={cg_tol}\n"
+            "- mode selection uses TRAIN-only Wiener weights (no test leakage)\n\n"
+            "## Stability (gx)\n\n"
+            + md_table(rows_gx, ["K", "Jaccard_mean+/-std", "IoMin_mean+/-std", "overlap_vs_global_mean+/-std"])
+            + "\n\n## Stability (gy)\n\n"
+            + md_table(rows_gy, ["K", "Jaccard_mean+/-std", "IoMin_mean+/-std", "overlap_vs_global_mean+/-std"])
+            + "\n\n## Interpretation\n\n"
+            "- If Jaccard and overlap_vs_global are high for K=800, the mode dictionary is stable.\n"
+            "- If they are low, selection is fold-dependent.\n"
+            "- Inspect the top-30 histogram and heatmap for concentration in low-k regions.\n"
+        )
+
+        (paths.run_dir / "summary_e47_sparsefft_mode_stability.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "w_big": int(w_big),
+                "alpha": float(alpha),
+                "k_list": k_list,
+                "k_plot": int(k_plot),
+                "wiener": {"lambda_rel": lambda_rel, "cg_max_iter": cg_max_iter, "cg_tol": cg_tol},
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
