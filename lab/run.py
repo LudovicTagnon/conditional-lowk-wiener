@@ -20801,6 +20801,401 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e48":
+        # E48 — Out-of-sample sparse-FFT vs Wiener (alpha=2.0, low-k).
+        #
+        # Train on N_train_fields (Wiener + sparse-FFT top-K) and evaluate on
+        # independent N_test_fields only. No leakage from test into training.
+        grid_size = int(cfg.get("grid_size", 256))
+        n_train_fields = int(cfg.get("n_train_fields", 10))
+        n_test_fields = int(cfg.get("n_test_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha = float(cfg.get("alpha", 2.0))
+
+        k_list = [int(k) for k in cfg.get("k_list", [200, 400, 800, 1600])]
+        k_list = [k for k in k_list if k > 0]
+        if not k_list:
+            raise ValueError("k_list must be non-empty with positive integers")
+
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_train_fields < 1 or n_test_fields < 1:
+            raise ValueError("n_train_fields and n_test_fields must be >= 1")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if alpha < 0:
+            raise ValueError("alpha must be >= 0")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def symm_gx(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float64)
+            wf_x = w[::-1, :]
+            wf_y = w[:, ::-1]
+            wf_xy = w[::-1, ::-1]
+            return 0.25 * (w - wf_x + wf_y - wf_xy)
+
+        def symm_gy(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float64)
+            wf_x = w[::-1, :]
+            wf_y = w[:, ::-1]
+            wf_xy = w[::-1, ::-1]
+            return 0.25 * (w + wf_x - wf_y - wf_xy)
+
+        def topk_trunc(W: np.ndarray, K: int) -> np.ndarray:
+            N = W.shape[0]
+            visited = np.zeros((N, N), dtype=bool)
+            pairs: list[tuple[float, int, int, int, int]] = []
+            for i in range(N):
+                for j in range(N):
+                    if visited[i, j]:
+                        continue
+                    ic = (-i) % N
+                    jc = (-j) % N
+                    visited[i, j] = True
+                    visited[ic, jc] = True
+                    if (ic == i) and (jc == j):
+                        mag = float(np.abs(W[i, j]))
+                    else:
+                        mag = float(np.sqrt(np.abs(W[i, j]) ** 2 + np.abs(W[ic, jc]) ** 2))
+                    pairs.append((mag, i, j, ic, jc))
+            pairs.sort(key=lambda x: x[0], reverse=True)
+            K = min(int(K), len(pairs))
+            Wt = np.zeros_like(W)
+            for _, i, j, ic, jc in pairs[:K]:
+                Wt[i, j] = W[i, j]
+                Wt[ic, jc] = W[ic, jc]
+            return Wt
+
+        # Pre-generate train/test fields (independent).
+        rho0_train_fft: list[np.ndarray] = []
+        for fid in range(n_train_fields):
+            rng_field = np.random.default_rng(seed + fid)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=float(alpha), rng=rng_field)
+            rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+            rho0_train_fft.append(np.fft.fftn(rho0))
+
+        rho0_test_fft: list[np.ndarray] = []
+        y_low_test: list[np.ndarray] = []
+
+        r_big = w_big // 2
+        centers_by_test_field: list[np.ndarray] = []
+        for fid in range(n_test_fields):
+            rng_cent = np.random.default_rng(seed + 777_777 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_test_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        for fid in range(n_test_fields):
+            rng_field = np.random.default_rng(seed + n_train_fields + fid)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=float(alpha), rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            y_low_test.append(sample_vec_at_centers(split.low.gx, split.low.gy, centers_by_test_field[fid]))
+            rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+            rho0_test_fft.append(np.fft.fftn(rho0))
+
+        # Fourier-domain transfer H for low-k.
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        k0 = float(k0_frac) * k_ny
+        mask_low = k <= k0
+        H_gx = np.zeros((nx, nx), dtype=np.complex128)
+        H_gy = np.zeros((nx, nx), dtype=np.complex128)
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+        H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gx[0, 0] = 0.0 + 0.0j
+        H_gy[0, 0] = 0.0 + 0.0j
+        conjH_gx = np.conj(H_gx)
+        conjH_gy = np.conj(H_gy)
+
+        c0 = grid_size // 2
+        sx = slice(c0 - r_big, c0 + r_big + 1)
+        sy = slice(c0 - r_big, c0 + r_big + 1)
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def wiener_fit_weights() -> tuple[np.ndarray, np.ndarray, float]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for R in rho0_train_fft:
+                acc += (R * np.conj(R)).real
+            for R in rho0_train_fft:
+                rho0 = np.fft.ifftn(R).real
+                var_acc += float(np.mean(rho0 * rho0))
+            S_rr = (acc / float(len(rho0_train_fft))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(rho0_train_fft))
+            lam = float(lambda_rel) * float(var0)
+
+            r_rgx = np.fft.ifftn(S_rr * conjH_gx).real
+            r_rgy = np.fft.ifftn(S_rr * conjH_gy).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, S: np.ndarray) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float64).reshape(w_big, w_big)
+                V.fill(0.0)
+                V[sx, sy] = v
+                conv = np.fft.ifftn(np.fft.fftn(V) * S).real
+                out = conv[sx, sy].reshape(-1).astype(np.float64, copy=False)
+                return out + lam * v.reshape(-1)
+
+            wx, itx, relresx = cg_solve(lambda v: apply_A(v, S=S_rr), b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            wy, ity, relresy = cg_solve(lambda v: apply_A(v, S=S_rr), b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            info = float(max(relresx, relresy))
+            return wx.reshape(w_big, w_big), wy.reshape(w_big, w_big), info
+
+        # Ceiling kernel (truncated impulse).
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+        g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_ceiling_gx = kernel_fft_centered(kcorr_low_gx, grid_size=grid_size)
+        kfft_ceiling_gy = kernel_fft_centered(kcorr_low_gy, grid_size=grid_size)
+
+        # Fit Wiener on TRAIN only, then build sparse FFT kernels from wiener_sym.
+        w_wiener_gx, w_wiener_gy, cg_info = wiener_fit_weights()
+        w_sym_gx = symm_gx(w_wiener_gx)
+        w_sym_gy = symm_gy(w_wiener_gy)
+        kfft_w_gx = kernel_fft_centered(w_wiener_gx, grid_size=grid_size)
+        kfft_w_gy = kernel_fft_centered(w_wiener_gy, grid_size=grid_size)
+
+        Wgx_fft = np.fft.fftn(w_sym_gx)
+        Wgy_fft = np.fft.fftn(w_sym_gy)
+
+        sparse_kernels: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        sim_rows: list[dict[str, str]] = []
+        for K in k_list:
+            Wgx_tr = topk_trunc(Wgx_fft, K)
+            Wgy_tr = topk_trunc(Wgy_fft, K)
+            wK_gx = np.fft.ifftn(Wgx_tr).real
+            wK_gy = np.fft.ifftn(Wgy_tr).real
+            sparse_kernels[K] = (
+                kernel_fft_centered(wK_gx, grid_size=grid_size),
+                kernel_fft_centered(wK_gy, grid_size=grid_size),
+            )
+            corr = 0.5 * (safe_corr_1d(wK_gx, w_sym_gx) + safe_corr_1d(wK_gy, w_sym_gy))
+            rel = 0.5 * (rel_l2(wK_gx, w_sym_gx) + rel_l2(wK_gy, w_sym_gy))
+            sim_rows.append(
+                {
+                    "K": str(K),
+                    "corr(wK,wiener_sym)": f"{corr:.4f}",
+                    "relL2(wK,wiener_sym)": f"{rel:.4f}",
+                }
+            )
+
+        # Evaluate on TEST fields only.
+        perf_rows: list[dict[str, str]] = []
+        delta_rows: list[dict[str, str]] = []
+
+        def eval_kernel(kfft_gx: np.ndarray, kfft_gy: np.ndarray) -> tuple[float, float, float, float]:
+            pears: list[float] = []
+            rels: list[float] = []
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_low_test[fid]
+                pears.append(pearson_mean_2d(y_true, y_pred))
+                rels.append(relrmse_mean_2d(y_true, y_pred))
+            p_mean = float(np.mean(pears))
+            p_std = float(np.std(pears, ddof=1)) if len(pears) > 1 else 0.0
+            r_mean = float(np.mean(rels))
+            r_std = float(np.std(rels, ddof=1)) if len(rels) > 1 else 0.0
+            return p_mean, p_std, r_mean, r_std
+
+        p_c_mean, p_c_std, r_c_mean, r_c_std = eval_kernel(kfft_ceiling_gx, kfft_ceiling_gy)
+        p_w_mean, p_w_std, r_w_mean, r_w_std = eval_kernel(kfft_w_gx, kfft_w_gy)
+        perf_rows.append(
+            {
+                "model": "ceiling",
+                "Pearson mean±std": f"{p_c_mean:.4f} ± {p_c_std:.4f}",
+                "relRMSE mean±std": f"{r_c_mean:.4f} ± {r_c_std:.4f}",
+            }
+        )
+        perf_rows.append(
+            {
+                "model": "wiener",
+                "Pearson mean±std": f"{p_w_mean:.4f} ± {p_w_std:.4f}",
+                "relRMSE mean±std": f"{r_w_mean:.4f} ± {r_w_std:.4f}",
+            }
+        )
+
+        for K in k_list:
+            kfft_k_gx, kfft_k_gy = sparse_kernels[K]
+            p_mean, p_std, r_mean, r_std = eval_kernel(kfft_k_gx, kfft_k_gy)
+            perf_rows.append(
+                {
+                    "model": f"sparseFFT K={K}",
+                    "Pearson mean±std": f"{p_mean:.4f} ± {p_std:.4f}",
+                    "relRMSE mean±std": f"{r_mean:.4f} ± {r_std:.4f}",
+                }
+            )
+            delta_rows.append(
+                {
+                    "K": str(K),
+                    "ΔrelRMSE vs wiener": f"{(r_mean - r_w_mean):+.4f}",
+                    "ΔrelRMSE vs ceiling": f"{(r_mean - r_c_mean):+.4f}",
+                }
+            )
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        summary_md = (
+            "# E48 — OOS sparse-FFT vs Wiener (alpha=2.0, low-k)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, k0_frac={k0_frac}, w_big={w_big}, alpha={alpha}\n"
+            f"- n_train_fields={n_train_fields}, n_test_fields={n_test_fields}, patches_per_field={patches_per_field}\n"
+            f"- k_list={k_list}, seed={seed}\n"
+            f"- wiener solver: lambda_rel={lambda_rel}, cg_max_iter={cg_max_iter}, cg_tol={cg_tol}\n"
+            "- train/test fields are independent; test fields are never used in training\n\n"
+            "## Test performance (mean±std over test fields)\n\n"
+            + md_table(perf_rows, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## ΔrelRMSE vs baselines\n\n"
+            + md_table(delta_rows, ["K", "ΔrelRMSE vs wiener", "ΔrelRMSE vs ceiling"])
+            + ("\n\n## Weight similarity to Wiener_sym (train-only)\n\n" + md_table(sim_rows, ["K", "corr(wK,wiener_sym)", "relL2(wK,wiener_sym)"]) if sim_rows else "")
+        )
+
+        (paths.run_dir / "summary_e48_oos_sparsefft_vs_wiener_alpha2.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "w_big": int(w_big),
+                "alpha": float(alpha),
+                "n_train_fields": n_train_fields,
+                "n_test_fields": n_test_fields,
+                "patches_per_field": patches_per_field,
+                "k_list": k_list,
+                "wiener": {"lambda_rel": lambda_rel, "cg_max_iter": cg_max_iter, "cg_tol": cg_tol},
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
