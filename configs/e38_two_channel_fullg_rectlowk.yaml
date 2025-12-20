@@ -1,0 +1,31 @@
+experiment: e38
+exp_name: e38_two_channel_fullg_rectlowk
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+
+# Two-channel supports
+w_big: 193
+w_local: 33
+
+# Low-k models
+rect_nx: 16
+rect_ny: 8
+annulus_M: 32
+ring_bin_mode: uniform_r   # or: equal_area
+
+# Ridge
+ridge_alpha: 1.0
+
+# Placebo (permute train y for rect model)
+n_perms: 100
+placebo_seed: 123
+
+# PASS criteria vs annulus baseline
+pass_fisher_p: 0.05
+pass_min_pos_folds: 7
+

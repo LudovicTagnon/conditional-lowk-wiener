@@ -15349,6 +15349,622 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e38":
+        # E38 — Two-channel LOFO full g: improved low-k (rectangular dipoles) + fixed high-k local kernel.
+        #
+        # Decompose full g into low/high using the same band_split_poisson_2d(k0_frac), then predict:
+        #  - low-k: learned rectangular dipoles (Nx=16,Ny=8) vs annulus dipole baseline (M=32) vs low-k ceiling (kernel)
+        #  - high-k: fixed impulse-response kernel truncated to w_local=33
+        # Recompose: g_full_pred = g_low_pred + g_high_pred, evaluate in LOFO.
+        import matplotlib.pyplot as plt
+        from scipy.stats import chi2
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 33)))
+
+        # Low-k learned models.
+        rect_nx = int(cfg.get("rect_nx", 16))
+        rect_ny = int(cfg.get("rect_ny", 8))
+        annulus_M = int(cfg.get("annulus_M", 32))
+        ring_bin_mode = str(cfg.get("ring_bin_mode", "uniform_r")).lower()
+
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        # Placebo: permutations of low-rect mapping vs baseline (annulus).
+        n_perms = int(cfg.get("n_perms", 100))
+        placebo_seed = int(cfg.get("placebo_seed", seed))
+
+        # PASS thresholds (relative to baseline full_two_channel_annulus).
+        pass_fisher_p = float(cfg.get("pass_fisher_p", 0.05))
+        pass_min_pos_folds = int(cfg.get("pass_min_pos_folds", 7))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size or w_local > grid_size:
+            raise ValueError("w_big/w_local must be <= grid_size")
+        if w_local > w_big:
+            raise ValueError("w_local must be <= w_big (centers sampled with w_big margin)")
+        if rect_nx <= 0 or rect_ny <= 0:
+            raise ValueError("rect_nx/rect_ny must be > 0")
+        if annulus_M <= 0:
+            raise ValueError("annulus_M must be > 0")
+        if ring_bin_mode not in {"uniform_r", "equal_area"}:
+            raise ValueError("ring_bin_mode must be 'uniform_r' or 'equal_area'")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if n_perms <= 0:
+            raise ValueError("n_perms must be > 0")
+        if pass_min_pos_folds <= 0 or pass_min_pos_folds > n_fields:
+            raise ValueError("pass_min_pos_folds out of range")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+            d = int(A.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(A + ridge_alpha * I, B)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(A + ridge_alpha * I, B, rcond=None)
+                return w
+
+        def annulus_edges(r_min: float, r_max: float, n_bins: int) -> np.ndarray:
+            if ring_bin_mode == "uniform_r":
+                return np.linspace(r_min, r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            rsq = np.linspace(r_min * r_min, r_max * r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            return np.sqrt(rsq, dtype=np.float64)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))  # convolution kernel so that output = correlation with `kernel`
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def save_img(arr: np.ndarray, out: Path, title: str) -> None:
+            fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+            vmax = float(np.max(np.abs(arr))) + 1e-12
+            im = ax.imshow(arr, cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+            ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def candidate_edges(r: int) -> np.ndarray:
+            base = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, r + 1]
+            base = [int(x) for x in base if 0 <= int(x) <= r + 1]
+            dense = list(range(0, min(16, r + 1) + 1))
+            geom = np.unique(np.rint(np.geomspace(1, r + 1, num=64)).astype(int)).tolist()
+            vals = sorted(set(base + dense + geom + [0, r + 1]))
+            return np.asarray(vals, dtype=np.int64)
+
+        def pick_edges(cand: np.ndarray, n_bins: int) -> np.ndarray:
+            cand = np.asarray(cand, dtype=np.int64)
+            if len(cand) < n_bins + 1:
+                cand = np.arange(int(cand.min()), int(cand.max()) + 1, dtype=np.int64)
+            idx = np.round(np.linspace(0, len(cand) - 1, n_bins + 1)).astype(int)
+            idx[0] = 0
+            idx[-1] = len(cand) - 1
+            for k in range(1, len(idx)):
+                if idx[k] <= idx[k - 1]:
+                    idx[k] = idx[k - 1] + 1
+            for k in range(len(idx) - 2, -1, -1):
+                if idx[k] >= idx[k + 1]:
+                    idx[k] = idx[k + 1] - 1
+            if idx[0] != 0 or idx[-1] != len(cand) - 1 or np.any(np.diff(idx) <= 0):
+                raise RuntimeError("Failed to build strictly increasing edge indices")
+            return cand[idx].astype(np.float64, copy=False)
+
+        def build_rect_bins(wb: int, *, nx_bins: int, ny_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            r_big = wb // 2
+            coords = np.arange(int(wb), dtype=np.float64) - float(r_big)
+            dx, dy = np.meshgrid(coords, coords, indexing="ij")
+            ax = np.abs(dx)
+            ay = np.abs(dy)
+            cand = candidate_edges(r_big)
+            edges_x = pick_edges(cand, int(nx_bins))
+            edges_y = pick_edges(cand, int(ny_bins))
+            ix = np.digitize(ax, edges_x, right=False) - 1
+            iy = np.digitize(ay, edges_y, right=False) - 1
+            ix = np.clip(ix, 0, int(nx_bins) - 1).astype(np.int32, copy=False)
+            iy = np.clip(iy, 0, int(ny_bins) - 1).astype(np.int32, copy=False)
+            bin_idx = (ix * int(ny_bins) + iy).astype(np.int32, copy=False)
+            return dx.astype(np.float64), dy.astype(np.float64), bin_idx
+
+        # 1) Generate fields + band splits.
+        rho01_by_field: list[np.ndarray] = []
+        rho0_by_field: list[np.ndarray] = []
+        split_cache: list[BandSplit2D] = []
+        var_frac_rows: list[dict[str, Any]] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rho0_by_field.append((rho01 - float(rho01.mean())).astype(np.float64, copy=False))
+            split_cache.append(split)
+
+            vfx = float(np.var(split.low.gx) / (np.var(split.full.gx) + 1e-12))
+            vfy = float(np.var(split.low.gy) / (np.var(split.full.gy) + 1e-12))
+            var_frac_rows.append({"field_id": int(field_id), "var_frac_gx": vfx, "var_frac_gy": vfy, "var_frac_mean": 0.5 * (vfx + vfy)})
+
+        var_frac_mean = float(np.mean([r0["var_frac_mean"] for r0 in var_frac_rows]))
+        var_frac_std = float(np.std([r0["var_frac_mean"] for r0 in var_frac_rows], ddof=1)) if n_fields > 1 else 0.0
+
+        # 2) Centers (shared across all channels).
+        r_big = w_big // 2
+        centers_by_field: list[np.ndarray] = []
+        centers_idx: list[tuple[np.ndarray, np.ndarray]] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * int(w_big) + 1_000 * field_id)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers = np.column_stack([cx, cy]).astype(np.int64, copy=False)
+            centers_by_field.append(centers)
+            centers_idx.append((cx.astype(np.int64, copy=False), cy.astype(np.int64, copy=False)))
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        y_low_by_field = [sample_vec_at_centers(split_cache[fid].low.gx, split_cache[fid].low.gy, centers_by_field[fid]) for fid in range(n_fields)]
+        y_full_by_field = [
+            sample_vec_at_centers(split_cache[fid].full.gx, split_cache[fid].full.gy, centers_by_field[fid]) for fid in range(n_fields)
+        ]
+
+        # 3) Impulse kernels for low/high.
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c0 = grid_size // 2
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+
+        # Low-k (w_big) correlation kernels (kcorr = flip(convolution-kernel patch)).
+        g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_low_gx = kernel_fft_centered(kcorr_low_gx, grid_size=grid_size)
+        kfft_low_gy = kernel_fft_centered(kcorr_low_gy, grid_size=grid_size)
+
+        # High-k (w_local) correlation kernels.
+        r_loc = w_local // 2
+        g_patch_high_gx = split_delta.high.gx[c0 - r_loc : c0 + r_loc + 1, c0 - r_loc : c0 + r_loc + 1]
+        g_patch_high_gy = split_delta.high.gy[c0 - r_loc : c0 + r_loc + 1, c0 - r_loc : c0 + r_loc + 1]
+        kcorr_high_gx = g_patch_high_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_high_gy = g_patch_high_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_high_gx = kernel_fft_centered(kcorr_high_gx, grid_size=grid_size)
+        kfft_high_gy = kernel_fft_centered(kcorr_high_gy, grid_size=grid_size)
+
+        # Save kernel images (sanity).
+        save_img(g_patch_low_gx, paths.run_dir / f"kernel_low_gx_wbig{w_big}.png", f"Kx_low truncated (w={w_big})")
+        save_img(g_patch_low_gy, paths.run_dir / f"kernel_low_gy_wbig{w_big}.png", f"Ky_low truncated (w={w_big})")
+        save_img(g_patch_high_gx, paths.run_dir / f"kernel_high_gx_wlocal{w_local}.png", f"Kx_high truncated (w={w_local})")
+        save_img(g_patch_high_gy, paths.run_dir / f"kernel_high_gy_wlocal{w_local}.png", f"Ky_high truncated (w={w_local})")
+
+        # 4) Precompute channel predictions that do not require learning (low ceiling + high kernel).
+        y_low_ceiling_pred_by_field: list[np.ndarray] = []
+        y_high_kernel_pred_by_field: list[np.ndarray] = []
+        for fid in range(n_fields):
+            field_fft = np.fft.fftn(rho0_by_field[fid])
+            gx_low_pred = np.fft.ifftn(field_fft * kfft_low_gx).real
+            gy_low_pred = np.fft.ifftn(field_fft * kfft_low_gy).real
+            y_low_ceiling_pred_by_field.append(sample_vec_at_centers(gx_low_pred, gy_low_pred, centers_by_field[fid]))
+
+            gx_high_pred = np.fft.ifftn(field_fft * kfft_high_gx).real
+            gy_high_pred = np.fft.ifftn(field_fft * kfft_high_gy).real
+            y_high_kernel_pred_by_field.append(sample_vec_at_centers(gx_high_pred, gy_high_pred, centers_by_field[fid]))
+
+        # 5) Build low-k feature blocks on w_big.
+        field_fft_rho01_by_field = [np.fft.fftn(rho01_by_field[fid]) for fid in range(n_fields)]
+
+        # Annulus dipole features (M=annulus_M).
+        coords = np.arange(int(w_big), dtype=np.float64) - float(r_big)
+        dx, dy = np.meshgrid(coords, coords, indexing="ij")
+        rgrid = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+        edges_r = annulus_edges(0.0, float(r_big), int(annulus_M))
+        n_bins_ann = int(annulus_M)
+        F_ann_by_field: list[np.ndarray] = [np.zeros((patches_per_field, 2 * n_bins_ann), dtype=np.float32) for _ in range(n_fields)]
+        for m in range(n_bins_ann):
+            lo = edges_r[m]
+            hi = edges_r[m + 1]
+            if m == n_bins_ann - 1:
+                ring = (rgrid >= lo) & (rgrid <= hi)
+            else:
+                ring = (rgrid >= lo) & (rgrid < hi)
+            ring_f = ring.astype(np.float64)
+            kdx = (dx * ring_f).astype(np.float64, copy=False)
+            kdy = (dy * ring_f).astype(np.float64, copy=False)
+            kfft_dx = kernel_fft_centered(kdx, grid_size=grid_size)
+            kfft_dy = kernel_fft_centered(kdy, grid_size=grid_size)
+            for fid in range(n_fields):
+                field_fft = field_fft_rho01_by_field[fid]
+                cx, cy = centers_idx[fid]
+                dx_grid = np.fft.ifftn(field_fft * kfft_dx).real
+                dy_grid = np.fft.ifftn(field_fft * kfft_dy).real
+                F_ann_by_field[fid][:, m] = dx_grid[cx, cy].astype(np.float32, copy=False)
+                F_ann_by_field[fid][:, n_bins_ann + m] = dy_grid[cx, cy].astype(np.float32, copy=False)
+
+        # Rectangular dipoles (Nx,Ny).
+        dxr, dyr, bin_idx = build_rect_bins(w_big, nx_bins=int(rect_nx), ny_bins=int(rect_ny))
+        n_bins_rect = int(rect_nx) * int(rect_ny)
+        F_rect_by_field: list[np.ndarray] = [np.zeros((patches_per_field, 2 * n_bins_rect), dtype=np.float32) for _ in range(n_fields)]
+        for b in range(n_bins_rect):
+            mask = (bin_idx == int(b)).astype(np.float64, copy=False)
+            kdx = (dxr * mask).astype(np.float64, copy=False)
+            kdy = (dyr * mask).astype(np.float64, copy=False)
+            kfft_dx = kernel_fft_centered(kdx, grid_size=grid_size)
+            kfft_dy = kernel_fft_centered(kdy, grid_size=grid_size)
+            for fid in range(n_fields):
+                field_fft = field_fft_rho01_by_field[fid]
+                cx, cy = centers_idx[fid]
+                dx_grid = np.fft.ifftn(field_fft * kfft_dx).real
+                dy_grid = np.fft.ifftn(field_fft * kfft_dy).real
+                F_rect_by_field[fid][:, b] = dx_grid[cx, cy].astype(np.float32, copy=False)
+                F_rect_by_field[fid][:, n_bins_rect + b] = dy_grid[cx, cy].astype(np.float32, copy=False)
+
+        # 6) LOFO: fit low-k models (annulus/rect), recombine with high-k kernel, evaluate on full g.
+        def fit_predict_fold(
+            F_by_field: list[np.ndarray],
+            y_by_field: list[np.ndarray],
+            *,
+            test_field: int,
+            permute_train_y: bool = False,
+            perm_rng: np.random.Generator | None = None,
+        ) -> np.ndarray:
+            # Fit ridge with StandardScaler and intercept using sufficient statistics.
+            d = int(F_by_field[0].shape[1])
+            sums_F = [np.asarray(F_by_field[fid], dtype=np.float64).sum(axis=0) for fid in range(n_fields)]
+            sums_y = [np.asarray(y_by_field[fid], dtype=np.float64).sum(axis=0) for fid in range(n_fields)]
+            FtF = [(np.asarray(F_by_field[fid], dtype=np.float64).T @ np.asarray(F_by_field[fid], dtype=np.float64)) for fid in range(n_fields)]
+
+            # FtY may be permuted.
+            if permute_train_y:
+                if perm_rng is None:
+                    raise ValueError("perm_rng required when permute_train_y=True")
+                FtY = []
+                for fid in range(n_fields):
+                    F = np.asarray(F_by_field[fid], dtype=np.float64)
+                    y = np.asarray(y_by_field[fid], dtype=np.float64)
+                    if fid == test_field:
+                        FtY.append(F.T @ y)
+                    else:
+                        perm = perm_rng.permutation(y.shape[0])
+                        FtY.append(F.T @ y[perm])
+            else:
+                FtY = [(np.asarray(F_by_field[fid], dtype=np.float64).T @ np.asarray(y_by_field[fid], dtype=np.float64)) for fid in range(n_fields)]
+
+            total_sum_F = np.sum(np.stack(sums_F, axis=0), axis=0)
+            total_sum_y = np.sum(np.stack(sums_y, axis=0), axis=0)
+            total_FtF = np.sum(np.stack(FtF, axis=0), axis=0)
+            total_FtY = np.sum(np.stack(FtY, axis=0), axis=0)
+
+            n_total = int(n_fields) * int(patches_per_field)
+            n_test = int(patches_per_field)
+            n_train = n_total - n_test
+
+            sum_F_tr = total_sum_F - sums_F[test_field]
+            sum_y_tr = total_sum_y - sums_y[test_field]
+            FtF_tr = total_FtF - FtF[test_field]
+            FtY_tr = total_FtY - FtY[test_field]
+
+            mu = sum_F_tr / float(n_train)
+            y_mu = sum_y_tr / float(n_train)
+            var = np.diag(FtF_tr) / float(n_train) - mu * mu
+            var = np.where(var > 1e-12, var, 1e-12)
+            sd = np.sqrt(var, dtype=np.float64)
+
+            FtF_center = FtF_tr - float(n_train) * np.outer(mu, mu)
+            FtY_center = FtY_tr - float(n_train) * (mu[:, None] * y_mu[None, :])
+
+            XtX = FtF_center / (sd[:, None] * sd[None, :])
+            Xty = FtY_center / sd[:, None]
+            w = solve_ridge(XtX, Xty)
+
+            Fte = np.asarray(F_by_field[test_field], dtype=np.float64)
+            Xte = (Fte - mu) / sd
+            y_pred = Xte @ w + y_mu
+            return y_pred.astype(np.float64, copy=False)
+
+        fold_rows: list[dict[str, Any]] = []
+        delta_real: list[float] = []
+        delta_real_rel: list[float] = []
+        placebo_pvals: list[float] = []
+
+        # Metrics storage per model across folds.
+        model_fold_metrics: dict[str, list[dict[str, Any]]] = {k: [] for k in ["full_annulus", "full_rect", "full_ceiling"]}
+        low_fold_metrics: dict[str, list[dict[str, Any]]] = {k: [] for k in ["low_annulus", "low_rect", "low_ceiling"]}
+
+        for test_field in range(n_fields):
+            y_full_true = y_full_by_field[test_field]
+            y_low_true = y_low_by_field[test_field]
+
+            # Low-k predictions.
+            y_low_ceiling = y_low_ceiling_pred_by_field[test_field]
+            y_low_ann = fit_predict_fold(F_ann_by_field, y_low_by_field, test_field=test_field)
+            y_low_rect = fit_predict_fold(F_rect_by_field, y_low_by_field, test_field=test_field)
+
+            # High-k prediction.
+            y_high = y_high_kernel_pred_by_field[test_field]
+
+            # Full predictions.
+            y_full_ceiling = y_low_ceiling + y_high
+            y_full_ann = y_low_ann + y_high
+            y_full_rect = y_low_rect + y_high
+
+            # Metrics.
+            p_full_ceiling = pearson_mean_2d(y_full_true, y_full_ceiling)
+            rr_full_ceiling = relrmse_mean_2d(y_full_true, y_full_ceiling)
+            p_full_ann = pearson_mean_2d(y_full_true, y_full_ann)
+            rr_full_ann = relrmse_mean_2d(y_full_true, y_full_ann)
+            p_full_rect = pearson_mean_2d(y_full_true, y_full_rect)
+            rr_full_rect = relrmse_mean_2d(y_full_true, y_full_rect)
+
+            p_low_ceiling = pearson_mean_2d(y_low_true, y_low_ceiling)
+            rr_low_ceiling = relrmse_mean_2d(y_low_true, y_low_ceiling)
+            p_low_ann = pearson_mean_2d(y_low_true, y_low_ann)
+            rr_low_ann = relrmse_mean_2d(y_low_true, y_low_ann)
+            p_low_rect = pearson_mean_2d(y_low_true, y_low_rect)
+            rr_low_rect = relrmse_mean_2d(y_low_true, y_low_rect)
+
+            model_fold_metrics["full_ceiling"].append({"field_id": int(test_field), "pearson": p_full_ceiling, "relRMSE": rr_full_ceiling})
+            model_fold_metrics["full_annulus"].append({"field_id": int(test_field), "pearson": p_full_ann, "relRMSE": rr_full_ann})
+            model_fold_metrics["full_rect"].append({"field_id": int(test_field), "pearson": p_full_rect, "relRMSE": rr_full_rect})
+
+            low_fold_metrics["low_ceiling"].append({"field_id": int(test_field), "pearson": p_low_ceiling, "relRMSE": rr_low_ceiling})
+            low_fold_metrics["low_annulus"].append({"field_id": int(test_field), "pearson": p_low_ann, "relRMSE": rr_low_ann})
+            low_fold_metrics["low_rect"].append({"field_id": int(test_field), "pearson": p_low_rect, "relRMSE": rr_low_rect})
+
+            dP = float(p_full_rect - p_full_ann)
+            dR = float(rr_full_rect - rr_full_ann)
+            delta_real.append(dP)
+            delta_real_rel.append(dR)
+
+            # Placebo for rect features: permute y_low in TRAIN only, refit, evaluate ΔPearson vs annulus baseline.
+            rng_perm = np.random.default_rng(int(placebo_seed) + 10_000 * test_field)
+            deltas_perm = np.zeros((n_perms,), dtype=np.float64)
+            for pidx in range(n_perms):
+                rng_pi = np.random.default_rng(rng_perm.integers(0, 2**32 - 1, dtype=np.uint64))
+                y_low_rect_perm = fit_predict_fold(
+                    F_rect_by_field,
+                    y_low_by_field,
+                    test_field=test_field,
+                    permute_train_y=True,
+                    perm_rng=rng_pi,
+                )
+                y_full_rect_perm = y_low_rect_perm + y_high
+                p_perm = pearson_mean_2d(y_full_true, y_full_rect_perm)
+                deltas_perm[pidx] = float(p_perm - p_full_ann)
+
+            # Empirical p-value (one-sided): fraction of perm deltas >= real delta.
+            denom = float(n_perms + 1)
+            p_emp = (float(np.sum(deltas_perm >= dP)) + 1.0) / denom
+            placebo_pvals.append(p_emp)
+
+            fold_rows.append(
+                {
+                    "field_id": int(test_field),
+                    "pearson_full_ceiling": float(p_full_ceiling),
+                    "pearson_full_annulus": float(p_full_ann),
+                    "pearson_full_rect": float(p_full_rect),
+                    "deltaP_rect_minus_annulus": float(dP),
+                    "relRMSE_full_ceiling": float(rr_full_ceiling),
+                    "relRMSE_full_annulus": float(rr_full_ann),
+                    "relRMSE_full_rect": float(rr_full_rect),
+                    "deltaR_rect_minus_annulus": float(dR),
+                    "p_emp_placebo": float(p_emp),
+                }
+            )
+
+        # Aggregates.
+        def mean_std(vals: list[float]) -> tuple[float, float]:
+            arr = np.asarray(vals, dtype=np.float64)
+            return float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+
+        def agg_metrics(rows: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+            p = np.asarray([r0["pearson"] for r0 in rows], dtype=np.float64)
+            r = np.asarray([r0["relRMSE"] for r0 in rows], dtype=np.float64)
+            return float(p.mean()), float(p.std(ddof=1)) if len(p) > 1 else 0.0, float(r.mean()), float(r.std(ddof=1)) if len(r) > 1 else 0.0
+
+        full_ceiling_m = agg_metrics(model_fold_metrics["full_ceiling"])
+        full_ann_m = agg_metrics(model_fold_metrics["full_annulus"])
+        full_rect_m = agg_metrics(model_fold_metrics["full_rect"])
+
+        low_ceiling_m = agg_metrics(low_fold_metrics["low_ceiling"])
+        low_ann_m = agg_metrics(low_fold_metrics["low_annulus"])
+        low_rect_m = agg_metrics(low_fold_metrics["low_rect"])
+
+        dP_mean, dP_std = mean_std(delta_real)
+        dR_mean, dR_std = mean_std(delta_real_rel)
+
+        # Fisher combine placebo p-values across folds.
+        pvals = np.clip(np.asarray(placebo_pvals, dtype=np.float64), 1e-300, 1.0)
+        fisher_stat = float(-2.0 * np.sum(np.log(pvals)))
+        fisher_p = float(chi2.sf(fisher_stat, df=2 * len(pvals)))
+
+        n_pos = int(np.sum(np.asarray(delta_real, dtype=np.float64) > 0))
+        passes = (dP_mean > 0) and (dR_mean < 0) and (fisher_p < pass_fisher_p) and (n_pos >= pass_min_pos_folds)
+
+        # Summary markdown.
+        md_var = [
+            {
+                "field_id": str(r0["field_id"]),
+                "var_frac_gx": f"{float(r0['var_frac_gx']):.4f}",
+                "var_frac_gy": f"{float(r0['var_frac_gy']):.4f}",
+                "var_frac_mean": f"{float(r0['var_frac_mean']):.4f}",
+            }
+            for r0 in var_frac_rows
+        ]
+
+        def fmt_ms(m: tuple[float, float, float, float]) -> tuple[str, str]:
+            return f"{m[0]:.4f} ± {m[1]:.4f}", f"{m[2]:.4f} ± {m[3]:.4f}"
+
+        full_rows = []
+        for name, m in [
+            ("full_two_channel_annulus", full_ann_m),
+            ("full_two_channel_rect", full_rect_m),
+            ("full_two_channel_ceiling", full_ceiling_m),
+        ]:
+            p_s, r_s = fmt_ms(m)
+            full_rows.append({"model": name, "Pearson mean±std": p_s, "relRMSE mean±std": r_s})
+
+        low_rows = []
+        for name, m in [
+            ("low_annulus_learn", low_ann_m),
+            ("low_rect_learn", low_rect_m),
+            ("low_ceiling", low_ceiling_m),
+        ]:
+            p_s, r_s = fmt_ms(m)
+            low_rows.append({"model": name, "Pearson mean±std": p_s, "relRMSE mean±std": r_s})
+
+        md_folds = [
+            {
+                "field_id": str(r0["field_id"]),
+                "Pearson_baseline(annulus)": f"{r0['pearson_full_annulus']:.4f}",
+                "Pearson_rect": f"{r0['pearson_full_rect']:.4f}",
+                "ΔPearson": f"{r0['deltaP_rect_minus_annulus']:+.4f}",
+                "relRMSE_baseline(annulus)": f"{r0['relRMSE_full_annulus']:.4f}",
+                "relRMSE_rect": f"{r0['relRMSE_full_rect']:.4f}",
+                "ΔrelRMSE": f"{r0['deltaR_rect_minus_annulus']:+.4f}",
+                "p_emp(placebo)": f"{r0['p_emp_placebo']:.4f}",
+            }
+            for r0 in fold_rows
+        ]
+
+        summary_md = (
+            "# E38 — Two-channel LOFO full g (rect low-k + kernel high-k)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, alpha={alpha}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_big={w_big} (low-k), w_local={w_local} (high-k kernel)\n"
+            f"- low_rect: Nx={rect_nx}, Ny={rect_ny} (d={2*rect_nx*rect_ny}) ; low_annulus: M={annulus_M} (d={2*annulus_M})\n"
+            f"- placebo: n_perms={n_perms} per fold, placebo_seed={placebo_seed}\n\n"
+            "## Low-k variance fraction (per field)\n\n"
+            + md_table(md_var, ["field_id", "var_frac_gx", "var_frac_gy", "var_frac_mean"])
+            + f"\n\n- var_frac_mean across fields: {var_frac_mean:.4f} ± {var_frac_std:.4f}\n\n"
+            "## Low-k channel metrics (gx_low, gy_low)\n\n"
+            + md_table(low_rows, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## Full g metrics (gx_full, gy_full)\n\n"
+            + md_table(full_rows, ["model", "Pearson mean±std", "relRMSE mean±std"])
+            + "\n\n## Improvement: rect vs annulus (full g)\n\n"
+            + f"- ΔPearson mean±std: {dP_mean:+.4f} ± {dP_std:.4f}\n"
+            + f"- ΔrelRMSE mean±std: {dR_mean:+.4f} ± {dR_std:.4f}\n"
+            + f"- #folds ΔPearson>0: {n_pos}/{n_fields}\n"
+            + f"- Fisher p-value (placebo ΔPearson): {fisher_p:.4g}\n"
+            + f"- VERDICT: {'PASS' if passes else 'FAIL'}\n\n"
+            "## Per-fold table (baseline=annulus)\n\n"
+            + md_table(
+                md_folds,
+                [
+                    "field_id",
+                    "Pearson_baseline(annulus)",
+                    "Pearson_rect",
+                    "ΔPearson",
+                    "relRMSE_baseline(annulus)",
+                    "relRMSE_rect",
+                    "ΔrelRMSE",
+                    "p_emp(placebo)",
+                ],
+            )
+            + "\n"
+        )
+
+        (paths.run_dir / "summary_e38_two_channel_fullg_rectlowk.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_big": int(w_big),
+                "w_local": int(w_local),
+                "rect": {"nx": int(rect_nx), "ny": int(rect_ny)},
+                "annulus_M": int(annulus_M),
+                "ring_bin_mode": ring_bin_mode,
+                "ridge_alpha": ridge_alpha,
+                "placebo": {"n_perms": int(n_perms), "seed": int(placebo_seed)},
+                "var_frac_rows": var_frac_rows,
+                "fold_rows": fold_rows,
+                "full_metrics": {"annulus": full_ann_m, "rect": full_rect_m, "ceiling": full_ceiling_m},
+                "low_metrics": {"annulus": low_ann_m, "rect": low_rect_m, "ceiling": low_ceiling_m},
+                "delta": {
+                    "dPearson_mean": dP_mean,
+                    "dPearson_std": dP_std,
+                    "drelRMSE_mean": dR_mean,
+                    "drelRMSE_std": dR_std,
+                    "n_pos": n_pos,
+                    "fisher_p": fisher_p,
+                    "pass": bool(passes),
+                },
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
