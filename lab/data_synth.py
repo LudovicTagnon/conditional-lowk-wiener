@@ -39,10 +39,16 @@ def generate_1overf_field_2d(
     shape: tuple[int, int],
     alpha: float,
     rng: np.random.Generator,
+    spectrum: str = "powerlaw",
+    bbks_k0: float | None = None,
+    bbks_ns: float = 1.0,
+    lognormal: bool = False,
+    lognormal_sigma: float = 1.0,
 ) -> np.ndarray:
     """
-    Generate a real 2D field with power spectrum ~ 1/|k|^alpha using rFFT.
-    Returns rho normalized to [0,1].
+    Generate a real 2D field using rFFT.
+    spectrum="powerlaw" uses ~1/|k|^alpha, spectrum="bbks" uses BBKS transfer.
+    Returns rho normalized to [0,1] (lognormal optionally applied).
     """
     if len(shape) != 2:
         raise ValueError(f"shape must be 2D, got {shape}")
@@ -50,6 +56,11 @@ def generate_1overf_field_2d(
         raise ValueError(f"invalid shape: {shape}")
     if alpha < 0:
         raise ValueError("alpha must be >= 0")
+    spectrum = str(spectrum).lower().strip()
+    if spectrum not in {"powerlaw", "bbks"}:
+        raise ValueError(f"unsupported spectrum={spectrum}")
+    if lognormal_sigma <= 0:
+        raise ValueError("lognormal_sigma must be > 0")
 
     nx, ny = shape
     kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
@@ -58,7 +69,23 @@ def generate_1overf_field_2d(
     k = np.sqrt(k2, dtype=np.float64)
     scale = np.zeros_like(k, dtype=np.float64)
     nonzero = k > 0
-    scale[nonzero] = k[nonzero] ** (-alpha / 2.0)
+    if spectrum == "powerlaw":
+        scale[nonzero] = k[nonzero] ** (-alpha / 2.0)
+    else:
+        if bbks_k0 is None:
+            bbks_k0 = 0.15 * np.pi
+        if bbks_k0 <= 0:
+            raise ValueError("bbks_k0 must be > 0")
+        q = np.zeros_like(k, dtype=np.float64)
+        q[nonzero] = k[nonzero] / float(bbks_k0)
+        x = 2.34 * q
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t0 = np.log1p(x) / np.where(x > 0, x, 1.0)
+        denom = 1.0 + 3.89 * q + (16.1 * q) ** 2 + (5.46 * q) ** 3 + (6.71 * q) ** 4
+        t = t0 * np.power(denom, -0.25)
+        p = np.zeros_like(k, dtype=np.float64)
+        p[nonzero] = (k[nonzero] ** float(bbks_ns)) * (t[nonzero] ** 2)
+        scale[nonzero] = np.sqrt(p[nonzero])
 
     real = rng.normal(size=(nx, ny // 2 + 1))
     imag = rng.normal(size=(nx, ny // 2 + 1))
@@ -67,6 +94,9 @@ def generate_1overf_field_2d(
 
     field = np.fft.irfftn(coeff, s=shape).real
     assert_finite("rho_raw_2d", field)
+    if lognormal:
+        field = np.exp(float(lognormal_sigma) * field)
+        assert_finite("rho_lognormal_2d", field)
     rho = normalize_01(field)
     if (rho.min() < -1e-9) or (rho.max() > 1.0 + 1e-9):
         raise RuntimeError("normalize_01 returned values outside [0,1]")
