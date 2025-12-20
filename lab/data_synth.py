@@ -69,6 +69,8 @@ def generate_1overf_field_2d(
     spectrum: str = "powerlaw",
     bbks_k0: float | None = None,
     bbks_ns: float = 1.0,
+    bbks_beta: float = 0.0,
+    bbks_k_eps: float = 1e-6,
     lognormal: bool = False,
     lognormal_sigma: float = 1.0,
     norm_mode: str = "minmax_01",
@@ -85,10 +87,12 @@ def generate_1overf_field_2d(
     if alpha < 0:
         raise ValueError("alpha must be >= 0")
     spectrum = str(spectrum).lower().strip()
-    if spectrum not in {"powerlaw", "bbks"}:
+    if spectrum not in {"powerlaw", "bbks", "bbks_tilt"}:
         raise ValueError(f"unsupported spectrum={spectrum}")
     if lognormal_sigma <= 0:
         raise ValueError("lognormal_sigma must be > 0")
+    if bbks_k_eps <= 0:
+        raise ValueError("bbks_k_eps must be > 0")
 
     nx, ny = shape
     kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
@@ -113,6 +117,8 @@ def generate_1overf_field_2d(
         t = t0 * np.power(denom, -0.25)
         p = np.zeros_like(k, dtype=np.float64)
         p[nonzero] = (k[nonzero] ** float(bbks_ns)) * (t[nonzero] ** 2)
+        if spectrum == "bbks_tilt":
+            p[nonzero] = p[nonzero] * (k[nonzero] + float(bbks_k_eps)) ** (-float(bbks_beta))
         scale[nonzero] = np.sqrt(p[nonzero])
 
     real = rng.normal(size=(nx, ny // 2 + 1))
