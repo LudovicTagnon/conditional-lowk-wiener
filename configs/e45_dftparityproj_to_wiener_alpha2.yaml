@@ -1,0 +1,31 @@
+experiment: e45
+exp_name: e45_dftparityproj_to_wiener_alpha2
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+w_big: 193
+alpha: 2.0
+
+# DFT parity basis sizes
+pq_list:
+  - [24, 12]
+  - [32, 16]
+  - [48, 24]
+
+# Rect baseline
+rect_pair: [24, 12]
+
+# Optional pi/L baseline (E44-style)
+include_piL_baseline: true
+piL_pair: [24, 12]
+
+# Projection ridge (basis -> Wiener)
+proj_lambda_rel: 1.0e-8
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6

@@ -19288,6 +19288,578 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e45":
+        # E45 — Discrete-DFT parity basis (2π/N) projection to Wiener (alpha=2.0, w_big=193).
+        #
+        # Compare DFT-parity basis projection vs rect bins and (optional) pi/L Fourier baseline.
+        grid_size = int(cfg.get("grid_size", 256))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha = float(cfg.get("alpha", 2.0))
+
+        pq_list = cfg.get("pq_list", [[24, 12], [32, 16], [48, 24]])
+        pq_list = [(int(p[0]), int(p[1])) for p in pq_list]
+
+        rect_pair = cfg.get("rect_pair", [24, 12])
+        rect_pair = (int(rect_pair[0]), int(rect_pair[1]))
+
+        include_piL = bool(cfg.get("include_piL_baseline", True))
+        piL_pair = cfg.get("piL_pair", [24, 12])
+        piL_pair = (int(piL_pair[0]), int(piL_pair[1]))
+
+        proj_lambda_rel = float(cfg.get("proj_lambda_rel", 1e-8))
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if alpha < 0:
+            raise ValueError("alpha must be >= 0")
+        if not pq_list:
+            raise ValueError("pq_list must be non-empty")
+        if any(p <= 0 or q <= 0 for p, q in pq_list):
+            raise ValueError("pq_list entries must be positive")
+        if rect_pair[0] <= 0 or rect_pair[1] <= 0:
+            raise ValueError("rect_pair must be positive")
+        if include_piL and (piL_pair[0] <= 0 or piL_pair[1] <= 0):
+            raise ValueError("piL_pair must be positive")
+        if proj_lambda_rel <= 0:
+            raise ValueError("proj_lambda_rel must be > 0")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def candidate_edges(r: int) -> np.ndarray:
+            base = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, r + 1]
+            base = [int(x) for x in base if 0 <= int(x) <= r + 1]
+            dense = list(range(0, min(16, r + 1) + 1))
+            geom = np.unique(np.rint(np.geomspace(1, r + 1, num=64)).astype(int)).tolist()
+            vals = sorted(set(base + dense + geom + [0, r + 1]))
+            return np.asarray(vals, dtype=np.int64)
+
+        def pick_edges(cand: np.ndarray, n_bins: int) -> np.ndarray:
+            cand = np.asarray(cand, dtype=np.int64)
+            if len(cand) < n_bins + 1:
+                cand = np.arange(int(cand.min()), int(cand.max()) + 1, dtype=np.int64)
+            idx = np.round(np.linspace(0, len(cand) - 1, n_bins + 1)).astype(int)
+            idx[0] = 0
+            idx[-1] = len(cand) - 1
+            edges = np.unique(cand[idx])
+            if len(edges) != n_bins + 1:
+                edges = np.unique(np.rint(np.linspace(int(cand.min()), int(cand.max()), n_bins + 1)).astype(np.int64))
+            edges[0] = int(cand.min())
+            edges[-1] = int(cand.max())
+            return edges
+
+        def build_rect_bins(w: int, *, nx_bins: int, ny_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            w = _require_odd("w_big", int(w))
+            r = w // 2
+            coords = np.arange(w, dtype=np.float64) - float(r)
+            dx, dy = np.meshgrid(coords, coords, indexing="ij")
+            ax = np.abs(dx).astype(np.int64)
+            ay = np.abs(dy).astype(np.int64)
+            cand = candidate_edges(int(r))
+            edges_x = pick_edges(cand, int(nx_bins))
+            edges_y = pick_edges(cand, int(ny_bins))
+            ix = np.digitize(ax, edges_x, right=False) - 1
+            iy = np.digitize(ay, edges_y, right=False) - 1
+            ix = np.clip(ix, 0, int(nx_bins) - 1).astype(np.int32, copy=False)
+            iy = np.clip(iy, 0, int(ny_bins) - 1).astype(np.int32, copy=False)
+            bin_idx = (ix * int(ny_bins) + iy).astype(np.int32, copy=False)
+            return dx.astype(np.float64), dy.astype(np.float64), bin_idx
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+
+        # Patch centers (shared across fields).
+        r_big = w_big // 2
+        centers_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * int(w_big) + 1_000 * field_id)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        # Generate fields (alpha fixed).
+        rho01_by_field: list[np.ndarray] = []
+        rho0_by_field: list[np.ndarray] = []
+        rho0_fft_by_field: list[np.ndarray] = []
+        split_cache: list[BandSplit2D] = []
+        y_low_by_field: list[np.ndarray] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=float(alpha), rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+            rho0_by_field.append(rho0)
+            rho0_fft_by_field.append(np.fft.fftn(rho0))
+            split_cache.append(split)
+            y_low_by_field.append(sample_vec_at_centers(split.low.gx, split.low.gy, centers_by_field[field_id]))
+
+        # Ceiling kernel (truncated impulse).
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c0 = grid_size // 2
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+        g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_ceiling_gx = kernel_fft_centered(kcorr_low_gx, grid_size=grid_size)
+        kfft_ceiling_gy = kernel_fft_centered(kcorr_low_gy, grid_size=grid_size)
+
+        # Fourier-domain transfer H for low-k (independent of alpha/rho).
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        k0 = float(k0_frac) * k_ny
+        mask_low = k <= k0
+        H_gx = np.zeros((nx, nx), dtype=np.complex128)
+        H_gy = np.zeros((nx, nx), dtype=np.complex128)
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+        H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+        H_gx[0, 0] = 0.0 + 0.0j
+        H_gy[0, 0] = 0.0 + 0.0j
+        conjH_gx = np.conj(H_gx)
+        conjH_gy = np.conj(H_gy)
+
+        sx = slice(c0 - r_big, c0 + r_big + 1)
+        sy = slice(c0 - r_big, c0 + r_big + 1)
+
+        def wiener_fit_weights(train_fields: list[int]) -> tuple[np.ndarray, np.ndarray, float]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for fid in train_fields:
+                R = rho0_fft_by_field[fid]
+                acc += (R * np.conj(R)).real
+                var_acc += float(np.mean(rho0_by_field[fid] * rho0_by_field[fid]))
+            S_rr = (acc / float(len(train_fields))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(train_fields))
+            lam = float(lambda_rel) * float(var0)
+
+            r_rgx = np.fft.ifftn(S_rr * conjH_gx).real
+            r_rgy = np.fft.ifftn(S_rr * conjH_gy).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, S: np.ndarray) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float64).reshape(w_big, w_big)
+                V.fill(0.0)
+                V[sx, sy] = v
+                conv = np.fft.ifftn(np.fft.fftn(V) * S).real
+                out = conv[sx, sy].reshape(-1).astype(np.float64, copy=False)
+                return out + lam * v.reshape(-1)
+
+            wx, itx, relresx = cg_solve(lambda v: apply_A(v, S=S_rr), b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            wy, ity, relresy = cg_solve(lambda v: apply_A(v, S=S_rr), b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            info = float(max(relresx, relresy))
+            return wx.reshape(w_big, w_big), wy.reshape(w_big, w_big), info
+
+        # Rect baseline bins.
+        rect_dx, rect_dy, rect_bin_idx = build_rect_bins(w_big, nx_bins=rect_pair[0], ny_bins=rect_pair[1])
+        rect_n_bins = rect_pair[0] * rect_pair[1]
+
+        # Precompute trig tables for DFT parity basis.
+        N = w_big
+        coords = (np.arange(w_big, dtype=np.float64) - float(r_big)).astype(np.float64)
+        dx_grid, dy_grid = np.meshgrid(coords, coords, indexing="ij")
+        Pmax = max(p for p, _ in pq_list)
+        Qmax = max(q for _, q in pq_list)
+        sin_p = np.zeros((Pmax, N), dtype=np.float64)
+        cos_q = np.zeros((Qmax, N), dtype=np.float64)
+        for p in range(1, Pmax + 1):
+            sin_p[p - 1] = np.sin(2.0 * np.pi * float(p) * coords / float(N))
+        for q in range(0, Qmax):
+            cos_q[q] = np.cos(2.0 * np.pi * float(q) * coords / float(N))
+        sin_norm = np.sum(sin_p * sin_p, axis=1)
+        cos_norm = np.sum(cos_q * cos_q, axis=1)
+
+        # Optional pi/L basis for baseline (24x12).
+        if include_piL:
+            L = float(r_big + 1)
+            sin_p_pi = np.zeros((piL_pair[0], N), dtype=np.float64)
+            cos_q_pi = np.zeros((piL_pair[1], N), dtype=np.float64)
+            for p in range(1, piL_pair[0] + 1):
+                sin_p_pi[p - 1] = np.sin(np.pi * float(p) * coords / L)
+            for q in range(0, piL_pair[1]):
+                cos_q_pi[q] = np.cos(np.pi * float(q) * coords / L)
+            sin_norm_pi = np.sum(sin_p_pi * sin_p_pi, axis=1)
+            cos_norm_pi = np.sum(cos_q_pi * cos_q_pi, axis=1)
+
+        # Baseline performance arrays.
+        p_ceiling_f: list[float] = []
+        r_ceiling_f: list[float] = []
+        p_wiener_f: list[float] = []
+        r_wiener_f: list[float] = []
+
+        # DFT basis accumulators.
+        perf_by_pq: dict[tuple[int, int], dict[str, list[float]]] = {}
+        sim_by_pq: dict[tuple[int, int], dict[str, list[float]]] = {}
+        for pair in pq_list:
+            perf_by_pq[pair] = {"pearson": [], "relrmse": [], "dr_wiener": [], "dr_ceiling": []}
+            sim_by_pq[pair] = {"corr": [], "relL2": []}
+
+        rect_perf: dict[str, list[float]] = {"pearson": [], "relrmse": [], "dr_wiener": [], "dr_ceiling": []}
+        piL_perf: dict[str, list[float]] = {"pearson": [], "relrmse": [], "dr_wiener": [], "dr_ceiling": []}
+
+        # LOFO.
+        for test_field in range(n_fields):
+            train_fields = [f for f in range(n_fields) if f != test_field]
+
+            w_wiener_gx, w_wiener_gy, cg_info = wiener_fit_weights(train_fields)
+
+            # Wiener predictions.
+            kfft_w_gx = kernel_fft_centered(w_wiener_gx, grid_size=grid_size)
+            kfft_w_gy = kernel_fft_centered(w_wiener_gy, grid_size=grid_size)
+            gx_pred = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_w_gx).real
+            gy_pred = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_w_gy).real
+            y_pred_w = sample_vec_at_centers(gx_pred, gy_pred, centers_by_field[test_field])
+
+            # Ceiling predictions.
+            gx_c = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_ceiling_gx).real
+            gy_c = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_ceiling_gy).real
+            y_pred_c = sample_vec_at_centers(gx_c, gy_c, centers_by_field[test_field])
+
+            y_true = y_low_by_field[test_field]
+            p_ceiling_f.append(pearson_mean_2d(y_true, y_pred_c))
+            r_ceiling_f.append(relrmse_mean_2d(y_true, y_pred_c))
+            p_wiener_f.append(pearson_mean_2d(y_true, y_pred_w))
+            r_wiener_f.append(relrmse_mean_2d(y_true, y_pred_w))
+
+            # Rect baseline projection.
+            rect_bin_flat = rect_bin_idx.reshape(-1).astype(np.int64, copy=False)
+            rect_dx_flat = rect_dx.reshape(-1).astype(np.float64, copy=False)
+            rect_dy_flat = rect_dy.reshape(-1).astype(np.float64, copy=False)
+            num_x = np.bincount(rect_bin_flat, weights=w_wiener_gx.reshape(-1) * rect_dx_flat, minlength=rect_n_bins)
+            den_x = np.bincount(rect_bin_flat, weights=rect_dx_flat * rect_dx_flat, minlength=rect_n_bins) + 1e-12
+            coef_dx = (num_x / den_x).astype(np.float64, copy=False)
+            num_y = np.bincount(rect_bin_flat, weights=w_wiener_gy.reshape(-1) * rect_dy_flat, minlength=rect_n_bins)
+            den_y = np.bincount(rect_bin_flat, weights=rect_dy_flat * rect_dy_flat, minlength=rect_n_bins) + 1e-12
+            coef_dy = (num_y / den_y).astype(np.float64, copy=False)
+            w_rect_gx = (rect_dx * coef_dx[rect_bin_idx]).astype(np.float64, copy=False)
+            w_rect_gy = (rect_dy * coef_dy[rect_bin_idx]).astype(np.float64, copy=False)
+            kfft_r_gx = kernel_fft_centered(w_rect_gx, grid_size=grid_size)
+            kfft_r_gy = kernel_fft_centered(w_rect_gy, grid_size=grid_size)
+            gx_r = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_r_gx).real
+            gy_r = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_r_gy).real
+            y_pred_r = sample_vec_at_centers(gx_r, gy_r, centers_by_field[test_field])
+            p_r = pearson_mean_2d(y_true, y_pred_r)
+            r_r = relrmse_mean_2d(y_true, y_pred_r)
+            rect_perf["pearson"].append(p_r)
+            rect_perf["relrmse"].append(r_r)
+            rect_perf["dr_wiener"].append(r_r - r_wiener_f[-1])
+            rect_perf["dr_ceiling"].append(r_r - r_ceiling_f[-1])
+
+            # Optional pi/L baseline projection (same parity basis but π/L).
+            if include_piL:
+                Pp, Qp = piL_pair
+                Wgx = w_wiener_gx
+                Wgy = w_wiener_gy
+                # gx: sin_p_pi * cos_q_pi
+                Rpx = sin_p_pi[:Pp] @ Wgx
+                num = Rpx @ cos_q_pi[:Qp].T
+                den = sin_norm_pi[:Pp][:, None] * cos_norm_pi[:Qp][None, :]
+                lam = float(proj_lambda_rel) * (float(np.sum(den)) / float(Pp * Qp))
+                A = num / (den + lam)
+                V = A @ cos_q_pi[:Qp]
+                w_pi_gx = sin_p_pi[:Pp].T @ V
+                # gy: cos_q_pi * sin_p_pi
+                Rpy = cos_q_pi[:Qp] @ Wgy
+                numy = Rpy @ sin_p_pi[:Pp].T  # Q x P
+                den_y = cos_norm_pi[:Qp][:, None] * sin_norm_pi[:Pp][None, :]
+                Ay = (numy / (den_y + lam)).T  # P x Q
+                VY = Ay.T @ sin_p_pi[:Pp]
+                w_pi_gy = cos_q_pi[:Qp].T @ VY
+
+                kfft_p_gx = kernel_fft_centered(w_pi_gx, grid_size=grid_size)
+                kfft_p_gy = kernel_fft_centered(w_pi_gy, grid_size=grid_size)
+                gx_p = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_p_gx).real
+                gy_p = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_p_gy).real
+                y_pred_p = sample_vec_at_centers(gx_p, gy_p, centers_by_field[test_field])
+                p_pi = pearson_mean_2d(y_true, y_pred_p)
+                r_pi = relrmse_mean_2d(y_true, y_pred_p)
+                piL_perf["pearson"].append(p_pi)
+                piL_perf["relrmse"].append(r_pi)
+                piL_perf["dr_wiener"].append(r_pi - r_wiener_f[-1])
+                piL_perf["dr_ceiling"].append(r_pi - r_ceiling_f[-1])
+
+            # DFT parity projections (2π/N).
+            for (P, Q) in pq_list:
+                Wgx = w_wiener_gx
+                Wgy = w_wiener_gy
+                # gx: sin_p * cos_q
+                Rpx = sin_p[:P] @ Wgx
+                num = Rpx @ cos_q[:Q].T
+                den = sin_norm[:P][:, None] * cos_norm[:Q][None, :]
+                lam = float(proj_lambda_rel) * (float(np.sum(den)) / float(P * Q))
+                A = num / (den + lam)
+                V = A @ cos_q[:Q]
+                w_proj_gx = sin_p[:P].T @ V
+
+                # gy: cos_q * sin_p (with p along y)
+                Rpy = cos_q[:Q] @ Wgy
+                numy = Rpy @ sin_p[:P].T  # Q x P
+                den_y = cos_norm[:Q][:, None] * sin_norm[:P][None, :]
+                Ay = (numy / (den_y + lam)).T  # P x Q
+                VY = Ay.T @ sin_p[:P]
+                w_proj_gy = cos_q[:Q].T @ VY
+
+                # Similarity vs Wiener.
+                corr_gx = safe_corr_1d(w_proj_gx, Wgx)
+                corr_gy = safe_corr_1d(w_proj_gy, Wgy)
+                rel_gx = rel_l2(w_proj_gx, Wgx)
+                rel_gy = rel_l2(w_proj_gy, Wgy)
+                sim_by_pq[(P, Q)]["corr"].append(0.5 * (corr_gx + corr_gy))
+                sim_by_pq[(P, Q)]["relL2"].append(0.5 * (rel_gx + rel_gy))
+
+                kfft_p_gx = kernel_fft_centered(w_proj_gx, grid_size=grid_size)
+                kfft_p_gy = kernel_fft_centered(w_proj_gy, grid_size=grid_size)
+                gx_p = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_p_gx).real
+                gy_p = np.fft.ifftn(rho0_fft_by_field[test_field] * kfft_p_gy).real
+                y_pred_p = sample_vec_at_centers(gx_p, gy_p, centers_by_field[test_field])
+                p_proj = pearson_mean_2d(y_true, y_pred_p)
+                r_proj = relrmse_mean_2d(y_true, y_pred_p)
+                perf_by_pq[(P, Q)]["pearson"].append(p_proj)
+                perf_by_pq[(P, Q)]["relrmse"].append(r_proj)
+                perf_by_pq[(P, Q)]["dr_wiener"].append(r_proj - r_wiener_f[-1])
+                perf_by_pq[(P, Q)]["dr_ceiling"].append(r_proj - r_ceiling_f[-1])
+
+        # Baseline stats.
+        p_ceiling_mean = float(np.mean(p_ceiling_f))
+        p_ceiling_std = float(np.std(p_ceiling_f, ddof=1))
+        r_ceiling_mean = float(np.mean(r_ceiling_f))
+        r_ceiling_std = float(np.std(r_ceiling_f, ddof=1))
+        p_wiener_mean = float(np.mean(p_wiener_f))
+        p_wiener_std = float(np.std(p_wiener_f, ddof=1))
+        r_wiener_mean = float(np.mean(r_wiener_f))
+        r_wiener_std = float(np.std(r_wiener_f, ddof=1))
+
+        perf_rows: list[dict[str, str]] = []
+        sim_rows: list[dict[str, str]] = []
+
+        perf_rows.append(
+            {
+                "P×Q": "ceiling",
+                "Pearson_proj mean±std": f"{p_ceiling_mean:.4f} ± {p_ceiling_std:.4f}",
+                "relRMSE_proj mean±std": f"{r_ceiling_mean:.4f} ± {r_ceiling_std:.4f}",
+                "ΔrelRMSE vs wiener": f"{(r_ceiling_mean - r_wiener_mean):+.4f}",
+                "ΔrelRMSE vs ceiling": f"{0.0:+.4f}",
+            }
+        )
+        perf_rows.append(
+            {
+                "P×Q": "wiener",
+                "Pearson_proj mean±std": f"{p_wiener_mean:.4f} ± {p_wiener_std:.4f}",
+                "relRMSE_proj mean±std": f"{r_wiener_mean:.4f} ± {r_wiener_std:.4f}",
+                "ΔrelRMSE vs wiener": f"{0.0:+.4f}",
+                "ΔrelRMSE vs ceiling": f"{(r_wiener_mean - r_ceiling_mean):+.4f}",
+            }
+        )
+        perf_rows.append(
+            {
+                "P×Q": f"rect {rect_pair[0]}x{rect_pair[1]}",
+                "Pearson_proj mean±std": f"{float(np.mean(rect_perf['pearson'])):.4f} ± {float(np.std(rect_perf['pearson'], ddof=1)):.4f}",
+                "relRMSE_proj mean±std": f"{float(np.mean(rect_perf['relrmse'])):.4f} ± {float(np.std(rect_perf['relrmse'], ddof=1)):.4f}",
+                "ΔrelRMSE vs wiener": f"{float(np.mean(rect_perf['dr_wiener'])):+.4f}",
+                "ΔrelRMSE vs ceiling": f"{float(np.mean(rect_perf['dr_ceiling'])):+.4f}",
+            }
+        )
+        if include_piL:
+            perf_rows.append(
+                {
+                    "P×Q": f"pi/L {piL_pair[0]}x{piL_pair[1]}",
+                    "Pearson_proj mean±std": f"{float(np.mean(piL_perf['pearson'])):.4f} ± {float(np.std(piL_perf['pearson'], ddof=1)):.4f}",
+                    "relRMSE_proj mean±std": f"{float(np.mean(piL_perf['relrmse'])):.4f} ± {float(np.std(piL_perf['relrmse'], ddof=1)):.4f}",
+                    "ΔrelRMSE vs wiener": f"{float(np.mean(piL_perf['dr_wiener'])):+.4f}",
+                    "ΔrelRMSE vs ceiling": f"{float(np.mean(piL_perf['dr_ceiling'])):+.4f}",
+                }
+            )
+
+        for (P, Q) in pq_list:
+            p_mean = float(np.mean(perf_by_pq[(P, Q)]["pearson"]))
+            p_std = float(np.std(perf_by_pq[(P, Q)]["pearson"], ddof=1))
+            r_mean = float(np.mean(perf_by_pq[(P, Q)]["relrmse"]))
+            r_std = float(np.std(perf_by_pq[(P, Q)]["relrmse"], ddof=1))
+            drw = float(np.mean(perf_by_pq[(P, Q)]["dr_wiener"]))
+            drc = float(np.mean(perf_by_pq[(P, Q)]["dr_ceiling"]))
+            perf_rows.append(
+                {
+                    "P×Q": f"{P}x{Q}",
+                    "Pearson_proj mean±std": f"{p_mean:.4f} ± {p_std:.4f}",
+                    "relRMSE_proj mean±std": f"{r_mean:.4f} ± {r_std:.4f}",
+                    "ΔrelRMSE vs wiener": f"{drw:+.4f}",
+                    "ΔrelRMSE vs ceiling": f"{drc:+.4f}",
+                }
+            )
+
+            corr_mean = float(np.mean(sim_by_pq[(P, Q)]["corr"]))
+            corr_std = float(np.std(sim_by_pq[(P, Q)]["corr"], ddof=1))
+            rel_mean = float(np.mean(sim_by_pq[(P, Q)]["relL2"]))
+            rel_std = float(np.std(sim_by_pq[(P, Q)]["relL2"], ddof=1))
+            sim_rows.append(
+                {
+                    "P×Q": f"{P}x{Q}",
+                    "corr_proj_wiener": f"{corr_mean:.4f} ± {corr_std:.4f}",
+                    "relL2_proj_wiener": f"{rel_mean:.4f} ± {rel_std:.4f}",
+                }
+            )
+
+        summary_md = (
+            "# E45 — DFT parity projection onto Wiener weights (alpha=2.0, low-k)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_big={w_big}, alpha={alpha}\n"
+            f"- pq_list={pq_list}, rect_pair={rect_pair}, include_piL={include_piL}, piL_pair={piL_pair}\n"
+            f"- wiener solver: lambda_rel={lambda_rel}, cg_max_iter={cg_max_iter}, cg_tol={cg_tol}\n\n"
+            "## Performance (low-k)\n\n"
+            + md_table(perf_rows, ["P×Q", "Pearson_proj mean±std", "relRMSE_proj mean±std", "ΔrelRMSE vs wiener", "ΔrelRMSE vs ceiling"])
+            + "\n\n## Weight similarity vs Wiener (mean of gx/gy)\n\n"
+            + md_table(sim_rows, ["P×Q", "corr_proj_wiener", "relL2_proj_wiener"])
+            + "\n"
+        )
+
+        (paths.run_dir / "summary_e45_dftparityproj_to_wiener_alpha2.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_big": int(w_big),
+                "alpha": float(alpha),
+                "pq_list": pq_list,
+                "rect_pair": rect_pair,
+                "include_piL": include_piL,
+                "piL_pair": piL_pair,
+                "proj_lambda_rel": proj_lambda_rel,
+                "wiener": {"lambda_rel": lambda_rel, "cg_max_iter": cg_max_iter, "cg_tol": cg_tol},
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
