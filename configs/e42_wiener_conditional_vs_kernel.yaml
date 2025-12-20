@@ -1,0 +1,23 @@
+experiment: e42
+exp_name: e42_wiener_conditional_vs_kernel
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+
+w_big: 193
+
+# Alpha sweep
+alpha_list: [0.0, 1.0, 1.5, 2.0]
+
+# Rect-learn comparison (same basis as E41/E39)
+rect_nx: 16
+rect_ny: 8
+ridge_alpha: 1.0
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
