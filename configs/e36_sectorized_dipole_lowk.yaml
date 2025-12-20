@@ -1,0 +1,34 @@
+experiment: e36
+exp_name: e36_sectorized_dipole_lowk
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+w_bigs: [129, 193]
+
+# Sectorized dipole basis
+M: 32
+S_list: [1, 4, 8, 16]
+ring_bin_mode: uniform_r   # or: equal_area
+
+# Learned ridge
+ridge_alpha: 1.0
+
+# PASS thresholds (relative to ceiling)
+gap_pearson_min: -0.003
+gap_relrmse_max: 0.03
+
+# Diagnostics
+diag_mask_wbig: 193
+diag_mask_M: 8
+diag_mask_S: 8
+
+coef_plot_wbig: 193
+coef_plot_S: 16
+
