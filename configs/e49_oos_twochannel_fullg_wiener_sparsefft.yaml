@@ -1,0 +1,19 @@
+experiment: e49
+exp_name: e49_oos_twochannel_fullg_wiener_sparsefft
+seed: 123
+
+grid_size: 256
+k0_frac: 0.15
+w_big: 193
+w_local: 33
+alpha: 2.0
+
+n_train_fields: 10
+n_test_fields: 10
+patches_per_field: 10000
+
+sparse_k: 800
+
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
