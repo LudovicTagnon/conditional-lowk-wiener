@@ -1,0 +1,23 @@
+experiment: e40
+exp_name: e40_lowk_taper_diag
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+
+# Supports
+w_big: 193
+w_local: 33
+
+# Rect-learn reference model (low-k)
+rect_nx: 16
+rect_ny: 8
+ridge_alpha: 1.0
+
+# Taper grids
+tukey_alphas: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+gauss_sigma_fracs: [0.25, 0.35, 0.50, 0.70, 1.0]
+radial_gauss_enabled: true
