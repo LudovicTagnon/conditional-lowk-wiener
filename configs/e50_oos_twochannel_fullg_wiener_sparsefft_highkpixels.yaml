@@ -1,0 +1,26 @@
+experiment: e50
+exp_name: e50_oos_twochannel_fullg_wiener_sparsefft_highkpixels
+seed: 123
+
+grid_size: 256
+k0_frac: 0.15
+w_big: 193
+w_local: 33
+alpha: 2.0
+
+n_train_fields: 10
+n_test_fields: 10
+patches_per_field: 10000
+
+sparse_k: 800
+
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
+
+# high-k pixels model
+pixel_epochs_high: 1
+pixel_batch_size: 1024
+pixel_alpha: 1.0e-4
+pixel_eta0: 0.01
+pixel_power_t: 0.25
