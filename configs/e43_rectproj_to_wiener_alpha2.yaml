@@ -1,0 +1,22 @@
+experiment: e43
+exp_name: e43_rectproj_to_wiener_alpha2
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+w_big: 193
+alpha: 2.0
+
+# Rect basis resolutions
+rect_pairs:
+  - [8, 4]
+  - [12, 6]
+  - [16, 8]
+  - [24, 12]
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
