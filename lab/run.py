@@ -24740,6 +24740,620 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e56":
+        # E56 — Unified law: Wiener gain ≈ outside_var * conditional R2.
+        from scipy import ndimage
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 256))
+        n_train_fields = int(cfg.get("n_train_fields", 10))
+        n_test_fields = int(cfg.get("n_test_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha_list = [float(x) for x in cfg.get("alpha_list", [0.0, 1.0, 1.5, 2.0])]
+        k0_fracs = [float(x) for x in cfg.get("k0_fracs", [0.20, 0.10, 0.02])]
+        beta_list = [float(x) for x in cfg.get("beta_list", [0.0, 1.0, 2.0])]
+        bbks_k0 = float(cfg.get("bbks_k0", 0.15 * np.pi))
+        bbks_ns = float(cfg.get("bbks_ns", 1.0))
+        bbks_k_eps = float(cfg.get("bbks_k_eps", 1e-6))
+        bbks_lognormal_sigmas = [float(x) for x in cfg.get("bbks_lognormal_sigmas", [1.0])]
+        norm_mode = str(cfg.get("norm_mode", "delta"))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_train_fields < 1 or n_test_fields < 1:
+            raise ValueError("n_train_fields and n_test_fields must be >= 1")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if bbks_k0 <= 0:
+            raise ValueError("bbks_k0 must be > 0")
+        if bbks_k_eps <= 0:
+            raise ValueError("bbks_k_eps must be > 0")
+        if norm_mode not in {"minmax_01", "delta", "zscore"}:
+            raise ValueError("norm_mode must be one of minmax_01, delta, zscore")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+
+        for k0 in k0_fracs:
+            if not (0.0 < float(k0) < 0.5):
+                raise ValueError("k0_fracs entries must be in (0,0.5)")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        def compute_B_features(field: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            field = np.asarray(field, dtype=np.float64)
+            ps = w_big
+            r = ps // 2
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - r).astype(np.int64)
+            x1 = (cx + r + 1).astype(np.int64)
+            y0 = (cy - r).astype(np.int64)
+            y1 = (cy + r + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(ps * ps)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=ps, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            return np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+
+        # Centers (shared).
+        r_big = w_big // 2
+        centers_by_train_field: list[np.ndarray] = []
+        for fid in range(n_train_fields):
+            rng_cent = np.random.default_rng(seed + 111_111 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_train_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        centers_by_test_field: list[np.ndarray] = []
+        for fid in range(n_test_fields):
+            rng_cent = np.random.default_rng(seed + 222_222 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_test_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Ceiling kernels for each k0_frac.
+        c0 = grid_size // 2
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[c0, c0] = 1.0
+        kfft_low_ceiling: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for k0 in k0_fracs:
+            split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0), validate_range=False)
+            g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+            kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+            kfft_low_ceiling[float(k0)] = (
+                kernel_fft_centered(kcorr_low_gx, grid_size=grid_size),
+                kernel_fft_centered(kcorr_low_gy, grid_size=grid_size),
+            )
+
+        # Fourier-domain transfer H_low for each k0.
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+        H_low_by_k0: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for k0 in k0_fracs:
+            mask_low = k <= float(k0) * k_ny
+            H_gx = np.zeros((nx, nx), dtype=np.complex128)
+            H_gy = np.zeros((nx, nx), dtype=np.complex128)
+            H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gx[0, 0] = 0.0 + 0.0j
+            H_gy[0, 0] = 0.0 + 0.0j
+            H_low_by_k0[float(k0)] = (H_gx, H_gy)
+
+        def wiener_fit_weights(rho0_train_fft: list[np.ndarray], k0_frac: float, H_pair: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for R in rho0_train_fft:
+                acc += (R * np.conj(R)).real
+            for R in rho0_train_fft:
+                rho0 = np.fft.ifftn(R).real
+                var_acc += float(np.mean(rho0 * rho0))
+            S_rr = (acc / float(len(rho0_train_fft))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(rho0_train_fft))
+            lam = float(lambda_rel) * float(var0)
+
+            H_gx, H_gy = H_pair
+            r_rgx = np.fft.ifftn(S_rr * np.conj(H_gx)).real
+            r_rgy = np.fft.ifftn(S_rr * np.conj(H_gy)).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            sx = slice(c0 - r_big, c0 + r_big + 1)
+            sy = slice(c0 - r_big, c0 + r_big + 1)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, S: np.ndarray) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float64).reshape(w_big, w_big)
+                V.fill(0.0)
+                V[sx, sy] = v
+                conv = np.fft.ifftn(np.fft.fftn(V) * S).real
+                out = conv[sx, sy].reshape(-1).astype(np.float64, copy=False)
+                return out + lam * v.reshape(-1)
+
+            wx, _, _ = cg_solve(lambda v: apply_A(v, S=S_rr), b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            wy, _, _ = cg_solve(lambda v: apply_A(v, S=S_rr), b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            return wx.reshape(w_big, w_big), wy.reshape(w_big, w_big)
+
+        def eval_relrmse_low(
+            kfft_gx: np.ndarray,
+            kfft_gy: np.ndarray,
+            rho0_test_fft: list[np.ndarray],
+            y_low_test: list[np.ndarray],
+        ) -> float:
+            rels: list[float] = []
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_low_test[fid]
+                rels.append(relrmse_mean_2d(y_true, y_pred))
+            return float(np.mean(rels))
+
+        def run_condition(
+            *,
+            family: str,
+            scenario: str,
+            spectrum: str,
+            alpha: float,
+            beta: float,
+            k0_frac: float,
+            lognormal: bool = False,
+            lognormal_sigma: float = 1.0,
+        ) -> dict[str, Any]:
+            rho0_train_fft: list[np.ndarray] = []
+            y_out_train: list[np.ndarray] = []
+
+            rho0_test_fft: list[np.ndarray] = []
+            y_out_test_by_field: list[np.ndarray] = []
+            y_low_test: list[np.ndarray] = []
+            X_train: list[np.ndarray] = []
+
+            outside_var_frac: list[float] = []
+
+            kfft_low_gx, kfft_low_gy = kfft_low_ceiling[float(k0_frac)]
+            H_low = H_low_by_k0[float(k0_frac)]
+            H_out = (H_low[0] - kfft_low_gx, H_low[1] - kfft_low_gy)
+
+            validate_range = norm_mode == "minmax_01"
+
+            for fid in range(n_train_fields):
+                rng_field = np.random.default_rng(seed + fid)
+                rho = generate_1overf_field_2d(
+                    (grid_size, grid_size),
+                    alpha=alpha,
+                    rng=rng_field,
+                    spectrum=spectrum,
+                    bbks_k0=bbks_k0,
+                    bbks_ns=bbks_ns,
+                    bbks_beta=beta,
+                    bbks_k_eps=bbks_k_eps,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                    norm_mode=norm_mode,
+                )
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=validate_range)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_train_fft.append(rho0_fft)
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                centers = centers_by_train_field[fid]
+                y_out_train.append(sample_vec_at_centers(outside_gx, outside_gy, centers))
+                X_train.append(compute_B_features(rho, centers))
+
+            for fid in range(n_test_fields):
+                rng_field = np.random.default_rng(seed + n_train_fields + fid)
+                rho = generate_1overf_field_2d(
+                    (grid_size, grid_size),
+                    alpha=alpha,
+                    rng=rng_field,
+                    spectrum=spectrum,
+                    bbks_k0=bbks_k0,
+                    bbks_ns=bbks_ns,
+                    bbks_beta=beta,
+                    bbks_k_eps=bbks_k_eps,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                    norm_mode=norm_mode,
+                )
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=validate_range)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_test_fft.append(rho0_fft)
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                frac_gx = float(np.var(outside_gx) / (np.var(split.low.gx) + 1e-12))
+                frac_gy = float(np.var(outside_gy) / (np.var(split.low.gy) + 1e-12))
+                outside_var_frac.append(0.5 * (frac_gx + frac_gy))
+
+                centers = centers_by_test_field[fid]
+                y_out_test_by_field.append(sample_vec_at_centers(outside_gx, outside_gy, centers))
+                y_low_test.append(sample_vec_at_centers(split.low.gx, split.low.gy, centers))
+
+            # Inside->outside predictor via Wiener weights for outside.
+            w_out_gx, w_out_gy = wiener_fit_weights(rho0_train_fft, k0_frac, H_out)
+            kfft_out_gx = kernel_fft_centered(w_out_gx, grid_size=grid_size)
+            kfft_out_gy = kernel_fft_centered(w_out_gy, grid_size=grid_size)
+            inside_p: list[float] = []
+            inside_r: list[float] = []
+            mse_pred = np.zeros(2, dtype=np.float64)
+            mse_base = np.zeros(2, dtype=np.float64)
+            y_out_train_all = np.concatenate(y_out_train, axis=0)
+            baseline = y_out_train_all.mean(axis=0)
+
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_out_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_out_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_out_test_by_field[fid]
+                inside_p.append(pearson_mean_2d(y_true, y_pred))
+                inside_r.append(relrmse_mean_2d(y_true, y_pred))
+                mse_pred += np.mean((y_true - y_pred) ** 2, axis=0)
+                mse_base += np.mean((y_true - baseline) ** 2, axis=0)
+
+            mse_pred /= float(n_test_fields)
+            mse_base /= float(n_test_fields)
+            r2 = 0.5 * ((1.0 - mse_pred[0] / (mse_base[0] + 1e-12)) + (1.0 - mse_pred[1] / (mse_base[1] + 1e-12)))
+
+            # Wiener vs ceiling gain on low-k target.
+            w_gx, w_gy = wiener_fit_weights(rho0_train_fft, k0_frac, H_low)
+            kfft_w_gx = kernel_fft_centered(w_gx, grid_size=grid_size)
+            kfft_w_gy = kernel_fft_centered(w_gy, grid_size=grid_size)
+            r_ceiling = eval_relrmse_low(kfft_low_gx, kfft_low_gy, rho0_test_fft, y_low_test)
+            r_wiener = eval_relrmse_low(kfft_w_gx, kfft_w_gy, rho0_test_fft, y_low_test)
+            p_ceiling = []
+            p_wiener = []
+            for fid in range(n_test_fields):
+                gx_c = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gx).real
+                gy_c = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gy).real
+                gx_w = np.fft.ifftn(rho0_test_fft[fid] * kfft_w_gx).real
+                gy_w = np.fft.ifftn(rho0_test_fft[fid] * kfft_w_gy).real
+                y_true = y_low_test[fid]
+                p_ceiling.append(pearson_mean_2d(y_true, sample_vec_at_centers(gx_c, gy_c, centers_by_test_field[fid])))
+                p_wiener.append(pearson_mean_2d(y_true, sample_vec_at_centers(gx_w, gy_w, centers_by_test_field[fid])))
+
+            return {
+                "family": family,
+                "scenario": scenario,
+                "alpha": float(alpha),
+                "beta": float(beta),
+                "k0_frac": float(k0_frac),
+                "lognormal": bool(lognormal),
+                "lognormal_sigma": float(lognormal_sigma),
+                "outside_var_frac": float(np.mean(outside_var_frac)),
+                "pearson_inside_out": float(np.mean(inside_p)),
+                "r2_inside_out": float(r2),
+                "relrmse_inside_out": float(np.mean(inside_r)),
+                "delta_relrmse": float(r_wiener - r_ceiling),
+                "delta_pearson": float(np.mean(p_wiener) - np.mean(p_ceiling)),
+            }
+
+        results: list[dict[str, Any]] = []
+
+        # Alpha family (powerlaw).
+        for a in alpha_list:
+            for k0 in k0_fracs:
+                results.append(run_condition(family="alpha", scenario="powerlaw", spectrum="powerlaw", alpha=float(a), beta=0.0, k0_frac=float(k0)))
+
+        # BBKS gauss/lognormal.
+        for k0 in k0_fracs:
+            results.append(run_condition(family="bbks", scenario="bbks", spectrum="bbks", alpha=0.0, beta=0.0, k0_frac=float(k0)))
+        for sig in bbks_lognormal_sigmas:
+            for k0 in k0_fracs:
+                results.append(
+                    run_condition(
+                        family="bbks",
+                        scenario="bbks_lognormal",
+                        spectrum="bbks",
+                        alpha=0.0,
+                        beta=0.0,
+                        k0_frac=float(k0),
+                        lognormal=True,
+                        lognormal_sigma=float(sig),
+                    )
+                )
+
+        # BBKS-tilt family.
+        for beta in beta_list:
+            for k0 in k0_fracs:
+                results.append(run_condition(family="bbks_tilt", scenario="bbks_tilt", spectrum="bbks_tilt", alpha=0.0, beta=float(beta), k0_frac=float(k0)))
+
+        # Aggregate metrics.
+        for r in results:
+            gain = -float(r["delta_relrmse"])
+            r["gain"] = gain
+            p1 = float(r["outside_var_frac"]) * max(0.0, float(r["pearson_inside_out"]))
+            p2 = float(r["outside_var_frac"]) * max(0.0, float(r["r2_inside_out"]))
+            r["pred1"] = p1
+            r["pred2"] = p2
+
+        def corr(x: np.ndarray, y: np.ndarray) -> float:
+            if len(x) < 2:
+                return float("nan")
+            return float(np.corrcoef(x, y)[0, 1])
+
+        gains = np.array([r["gain"] for r in results], dtype=np.float64)
+        pred1 = np.array([r["pred1"] for r in results], dtype=np.float64)
+        pred2 = np.array([r["pred2"] for r in results], dtype=np.float64)
+        corr1 = corr(gains, pred1)
+        corr2 = corr(gains, pred2)
+
+        # Per-family correlations.
+        fam_corrs: dict[str, dict[str, float]] = {}
+        for fam in {"alpha", "bbks", "bbks_tilt"}:
+            rows = [r for r in results if r["family"] == fam]
+            if len(rows) >= 2:
+                g = np.array([r["gain"] for r in rows], dtype=np.float64)
+                p1 = np.array([r["pred1"] for r in rows], dtype=np.float64)
+                p2 = np.array([r["pred2"] for r in rows], dtype=np.float64)
+                fam_corrs[fam] = {"corr_pred1": corr(g, p1), "corr_pred2": corr(g, p2)}
+
+        # Cross-family hold-out fits.
+        holdout_r2: dict[str, float] = {}
+        families = ["alpha", "bbks", "bbks_tilt"]
+        for hold in families:
+            train = [r for r in results if r["family"] != hold]
+            test = [r for r in results if r["family"] == hold]
+            if len(train) < 2 or len(test) < 2:
+                holdout_r2[hold] = float("nan")
+                continue
+            x = np.array([r["pred2"] for r in train], dtype=np.float64)
+            y = np.array([r["gain"] for r in train], dtype=np.float64)
+            denom = float(np.dot(x, x)) + 1e-12
+            a = float(np.dot(x, y) / denom)
+            xt = np.array([r["pred2"] for r in test], dtype=np.float64)
+            yt = np.array([r["gain"] for r in test], dtype=np.float64)
+            yhat = a * xt
+            ss_res = float(np.sum((yt - yhat) ** 2))
+            ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2)) + 1e-12
+            holdout_r2[hold] = 1.0 - ss_res / ss_tot
+
+        results_sorted = sorted(results, key=lambda r: -float(r["gain"]))
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        table_rows: list[dict[str, str]] = []
+        for res in results_sorted:
+            table_rows.append(
+                {
+                    "family": res["family"],
+                    "scenario": res["scenario"],
+                    "alpha": f"{res['alpha']:.1f}",
+                    "beta": f"{res['beta']:.1f}",
+                    "k0_frac": f"{res['k0_frac']:.2f}",
+                    "outside_var_frac": f"{res['outside_var_frac']:.4f}",
+                    "Pearson_inside_out": f"{res['pearson_inside_out']:.4f}",
+                    "R2_inside_out": f"{res['r2_inside_out']:.4f}",
+                    "gain": f"{res['gain']:+.4f}",
+                    "pred1": f"{res['pred1']:.5f}",
+                    "pred2": f"{res['pred2']:.5f}",
+                }
+            )
+
+        top10 = results_sorted[:10]
+        top10_lines = "\n".join(
+            [
+                f"- {r['family']} {r['scenario']} k0={r['k0_frac']:.2f} gain={r['gain']:+.4f} pred2={r['pred2']:.5f}"
+                for r in top10
+            ]
+        )
+
+        # Scatter plot gain vs predicted_gain2.
+        fam_color = {"alpha": "tab:blue", "bbks": "tab:orange", "bbks_tilt": "tab:green"}
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        for fam in families:
+            rows = [r for r in results_sorted if r["family"] == fam]
+            xs = [r["pred2"] for r in rows]
+            ys = [r["gain"] for r in rows]
+            ax.scatter(xs, ys, label=fam, alpha=0.8, s=40, color=fam_color.get(fam, None))
+        # Fit line on all data.
+        x_all = pred2
+        y_all = gains
+        a_all = float(np.dot(x_all, y_all) / (np.dot(x_all, x_all) + 1e-12))
+        xs = np.linspace(float(np.min(x_all)), float(np.max(x_all)), 100)
+        ax.plot(xs, a_all * xs, color="black", linestyle="--", label="fit")
+        ax.set_xlabel("predicted_gain2 = outside_var * max(0,R2_inside_out)")
+        ax.set_ylabel("gain = -ΔrelRMSE(W-C)")
+        ax.set_title("E56 unified gain law")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(paths.run_dir / "unified_gain_law.png", dpi=150)
+        plt.close(fig)
+
+        summary_md = (
+            "# E56 — Unified law: Wiener gain ≈ outside_var * conditional R2\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, w_big={w_big}, patches_per_field={patches_per_field}\n"
+            f"- n_train_fields={n_train_fields}, n_test_fields={n_test_fields}\n"
+            f"- alpha_list={alpha_list}, k0_fracs={k0_fracs}, beta_list={beta_list}\n"
+            f"- bbks_k0={bbks_k0:.4f}, bbks_ns={bbks_ns:.3f}, bbks_k_eps={bbks_k_eps}\n"
+            f"- norm_mode={norm_mode}, ridge_alpha={ridge_alpha}\n"
+            f"- corr(gain, pred1)={corr1:.4f}, corr(gain, pred2)={corr2:.4f}\n\n"
+            "## Conditions sorted by gain\n\n"
+            + md_table(
+                table_rows,
+                [
+                    "family",
+                    "scenario",
+                    "alpha",
+                    "beta",
+                    "k0_frac",
+                    "outside_var_frac",
+                    "Pearson_inside_out",
+                    "R2_inside_out",
+                    "gain",
+                    "pred1",
+                    "pred2",
+                ],
+            )
+            + "\n\n## Top-10 conditions\n\n"
+            + top10_lines
+            + "\n\n## Correlations by family\n\n"
+            + "\n".join([f"- {fam}: corr(pred1)={vals['corr_pred1']:.4f}, corr(pred2)={vals['corr_pred2']:.4f}" for fam, vals in fam_corrs.items()])
+            + "\n\n## Hold-out family R2 (gain ~ a*pred2)\n\n"
+            + "\n".join([f"- holdout {fam}: R2={holdout_r2[fam]:.4f}" for fam in families])
+            + "\n"
+        )
+
+        (paths.run_dir / "summary_e56_unified_gain_law.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "w_big": int(w_big),
+                "n_train_fields": n_train_fields,
+                "n_test_fields": n_test_fields,
+                "patches_per_field": patches_per_field,
+                "alpha_list": alpha_list,
+                "beta_list": beta_list,
+                "k0_fracs": k0_fracs,
+                "bbks_k0": float(bbks_k0),
+                "bbks_ns": float(bbks_ns),
+                "bbks_k_eps": float(bbks_k_eps),
+                "bbks_lognormal_sigmas": bbks_lognormal_sigmas,
+                "norm_mode": norm_mode,
+                "ridge_alpha": float(ridge_alpha),
+                "corr": {"pred1": corr1, "pred2": corr2},
+                "holdout_r2": holdout_r2,
+                "results": results_sorted,
+                "plot": str(paths.run_dir / "unified_gain_law.png"),
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
