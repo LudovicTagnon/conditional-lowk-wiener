@@ -1,0 +1,28 @@
+experiment: e44
+exp_name: e44_fourierproj_to_wiener_alpha2
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+w_big: 193
+alpha: 2.0
+
+# Fourier parity basis sizes
+pq_list:
+  - [8, 4]
+  - [12, 6]
+  - [16, 8]
+  - [24, 12]
+
+# Rect baseline (for comparison)
+rect_pair: [24, 12]
+
+# Projection ridge (basis -> Wiener)
+proj_lambda_rel: 1.0e-8
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
