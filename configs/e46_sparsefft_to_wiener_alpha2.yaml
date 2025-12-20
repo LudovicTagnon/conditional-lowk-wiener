@@ -1,0 +1,21 @@
+experiment: e46
+exp_name: e46_sparsefft_to_wiener_alpha2
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+w_big: 193
+alpha: 2.0
+
+# Sparse FFT K sweep
+k_list: [50, 100, 200, 400, 800, 1600, 3200]
+
+# DFT parity baseline (2π/N)
+dft_pair: [48, 24]
+
+# Wiener/CG solver params
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
