@@ -10,6 +10,7 @@ from .data_synth import (
     band_split_poisson_2d,
     generate_1overf_field_2d,
     generate_1overf_field_3d,
+    normalize_rho,
     solve_poisson_periodic_fft,
 )
 from .features import b0_counts, grad_energy, patch_basic_stats
@@ -23079,6 +23080,572 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
                 "bbks_k0": float(bbks_k0),
                 "bbks_ns": float(bbks_ns),
                 "lognormal_sigma": float(lognormal_sigma),
+                "ridge_alpha": float(ridge_alpha),
+                "results": results,
+            },
+        )
+        return paths
+
+    if experiment == "e53":
+        # E53 — BBKS/lognormal sensitivity + physical normalization.
+        from scipy import ndimage, stats
+
+        grid_size = int(cfg.get("grid_size", 256))
+        n_train_fields = int(cfg.get("n_train_fields", 10))
+        n_test_fields = int(cfg.get("n_test_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        alpha = float(cfg.get("alpha", 2.0))
+
+        k0_fracs = [float(x) for x in cfg.get("k0_fracs", [0.10, 0.20, 0.30])]
+        norm_modes = [str(x) for x in cfg.get("norm_modes", ["minmax_01", "delta", "zscore"])]
+        bbks_k0 = float(cfg.get("bbks_k0", 0.15 * np.pi))
+        bbks_ns = float(cfg.get("bbks_ns", 1.0))
+        lognormal_sigmas = [float(x) for x in cfg.get("lognormal_sigmas", [0.5, 1.0, 1.5])]
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_train_fields < 1 or n_test_fields < 1:
+            raise ValueError("n_train_fields and n_test_fields must be >= 1")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if alpha < 0:
+            raise ValueError("alpha must be >= 0")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if bbks_k0 <= 0:
+            raise ValueError("bbks_k0 must be > 0")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+
+        for k0 in k0_fracs:
+            if not (0.0 < float(k0) < 0.5):
+                raise ValueError("k0_fracs entries must be in (0,0.5)")
+        for mode in norm_modes:
+            if mode not in {"minmax_01", "delta", "zscore"}:
+                raise ValueError(f"unsupported norm_mode={mode}")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def make_field_raw(
+            rng: np.random.Generator,
+            *,
+            spectrum: str,
+            lognormal: bool,
+            lognormal_sigma: float,
+        ) -> np.ndarray:
+            nx, ny = grid_size, grid_size
+            kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
+            ky = 2.0 * np.pi * np.fft.rfftfreq(ny)[None, :]
+            k2 = kx * kx + ky * ky
+            k = np.sqrt(k2, dtype=np.float64)
+            scale = np.zeros_like(k, dtype=np.float64)
+            nonzero = k > 0
+            if spectrum == "powerlaw":
+                scale[nonzero] = k[nonzero] ** (-alpha / 2.0)
+            elif spectrum == "bbks":
+                q = np.zeros_like(k, dtype=np.float64)
+                q[nonzero] = k[nonzero] / float(bbks_k0)
+                x = 2.34 * q
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t0 = np.log1p(x) / np.where(x > 0, x, 1.0)
+                denom = 1.0 + 3.89 * q + (16.1 * q) ** 2 + (5.46 * q) ** 3 + (6.71 * q) ** 4
+                t = t0 * np.power(denom, -0.25)
+                p = np.zeros_like(k, dtype=np.float64)
+                p[nonzero] = (k[nonzero] ** float(bbks_ns)) * (t[nonzero] ** 2)
+                scale[nonzero] = np.sqrt(p[nonzero])
+            else:
+                raise ValueError(f"unsupported spectrum={spectrum}")
+
+            real = rng.normal(size=(nx, ny // 2 + 1))
+            imag = rng.normal(size=(nx, ny // 2 + 1))
+            coeff = (real + 1j * imag) * scale
+            coeff[0, 0] = 0.0 + 0.0j
+            field = np.fft.irfftn(coeff, s=(nx, ny), axes=(0, 1)).real
+            assert_finite("rho_raw_2d", field)
+            if lognormal:
+                field = np.exp(float(lognormal_sigma) * field)
+                assert_finite("rho_lognormal_2d", field)
+            return field
+
+        def field_stats(x: np.ndarray) -> tuple[float, float, float]:
+            flat = np.asarray(x, dtype=np.float64).reshape(-1)
+            skew = float(stats.skew(flat, bias=False))
+            kurt = float(stats.kurtosis(flat, fisher=True, bias=False))
+            flat_abs = np.abs(flat)
+            p50 = float(np.percentile(flat_abs, 50))
+            p99 = float(np.percentile(flat_abs, 99))
+            ratio = p99 / (p50 + 1e-12)
+            return skew, kurt, ratio
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        def compute_B_features(field: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            field = np.asarray(field, dtype=np.float64)
+            ps = w_big
+            r = ps // 2
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            pref1 = _prefix_sum_2d(field)
+            pref2 = _prefix_sum_2d(field * field)
+            x0 = (cx - r).astype(np.int64)
+            x1 = (cx + r + 1).astype(np.int64)
+            y0 = (cy - r).astype(np.int64)
+            y1 = (cy + r + 1).astype(np.int64)
+            mass = _box_sum_2d(pref1, x0, x1, y0, y1)
+            nvox = float(ps * ps)
+            mean = mass / nvox
+            sumsq = _box_sum_2d(pref2, x0, x1, y0, y1)
+            var = np.maximum(0.0, sumsq / nvox - mean * mean)
+            mass2 = mass * mass
+            max_grid = ndimage.maximum_filter(field, size=ps, mode="constant", cval=-np.inf)
+            mx = max_grid[cx, cy]
+            gx_f, gy_f = np.gradient(field)
+            egrid = gx_f * gx_f + gy_f * gy_f
+            eavg = ndimage.uniform_filter(egrid, size=ps, mode="constant", cval=0.0)
+            ge = eavg[cx, cy]
+            return np.column_stack([mass, mass2, var, mx, ge]).astype(np.float64, copy=False)
+
+        # Centers (shared across conditions).
+        r_big = w_big // 2
+        centers_by_train_field: list[np.ndarray] = []
+        for fid in range(n_train_fields):
+            rng_cent = np.random.default_rng(seed + 111_111 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_train_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        centers_by_test_field: list[np.ndarray] = []
+        for fid in range(n_test_fields):
+            rng_cent = np.random.default_rng(seed + 222_222 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_test_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Precompute ceiling kernels for each k0_frac.
+        c0 = grid_size // 2
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[c0, c0] = 1.0
+        kfft_low_ceiling: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for k0 in k0_fracs:
+            split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0))
+            g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+            kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+            kfft_low_ceiling[float(k0)] = (
+                kernel_fft_centered(kcorr_low_gx, grid_size=grid_size),
+                kernel_fft_centered(kcorr_low_gy, grid_size=grid_size),
+            )
+
+        # Fourier-domain transfer H for Wiener (depends on k0).
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+
+        def wiener_fit_weights(rho0_train_fft: list[np.ndarray], k0_frac: float) -> tuple[np.ndarray, np.ndarray]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for R in rho0_train_fft:
+                acc += (R * np.conj(R)).real
+            for R in rho0_train_fft:
+                rho0 = np.fft.ifftn(R).real
+                var_acc += float(np.mean(rho0 * rho0))
+            S_rr = (acc / float(len(rho0_train_fft))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(rho0_train_fft))
+            lam = float(lambda_rel) * float(var0)
+
+            k0 = float(k0_frac) * k_ny
+            mask_low = k <= k0
+            H_gx = np.zeros((nx, nx), dtype=np.complex128)
+            H_gy = np.zeros((nx, nx), dtype=np.complex128)
+            H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gx[0, 0] = 0.0 + 0.0j
+            H_gy[0, 0] = 0.0 + 0.0j
+            r_rgx = np.fft.ifftn(S_rr * np.conj(H_gx)).real
+            r_rgy = np.fft.ifftn(S_rr * np.conj(H_gy)).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            sx = slice(c0 - r_big, c0 + r_big + 1)
+            sy = slice(c0 - r_big, c0 + r_big + 1)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, S: np.ndarray) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float64).reshape(w_big, w_big)
+                V.fill(0.0)
+                V[sx, sy] = v
+                conv = np.fft.ifftn(np.fft.fftn(V) * S).real
+                out = conv[sx, sy].reshape(-1).astype(np.float64, copy=False)
+                return out + lam * v.reshape(-1)
+
+            wx, _, _ = cg_solve(lambda v: apply_A(v, S=S_rr), b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            wy, _, _ = cg_solve(lambda v: apply_A(v, S=S_rr), b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            return wx.reshape(w_big, w_big), wy.reshape(w_big, w_big)
+
+        def eval_relrmse_low(
+            kfft_gx: np.ndarray,
+            kfft_gy: np.ndarray,
+            rho0_test_fft: list[np.ndarray],
+            y_low_test: list[np.ndarray],
+        ) -> float:
+            rels: list[float] = []
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_low_test[fid]
+                rels.append(relrmse_mean_2d(y_true, y_pred))
+            return float(np.mean(rels))
+
+        def run_condition(
+            *,
+            scenario: str,
+            spectrum: str,
+            lognormal: bool,
+            lognormal_sigma: float,
+            norm_mode: str,
+            k0_frac: float,
+        ) -> dict[str, Any]:
+            stats_raw: list[tuple[float, float, float]] = []
+            stats_norm: list[tuple[float, float, float]] = []
+
+            rho0_train_fft: list[np.ndarray] = []
+            X_train: list[np.ndarray] = []
+            y_out_train: list[np.ndarray] = []
+
+            rho0_test_fft: list[np.ndarray] = []
+            X_test_by_field: list[np.ndarray] = []
+            y_out_test_by_field: list[np.ndarray] = []
+            y_low_test: list[np.ndarray] = []
+
+            outside_var_frac: list[float] = []
+            pearson_out_pred: list[float] = []
+
+            kfft_low_gx, kfft_low_gy = kfft_low_ceiling[float(k0_frac)]
+            validate_range = norm_mode == "minmax_01"
+
+            for fid in range(n_train_fields):
+                rng_field = np.random.default_rng(seed + fid)
+                raw = make_field_raw(
+                    rng_field,
+                    spectrum=spectrum,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                )
+                rho = normalize_rho(raw, mode=norm_mode)
+                stats_raw.append(field_stats(raw))
+                stats_norm.append(field_stats(rho))
+
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=validate_range)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_train_fft.append(rho0_fft)
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                centers = centers_by_train_field[fid]
+                X_train.append(compute_B_features(rho, centers))
+                y_out_train.append(sample_vec_at_centers(outside_gx, outside_gy, centers))
+
+            for fid in range(n_test_fields):
+                rng_field = np.random.default_rng(seed + n_train_fields + fid)
+                raw = make_field_raw(
+                    rng_field,
+                    spectrum=spectrum,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                )
+                rho = normalize_rho(raw, mode=norm_mode)
+                stats_raw.append(field_stats(raw))
+                stats_norm.append(field_stats(rho))
+
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=validate_range)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_test_fft.append(rho0_fft)
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                outside_gx = split.low.gx - gx_trunc
+                outside_gy = split.low.gy - gy_trunc
+
+                frac_gx = float(np.var(outside_gx) / (np.var(split.low.gx) + 1e-12))
+                frac_gy = float(np.var(outside_gy) / (np.var(split.low.gy) + 1e-12))
+                outside_var_frac.append(0.5 * (frac_gx + frac_gy))
+
+                centers = centers_by_test_field[fid]
+                X = compute_B_features(rho, centers)
+                y_out = sample_vec_at_centers(outside_gx, outside_gy, centers)
+                y_low_test.append(sample_vec_at_centers(split.low.gx, split.low.gy, centers))
+                X_test_by_field.append(X)
+                y_out_test_by_field.append(y_out)
+
+            # Ridge on TRAIN to predict outside from B.
+            Xtr = np.concatenate(X_train, axis=0)
+            ytr = np.concatenate(y_out_train, axis=0)
+            mu = Xtr.mean(axis=0)
+            sd = Xtr.std(axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            Xtr_s = (Xtr - mu) / sd
+            y_mu = ytr.mean(axis=0)
+            yctr = ytr - y_mu
+            XtX = Xtr_s.T @ Xtr_s + ridge_alpha * np.eye(Xtr_s.shape[1], dtype=np.float64)
+            w = np.linalg.solve(XtX, Xtr_s.T @ yctr)
+
+            for X_te, y_te in zip(X_test_by_field, y_out_test_by_field):
+                Xte_s = (X_te - mu) / sd
+                y_pred = Xte_s @ w + y_mu
+                pearson_out_pred.append(pearson_mean_2d(y_te, y_pred))
+
+            # Wiener vs ceiling (low-k) on TEST.
+            w_gx, w_gy = wiener_fit_weights(rho0_train_fft, k0_frac)
+            kfft_w_gx = kernel_fft_centered(w_gx, grid_size=grid_size)
+            kfft_w_gy = kernel_fft_centered(w_gy, grid_size=grid_size)
+            r_ceiling = eval_relrmse_low(kfft_low_gx, kfft_low_gy, rho0_test_fft, y_low_test)
+            r_wiener = eval_relrmse_low(kfft_w_gx, kfft_w_gy, rho0_test_fft, y_low_test)
+
+            stats_raw = np.asarray(stats_raw, dtype=np.float64)
+            stats_norm = np.asarray(stats_norm, dtype=np.float64)
+            return {
+                "scenario": scenario,
+                "norm_mode": norm_mode,
+                "k0_frac": float(k0_frac),
+                "lognormal_sigma": float(lognormal_sigma) if lognormal else 0.0,
+                "outside_var_frac": (float(np.mean(outside_var_frac)), float(np.std(outside_var_frac, ddof=1)) if len(outside_var_frac) > 1 else 0.0),
+                "pearson_out_pred": (float(np.mean(pearson_out_pred)), float(np.std(pearson_out_pred, ddof=1)) if len(pearson_out_pred) > 1 else 0.0),
+                "delta_relrmse": float(r_wiener - r_ceiling),
+                "stats_raw": (
+                    float(np.mean(stats_raw[:, 0])),
+                    float(np.mean(stats_raw[:, 1])),
+                    float(np.mean(stats_raw[:, 2])),
+                ),
+                "stats_norm": (
+                    float(np.mean(stats_norm[:, 0])),
+                    float(np.mean(stats_norm[:, 1])),
+                    float(np.mean(stats_norm[:, 2])),
+                ),
+            }
+
+        results: list[dict[str, Any]] = []
+
+        scenarios: list[dict[str, Any]] = [{"scenario": "alpha2", "spectrum": "powerlaw", "lognormal": False, "sigma": 0.0}]
+        scenarios.append({"scenario": "bbks_gauss", "spectrum": "bbks", "lognormal": False, "sigma": 0.0})
+        for sig in lognormal_sigmas:
+            scenarios.append({"scenario": "bbks_lognormal", "spectrum": "bbks", "lognormal": True, "sigma": float(sig)})
+
+        for k0 in k0_fracs:
+            for norm_mode in norm_modes:
+                for sc in scenarios:
+                    results.append(
+                        run_condition(
+                            scenario=sc["scenario"],
+                            spectrum=sc["spectrum"],
+                            lognormal=sc["lognormal"],
+                            lognormal_sigma=sc["sigma"],
+                            norm_mode=norm_mode,
+                            k0_frac=float(k0),
+                        )
+                    )
+
+        # Sort by ΔrelRMSE (Wiener - ceiling), best (most negative) first.
+        results_sorted = sorted(results, key=lambda r: float(r["delta_relrmse"]))
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        table_rows: list[dict[str, str]] = []
+        for res in results_sorted:
+            ov_mean, ov_std = res["outside_var_frac"]
+            p_mean, p_std = res["pearson_out_pred"]
+            sraw = res["stats_raw"]
+            snorm = res["stats_norm"]
+            table_rows.append(
+                {
+                    "scenario": res["scenario"],
+                    "norm_mode": res["norm_mode"],
+                    "k0_frac": f"{res['k0_frac']:.2f}",
+                    "lognormal_sigma": f"{res['lognormal_sigma']:.2f}" if res["lognormal_sigma"] > 0 else "0.00",
+                    "outside_var_frac": f"{ov_mean:.4f} ± {ov_std:.4f}",
+                    "Pearson_outside_pred": f"{p_mean:.4f} ± {p_std:.4f}",
+                    "ΔrelRMSE(W-C)": f"{res['delta_relrmse']:+.4f}",
+                    "skew_raw": f"{sraw[0]:+.3f}",
+                    "kurt_raw": f"{sraw[1]:+.3f}",
+                    "skew_norm": f"{snorm[0]:+.3f}",
+                    "kurt_norm": f"{snorm[1]:+.3f}",
+                }
+            )
+
+        top5 = results_sorted[:5]
+        top5_lines = "\n".join(
+            [
+                f"- {r['scenario']} norm={r['norm_mode']} k0={r['k0_frac']:.2f} "
+                f"sigma={r['lognormal_sigma']:.2f} ΔrelRMSE={r['delta_relrmse']:+.4f}"
+                for r in top5
+            ]
+        )
+
+        summary_md = (
+            "# E53 — BBKS/lognormal sensitivity + physical normalization\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, w_big={w_big}, patches_per_field={patches_per_field}\n"
+            f"- n_train_fields={n_train_fields}, n_test_fields={n_test_fields}\n"
+            f"- k0_fracs={k0_fracs}, norm_modes={norm_modes}\n"
+            f"- bbks_k0={bbks_k0:.4f}, bbks_ns={bbks_ns:.3f}, lognormal_sigmas={lognormal_sigmas}\n"
+            f"- ridge_alpha={ridge_alpha}\n"
+            "- train/test fields are independent; test fields are never used in training\n\n"
+            "## Conditions sorted by ΔrelRMSE(Wiener - ceiling)\n\n"
+            + md_table(
+                table_rows,
+                [
+                    "scenario",
+                    "norm_mode",
+                    "k0_frac",
+                    "lognormal_sigma",
+                    "outside_var_frac",
+                    "Pearson_outside_pred",
+                    "ΔrelRMSE(W-C)",
+                    "skew_raw",
+                    "kurt_raw",
+                    "skew_norm",
+                    "kurt_norm",
+                ],
+            )
+            + "\n\n## Top-5 by ΔrelRMSE (most negative)\n\n"
+            + top5_lines
+            + "\n\n## Conclusion\n\n"
+            "- If outside_var_frac stays ~1% across norm modes and k0, the BBKS no-gain is intrinsic.\n"
+            "- If delta/zscore increases outside_var_frac and makes ΔrelRMSE more negative, normalization is the culprit.\n"
+            "- Check skew/kurtosis raw vs norm to see if lognormality is preserved or washed out.\n"
+            "- Compare alpha2 rows vs BBKS rows for spectrum-driven differences.\n"
+            "- Use Pearson_outside_pred to assess predictability of the outside signal.\n"
+        )
+
+        (paths.run_dir / "summary_e53_bbks_lognormal_sensitivity.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "w_big": int(w_big),
+                "n_train_fields": n_train_fields,
+                "n_test_fields": n_test_fields,
+                "patches_per_field": patches_per_field,
+                "k0_fracs": k0_fracs,
+                "norm_modes": norm_modes,
+                "bbks_k0": float(bbks_k0),
+                "bbks_ns": float(bbks_ns),
+                "lognormal_sigmas": lognormal_sigmas,
                 "ridge_alpha": float(ridge_alpha),
                 "results": results,
             },

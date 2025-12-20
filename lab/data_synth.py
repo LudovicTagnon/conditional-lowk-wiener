@@ -35,6 +35,33 @@ class BandSplit2D:
     rel_err_gy: float
 
 
+def normalize_rho(field: np.ndarray, mode: str = "minmax_01") -> np.ndarray:
+    """
+    Normalize a field for Poisson solving.
+    - minmax_01: scale to [0,1]
+    - delta: (rho - mean)/mean (per field)
+    - zscore: (rho - mean)/std (per field)
+    """
+    field = np.asarray(field, dtype=np.float64)
+    mode = str(mode).lower().strip()
+    if mode == "minmax_01":
+        rho = normalize_01(field)
+        if (rho.min() < -1e-9) or (rho.max() > 1.0 + 1e-9):
+            raise RuntimeError("normalize_01 returned values outside [0,1]")
+        return rho
+    if mode == "delta":
+        mu = float(field.mean())
+        denom = mu if abs(mu) > 1e-8 else (1e-8 if mu >= 0 else -1e-8)
+        return (field - mu) / denom
+    if mode == "zscore":
+        mu = float(field.mean())
+        sd = float(field.std())
+        if sd <= 0:
+            return field - mu
+        return (field - mu) / sd
+    raise ValueError(f"unsupported norm_mode={mode}")
+
+
 def generate_1overf_field_2d(
     shape: tuple[int, int],
     alpha: float,
@@ -44,11 +71,12 @@ def generate_1overf_field_2d(
     bbks_ns: float = 1.0,
     lognormal: bool = False,
     lognormal_sigma: float = 1.0,
+    norm_mode: str = "minmax_01",
 ) -> np.ndarray:
     """
     Generate a real 2D field using rFFT.
     spectrum="powerlaw" uses ~1/|k|^alpha, spectrum="bbks" uses BBKS transfer.
-    Returns rho normalized to [0,1] (lognormal optionally applied).
+    Returns rho normalized by norm_mode (lognormal optionally applied).
     """
     if len(shape) != 2:
         raise ValueError(f"shape must be 2D, got {shape}")
@@ -97,9 +125,7 @@ def generate_1overf_field_2d(
     if lognormal:
         field = np.exp(float(lognormal_sigma) * field)
         assert_finite("rho_lognormal_2d", field)
-    rho = normalize_01(field)
-    if (rho.min() < -1e-9) or (rho.max() > 1.0 + 1e-9):
-        raise RuntimeError("normalize_01 returned values outside [0,1]")
+    rho = normalize_rho(field, mode=norm_mode)
     return rho
 
 
@@ -141,6 +167,7 @@ def band_split_poisson_2d(
     rho01: np.ndarray,
     *,
     k0_frac: float = 0.15,
+    validate_range: bool = True,
 ) -> BandSplit2D:
     """
     Split rho into low/high-k components in Fourier space, solve Poisson for each,
@@ -149,8 +176,9 @@ def band_split_poisson_2d(
     rho01 = np.asarray(rho01, dtype=np.float64)
     if rho01.ndim != 2:
         raise ValueError("rho01 must be 2D")
-    if (rho01.min() < -1e-6) or (rho01.max() > 1.0 + 1e-6):
-        raise ValueError("rho01 must be in [0,1]")
+    if validate_range:
+        if (rho01.min() < -1e-6) or (rho01.max() > 1.0 + 1e-6):
+            raise ValueError("rho01 must be in [0,1]")
     if not (0.0 < float(k0_frac) < 0.5):
         raise ValueError("k0_frac must be in (0,0.5)")
 

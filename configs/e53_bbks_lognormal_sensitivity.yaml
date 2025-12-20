@@ -1,0 +1,25 @@
+experiment: e53
+exp_name: e53_bbks_lognormal_sensitivity
+seed: 123
+
+grid_size: 256
+w_big: 193
+
+n_train_fields: 10
+n_test_fields: 10
+patches_per_field: 10000
+
+alpha: 2.0
+
+k0_fracs: [0.10, 0.20, 0.30]
+norm_modes: [minmax_01, delta, zscore]
+
+bbks_k0: 0.47123889803846897  # 0.15 * pi
+bbks_ns: 1.0
+lognormal_sigmas: [0.5, 1.0, 1.5]
+
+ridge_alpha: 1.0
+
+lambda_rel: 1.0e-6
+cg_max_iter: 200
+cg_tol: 1.0e-6
