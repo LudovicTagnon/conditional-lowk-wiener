@@ -14681,6 +14681,674 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e37":
+        # E37 — Rectangular dipole basis dx * f(|dx|,|dy|) to close the low-k relRMSE gap.
+        #
+        # Compare (per w_big):
+        #  - Ceiling: truncated impulse-response low-k kernel (exact pipeline).
+        #  - Annulus dipole baseline: dx*f(r) with M=32 (learned + projection).
+        #  - Rectangular dipoles: dx*f(|dx|,|dy|) (learned + projection), with a small bin sweep.
+        import matplotlib.pyplot as plt
+
+        grid_size = int(cfg.get("grid_size", 256))
+        alpha = float(cfg.get("alpha", 2.0))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_bigs = [_require_odd("w_big", int(w)) for w in cfg.get("w_bigs", [129, 193])]
+
+        bin_settings = cfg.get("bin_settings", [(8, 4), (12, 6), (16, 8)])
+        bin_settings = [(int(a), int(b)) for a, b in bin_settings]
+        if any(nx <= 0 or ny <= 0 for nx, ny in bin_settings):
+            raise ValueError("bin_settings must contain positive (Nx,Ny) pairs")
+
+        # Baseline: annulus dipole (no sectors).
+        annulus_M = int(cfg.get("annulus_M", 32))
+
+        ring_bin_mode = str(cfg.get("ring_bin_mode", "uniform_r")).lower()
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        # Success criteria (projection, w_big=193).
+        gap_pearson_min = float(cfg.get("gap_pearson_min", -0.003))
+        gap_relrmse_max = float(cfg.get("gap_relrmse_max", 0.03))
+
+        # Diagnostics.
+        diag_wbig = _require_odd("diag_wbig", int(cfg.get("diag_wbig", 193)))
+        diag_setting = cfg.get("diag_setting", (8, 4))
+        diag_setting = (int(diag_setting[0]), int(diag_setting[1]))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if any(w > grid_size for w in w_bigs):
+            raise ValueError("all w_bigs must be <= grid_size")
+        if annulus_M <= 0:
+            raise ValueError("annulus_M must be > 0")
+        if ring_bin_mode not in {"uniform_r", "equal_area"}:
+            raise ValueError("ring_bin_mode must be 'uniform_r' or 'equal_area'")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(XtX: np.ndarray, Xty: np.ndarray) -> np.ndarray:
+            d = int(XtX.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(XtX + ridge_alpha * I, Xty)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(XtX + ridge_alpha * I, Xty, rcond=None)
+                return w
+
+        def annulus_edges(r_min: float, r_max: float, n_bins: int) -> np.ndarray:
+            if ring_bin_mode == "uniform_r":
+                return np.linspace(r_min, r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            rsq = np.linspace(r_min * r_min, r_max * r_max + 1e-9, n_bins + 1, dtype=np.float64)
+            return np.sqrt(rsq, dtype=np.float64)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))  # makes convolution(field, kr) == correlation(field, kernel)
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def save_kernel_img(arr: np.ndarray, out: Path, title: str) -> None:
+            fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+            vmax = float(np.max(np.abs(arr))) + 1e-12
+            im = ax.imshow(arr, cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+            ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(out, dpi=150)
+            plt.close(fig)
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        def candidate_edges(r: int) -> np.ndarray:
+            # Deterministic, dense-near-0 edge candidates, always includes 0 and r+1.
+            base = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, r + 1]
+            base = [int(x) for x in base if 0 <= int(x) <= r + 1]
+            dense = list(range(0, min(16, r + 1) + 1))
+            geom = np.unique(np.rint(np.geomspace(1, r + 1, num=64)).astype(int)).tolist()
+            vals = sorted(set(base + dense + geom + [0, r + 1]))
+            return np.asarray(vals, dtype=np.int64)
+
+        def pick_edges(cand: np.ndarray, n_bins: int) -> np.ndarray:
+            cand = np.asarray(cand, dtype=np.int64)
+            if cand.ndim != 1:
+                raise ValueError("cand must be 1D")
+            if len(cand) < n_bins + 1:
+                # Fallback: use all integer edges.
+                cand = np.arange(int(cand.min()), int(cand.max()) + 1, dtype=np.int64)
+            idx = np.round(np.linspace(0, len(cand) - 1, n_bins + 1)).astype(int)
+            idx[0] = 0
+            idx[-1] = len(cand) - 1
+            for k in range(1, len(idx)):
+                if idx[k] <= idx[k - 1]:
+                    idx[k] = idx[k - 1] + 1
+            for k in range(len(idx) - 2, -1, -1):
+                if idx[k] >= idx[k + 1]:
+                    idx[k] = idx[k + 1] - 1
+            if idx[0] != 0 or idx[-1] != len(cand) - 1 or np.any(np.diff(idx) <= 0):
+                raise RuntimeError("Failed to build strictly increasing edge indices")
+            edges = cand[idx].astype(np.int64, copy=False)
+            return edges
+
+        def build_rect_bins(
+            wb: int, *, nx_bins: int, ny_bins: int
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            r_big = wb // 2
+            coords = np.arange(int(wb), dtype=np.float64) - float(r_big)
+            dx, dy = np.meshgrid(coords, coords, indexing="ij")
+            ax = np.abs(dx)
+            ay = np.abs(dy)
+
+            cand = candidate_edges(r_big)
+            edges_x = pick_edges(cand, int(nx_bins)).astype(np.float64, copy=False)
+            edges_y = pick_edges(cand, int(ny_bins)).astype(np.float64, copy=False)
+
+            # ix in [0..nx_bins-1], iy in [0..ny_bins-1]
+            ix = np.digitize(ax, edges_x, right=False) - 1
+            iy = np.digitize(ay, edges_y, right=False) - 1
+            ix = np.clip(ix, 0, int(nx_bins) - 1).astype(np.int32, copy=False)
+            iy = np.clip(iy, 0, int(ny_bins) - 1).astype(np.int32, copy=False)
+
+            bin_idx = (ix * int(ny_bins) + iy).astype(np.int32, copy=False)
+            return dx.astype(np.float64), dy.astype(np.float64), bin_idx, edges_x.astype(np.float64), edges_y.astype(np.float64)
+
+        def lofo_ridge_from_fields(F_by_field: list[np.ndarray], y_by_field: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+            # Learned ridge with StandardScaler-style normalization, using per-field sufficient statistics.
+            sums_F: list[np.ndarray] = []
+            sums_y: list[np.ndarray] = []
+            FtF: list[np.ndarray] = []
+            FtY: list[np.ndarray] = []
+            for fid in range(n_fields):
+                F = np.asarray(F_by_field[fid], dtype=np.float64)
+                y = np.asarray(y_by_field[fid], dtype=np.float64)
+                sums_F.append(F.sum(axis=0))
+                sums_y.append(y.sum(axis=0))
+                FtF.append(F.T @ F)
+                FtY.append(F.T @ y)
+
+            total_sum_F = np.sum(np.stack(sums_F, axis=0), axis=0)
+            total_sum_y = np.sum(np.stack(sums_y, axis=0), axis=0)
+            total_FtF = np.sum(np.stack(FtF, axis=0), axis=0)
+            total_FtY = np.sum(np.stack(FtY, axis=0), axis=0)
+
+            n_total = int(n_fields) * int(patches_per_field)
+            fold_p = np.zeros((n_fields,), dtype=np.float64)
+            fold_r = np.zeros((n_fields,), dtype=np.float64)
+
+            for test_field in range(n_fields):
+                n_test = int(patches_per_field)
+                n_train = n_total - n_test
+                sum_F_tr = total_sum_F - sums_F[test_field]
+                sum_y_tr = total_sum_y - sums_y[test_field]
+                FtF_tr = total_FtF - FtF[test_field]
+                FtY_tr = total_FtY - FtY[test_field]
+
+                mu = sum_F_tr / float(n_train)
+                y_mu = sum_y_tr / float(n_train)
+
+                var = np.diag(FtF_tr) / float(n_train) - mu * mu
+                var = np.where(var > 1e-12, var, 1e-12)
+                sd = np.sqrt(var, dtype=np.float64)
+
+                FtF_center = FtF_tr - float(n_train) * np.outer(mu, mu)
+                FtY_center = FtY_tr - float(n_train) * (mu[:, None] * y_mu[None, :])
+
+                XtX = FtF_center / (sd[:, None] * sd[None, :])
+                Xty = FtY_center / sd[:, None]
+                w = solve_ridge(XtX, Xty)
+
+                Fte = np.asarray(F_by_field[test_field], dtype=np.float64)
+                Xte = (Fte - mu) / sd
+                y_pred = Xte @ w + y_mu
+                y_true = np.asarray(y_by_field[test_field], dtype=np.float64)
+                fold_p[test_field] = pearson_mean_2d(y_true, y_pred)
+                fold_r[test_field] = relrmse_mean_2d(y_true, y_pred)
+            return fold_p, fold_r
+
+        # Generate fields + band split targets.
+        rho01_by_field: list[np.ndarray] = []
+        rho0_by_field: list[np.ndarray] = []
+        field_fft_by_field: list[np.ndarray] = []
+        split_cache: list[BandSplit2D] = []
+        for field_id in range(n_fields):
+            rng_field = np.random.default_rng(seed + field_id)
+            rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=alpha, rng=rng_field)
+            split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+            rho01_by_field.append(rho01.astype(np.float64, copy=False))
+            rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+            rho0_by_field.append(rho0)
+            field_fft_by_field.append(np.fft.fftn(rho01))
+            split_cache.append(split)
+
+        def sample_low_at_centers(split: BandSplit2D, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([split.low.gx[cx, cy], split.low.gy[cx, cy]]).astype(np.float64, copy=False)
+
+        # Impulse-response low-k kernel (full grid).
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c0 = grid_size // 2
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+        kfull_gx = np.asarray(split_delta.low.gx, dtype=np.float64, copy=False)
+        kfull_gy = np.asarray(split_delta.low.gy, dtype=np.float64, copy=False)
+        save_kernel_img(kfull_gx, paths.run_dir / "kernel_low_full_gx.png", "Kx_low (full grid, impulse)")
+        save_kernel_img(kfull_gy, paths.run_dir / "kernel_low_full_gy.png", "Ky_low (full grid, impulse)")
+
+        # Summary storage.
+        rows_metrics: list[dict[str, Any]] = []
+        rows_kapprox: list[dict[str, Any]] = []
+
+        # Diagnostics outputs (only once).
+        diag_done_mask = False
+        diag_done_kernels = False
+
+        for wb in w_bigs:
+            r_big = int(wb) // 2
+
+            # Deterministic centers per w_big.
+            centers_by_field: list[np.ndarray] = []
+            centers_idx: list[tuple[np.ndarray, np.ndarray]] = []
+            for field_id in range(n_fields):
+                rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * int(wb) + 1_000 * field_id)
+                cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+                cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+                centers = np.column_stack([cx, cy]).astype(np.int64, copy=False)
+                centers_by_field.append(centers)
+                centers_idx.append((cx.astype(np.int64, copy=False), cy.astype(np.int64, copy=False)))
+
+            y_low_by_field = [sample_low_at_centers(split_cache[fid], centers_by_field[fid]) for fid in range(n_fields)]
+
+            # Truncated impulse kernels and their correlation-kernel form.
+            g_patch_gx = kfull_gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            g_patch_gy = kfull_gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            kcorr_true_gx = g_patch_gx[::-1, ::-1].astype(np.float64, copy=False)
+            kcorr_true_gy = g_patch_gy[::-1, ::-1].astype(np.float64, copy=False)
+            save_kernel_img(g_patch_gx, paths.run_dir / f"kernel_low_gx_wbig{wb}.png", f"Kx_low truncated (w={wb})")
+            save_kernel_img(g_patch_gy, paths.run_dir / f"kernel_low_gy_wbig{wb}.png", f"Ky_low truncated (w={wb})")
+
+            # Ceiling (no learning): convolve mean-subtracted rho with kernel.
+            kfft_gx = kernel_fft_centered(kcorr_true_gx, grid_size=grid_size)
+            kfft_gy = kernel_fft_centered(kcorr_true_gy, grid_size=grid_size)
+            ceil_fold_p = np.zeros((n_fields,), dtype=np.float64)
+            ceil_fold_r = np.zeros((n_fields,), dtype=np.float64)
+            for fid in range(n_fields):
+                field_fft = np.fft.fftn(rho0_by_field[fid])
+                gx_pred = np.fft.ifftn(field_fft * kfft_gx).real
+                gy_pred = np.fft.ifftn(field_fft * kfft_gy).real
+                cx, cy = centers_idx[fid]
+                y_pred = np.column_stack([gx_pred[cx, cy], gy_pred[cx, cy]]).astype(np.float64, copy=False)
+                y_true = y_low_by_field[fid]
+                ceil_fold_p[fid] = pearson_mean_2d(y_true, y_pred)
+                ceil_fold_r[fid] = relrmse_mean_2d(y_true, y_pred)
+            ceil_mean_p = float(ceil_fold_p.mean())
+            ceil_std_p = float(ceil_fold_p.std(ddof=1)) if len(ceil_fold_p) > 1 else 0.0
+            ceil_mean_r = float(ceil_fold_r.mean())
+            ceil_std_r = float(ceil_fold_r.std(ddof=1)) if len(ceil_fold_r) > 1 else 0.0
+
+            # Baseline annulus dipole (M=32): projection + learned.
+            coords = np.arange(int(wb), dtype=np.float64) - float(r_big)
+            dx, dy = np.meshgrid(coords, coords, indexing="ij")
+            rgrid = np.sqrt(dx * dx + dy * dy, dtype=np.float64)
+            edges_r = annulus_edges(0.0, float(r_big), int(annulus_M))
+            n_bins_base = int(annulus_M)
+
+            coef_base_x = np.zeros((n_bins_base,), dtype=np.float64)
+            coef_base_y = np.zeros((n_bins_base,), dtype=np.float64)
+            Fbase_by_field: list[np.ndarray] = [np.zeros((patches_per_field, 2 * n_bins_base), dtype=np.float32) for _ in range(n_fields)]
+
+            for m in range(n_bins_base):
+                lo = edges_r[m]
+                hi = edges_r[m + 1]
+                if m == n_bins_base - 1:
+                    ring = (rgrid >= lo) & (rgrid <= hi)
+                else:
+                    ring = (rgrid >= lo) & (rgrid < hi)
+                ring_f = ring.astype(np.float64)
+                bx = (dx * ring_f).astype(np.float64, copy=False)
+                by = (dy * ring_f).astype(np.float64, copy=False)
+                denom_x = float(np.sum(bx * bx))
+                denom_y = float(np.sum(by * by))
+                coef_base_x[m] = float(np.sum(kcorr_true_gx * bx)) / (denom_x + 1e-12) if denom_x > 0 else 0.0
+                coef_base_y[m] = float(np.sum(kcorr_true_gy * by)) / (denom_y + 1e-12) if denom_y > 0 else 0.0
+
+                kfft_dx = kernel_fft_centered(bx, grid_size=grid_size)
+                kfft_dy = kernel_fft_centered(by, grid_size=grid_size)
+                for fid in range(n_fields):
+                    field_fft = field_fft_by_field[fid]
+                    cx, cy = centers_idx[fid]
+                    dx_grid = np.fft.ifftn(field_fft * kfft_dx).real
+                    dy_grid = np.fft.ifftn(field_fft * kfft_dy).real
+                    Fbase_by_field[fid][:, m] = dx_grid[cx, cy].astype(np.float32, copy=False)
+                    Fbase_by_field[fid][:, n_bins_base + m] = dy_grid[cx, cy].astype(np.float32, copy=False)
+
+            # Baseline projection metrics (no learning).
+            base_proj_p = np.zeros((n_fields,), dtype=np.float64)
+            base_proj_r = np.zeros((n_fields,), dtype=np.float64)
+            for fid in range(n_fields):
+                F = Fbase_by_field[fid].astype(np.float64, copy=False)
+                y_pred = np.column_stack([F[:, :n_bins_base] @ coef_base_x, F[:, n_bins_base:] @ coef_base_y]).astype(np.float64, copy=False)
+                y_true = y_low_by_field[fid]
+                base_proj_p[fid] = pearson_mean_2d(y_true, y_pred)
+                base_proj_r[fid] = relrmse_mean_2d(y_true, y_pred)
+            base_proj_mean_p = float(base_proj_p.mean())
+            base_proj_std_p = float(base_proj_p.std(ddof=1)) if len(base_proj_p) > 1 else 0.0
+            base_proj_mean_r = float(base_proj_r.mean())
+            base_proj_std_r = float(base_proj_r.std(ddof=1)) if len(base_proj_r) > 1 else 0.0
+
+            # Baseline learned (LOFO ridge).
+            base_learn_p, base_learn_r = lofo_ridge_from_fields(Fbase_by_field, y_low_by_field)
+            base_learn_mean_p = float(base_learn_p.mean())
+            base_learn_std_p = float(base_learn_p.std(ddof=1)) if len(base_learn_p) > 1 else 0.0
+            base_learn_mean_r = float(base_learn_r.mean())
+            base_learn_std_r = float(base_learn_r.std(ddof=1)) if len(base_learn_r) > 1 else 0.0
+
+            # Record baseline rows.
+            rows_metrics.append(
+                {
+                    "w_big": int(wb),
+                    "method": "ceiling",
+                    "setting": "-",
+                    "d": 0,
+                    "pearson_mean": ceil_mean_p,
+                    "pearson_std": ceil_std_p,
+                    "relRMSE_mean": ceil_mean_r,
+                    "relRMSE_std": ceil_std_r,
+                    "gapP": 0.0,
+                    "gapR": 0.0,
+                }
+            )
+            rows_metrics.append(
+                {
+                    "w_big": int(wb),
+                    "method": "annulus_learn",
+                    "setting": f"M={annulus_M}",
+                    "d": int(2 * n_bins_base),
+                    "pearson_mean": base_learn_mean_p,
+                    "pearson_std": base_learn_std_p,
+                    "relRMSE_mean": base_learn_mean_r,
+                    "relRMSE_std": base_learn_std_r,
+                    "gapP": float(base_learn_mean_p - ceil_mean_p),
+                    "gapR": float(base_learn_mean_r - ceil_mean_r),
+                }
+            )
+            rows_metrics.append(
+                {
+                    "w_big": int(wb),
+                    "method": "annulus_proj",
+                    "setting": f"M={annulus_M}",
+                    "d": int(2 * n_bins_base),
+                    "pearson_mean": base_proj_mean_p,
+                    "pearson_std": base_proj_std_p,
+                    "relRMSE_mean": base_proj_mean_r,
+                    "relRMSE_std": base_proj_std_r,
+                    "gapP": float(base_proj_mean_p - ceil_mean_p),
+                    "gapR": float(base_proj_mean_r - ceil_mean_r),
+                }
+            )
+
+            # Rectangular bin settings.
+            for nx_bins, ny_bins in bin_settings:
+                dxr, dyr, bin_idx, edges_x, edges_y = build_rect_bins(int(wb), nx_bins=int(nx_bins), ny_bins=int(ny_bins))
+                n_bins = int(nx_bins) * int(ny_bins)
+                d = 2 * n_bins
+
+                # Diagnostics: show bin regions (smallest setting).
+                if (int(wb) == int(diag_wbig)) and ((int(nx_bins), int(ny_bins)) == diag_setting) and not diag_done_mask:
+                    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+                    ax.imshow(bin_idx.astype(np.float64), cmap="turbo", interpolation="nearest")
+                    ax.set_title(f"Rect bins (w_big={wb}, Nx={nx_bins}, Ny={ny_bins})")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    fig.tight_layout()
+                    out = paths.run_dir / f"mask_rectbins_wbig{wb}_Nx{nx_bins}_Ny{ny_bins}.png"
+                    fig.savefig(out, dpi=150)
+                    plt.close(fig)
+                    diag_done_mask = True
+
+                # Projection coefficients (disjoint masks).
+                bin_flat = bin_idx.reshape(-1).astype(np.int64, copy=False)
+                dx_flat = dxr.reshape(-1).astype(np.float64, copy=False)
+                dy_flat = dyr.reshape(-1).astype(np.float64, copy=False)
+                kx_flat = kcorr_true_gx.reshape(-1).astype(np.float64, copy=False)
+                ky_flat = kcorr_true_gy.reshape(-1).astype(np.float64, copy=False)
+
+                num_x = np.bincount(bin_flat, weights=kx_flat * dx_flat, minlength=n_bins).astype(np.float64, copy=False)
+                den_x = np.bincount(bin_flat, weights=dx_flat * dx_flat, minlength=n_bins).astype(np.float64, copy=False)
+                coef_x = np.where(den_x > 0, num_x / (den_x + 1e-12), 0.0).astype(np.float64, copy=False)
+
+                num_y = np.bincount(bin_flat, weights=ky_flat * dy_flat, minlength=n_bins).astype(np.float64, copy=False)
+                den_y = np.bincount(bin_flat, weights=dy_flat * dy_flat, minlength=n_bins).astype(np.float64, copy=False)
+                coef_y = np.where(den_y > 0, num_y / (den_y + 1e-12), 0.0).astype(np.float64, copy=False)
+
+                Kx_approx = coef_x[bin_idx] * dxr
+                Ky_approx = coef_y[bin_idx] * dyr
+
+                corr_kx = safe_corr_1d(kcorr_true_gx, Kx_approx)
+                corr_ky = safe_corr_1d(kcorr_true_gy, Ky_approx)
+                rel_kx = float(np.linalg.norm((Kx_approx - kcorr_true_gx).ravel()) / (np.linalg.norm(kcorr_true_gx.ravel()) + 1e-12))
+                rel_ky = float(np.linalg.norm((Ky_approx - kcorr_true_gy).ravel()) / (np.linalg.norm(kcorr_true_gy.ravel()) + 1e-12))
+                rows_kapprox.append(
+                    {
+                        "w_big": int(wb),
+                        "Nx": int(nx_bins),
+                        "Ny": int(ny_bins),
+                        "d": int(d),
+                        "corr_kernel_mean": float(0.5 * (corr_kx + corr_ky)),
+                        "relL2_kernel_mean": float(0.5 * (rel_kx + rel_ky)),
+                    }
+                )
+
+                # Diagnostics: Kx_true vs Kx_approx (smallest setting at w_big=193).
+                if (int(wb) == int(diag_wbig)) and ((int(nx_bins), int(ny_bins)) == diag_setting) and not diag_done_kernels:
+                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                    vmax = float(np.max(np.abs(kcorr_true_gx))) + 1e-12
+                    axes[0].imshow(kcorr_true_gx, cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+                    axes[0].set_title("Kx_true (kcorr)")
+                    axes[1].imshow(Kx_approx, cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+                    axes[1].set_title("Kx_approx (proj)")
+                    diff = Kx_approx - kcorr_true_gx
+                    vmax_d = float(np.max(np.abs(diff))) + 1e-12
+                    axes[2].imshow(diff, cmap="RdBu_r", vmin=-vmax_d, vmax=vmax_d, interpolation="nearest")
+                    axes[2].set_title("diff")
+                    for ax in axes:
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                    fig.tight_layout()
+                    out = paths.run_dir / f"kernel_rectproj_compare_wbig{wb}_Nx{nx_bins}_Ny{ny_bins}_Kx.png"
+                    fig.savefig(out, dpi=150)
+                    plt.close(fig)
+                    diag_done_kernels = True
+
+                # Build features for learned/proj evaluation: Dx_{i,j}, Dy_{i,j}.
+                F_by_field: list[np.ndarray] = [np.zeros((patches_per_field, d), dtype=np.float32) for _ in range(n_fields)]
+                for b in range(n_bins):
+                    mask = (bin_idx == int(b)).astype(np.float64, copy=False)
+                    kdx = (dxr * mask).astype(np.float64, copy=False)
+                    kdy = (dyr * mask).astype(np.float64, copy=False)
+                    kfft_dx = kernel_fft_centered(kdx, grid_size=grid_size)
+                    kfft_dy = kernel_fft_centered(kdy, grid_size=grid_size)
+                    for fid in range(n_fields):
+                        field_fft = field_fft_by_field[fid]
+                        cx, cy = centers_idx[fid]
+                        dx_grid = np.fft.ifftn(field_fft * kfft_dx).real
+                        dy_grid = np.fft.ifftn(field_fft * kfft_dy).real
+                        F_by_field[fid][:, b] = dx_grid[cx, cy].astype(np.float32, copy=False)
+                        F_by_field[fid][:, n_bins + b] = dy_grid[cx, cy].astype(np.float32, copy=False)
+
+                # Projection performance (no learning).
+                proj_p = np.zeros((n_fields,), dtype=np.float64)
+                proj_r = np.zeros((n_fields,), dtype=np.float64)
+                for fid in range(n_fields):
+                    F = F_by_field[fid].astype(np.float64, copy=False)
+                    y_pred = np.column_stack([F[:, :n_bins] @ coef_x, F[:, n_bins:] @ coef_y]).astype(np.float64, copy=False)
+                    y_true = y_low_by_field[fid]
+                    proj_p[fid] = pearson_mean_2d(y_true, y_pred)
+                    proj_r[fid] = relrmse_mean_2d(y_true, y_pred)
+                proj_mean_p = float(proj_p.mean())
+                proj_std_p = float(proj_p.std(ddof=1)) if len(proj_p) > 1 else 0.0
+                proj_mean_r = float(proj_r.mean())
+                proj_std_r = float(proj_r.std(ddof=1)) if len(proj_r) > 1 else 0.0
+
+                # Learned performance (LOFO ridge).
+                learn_p, learn_r = lofo_ridge_from_fields(F_by_field, y_low_by_field)
+                learn_mean_p = float(learn_p.mean())
+                learn_std_p = float(learn_p.std(ddof=1)) if len(learn_p) > 1 else 0.0
+                learn_mean_r = float(learn_r.mean())
+                learn_std_r = float(learn_r.std(ddof=1)) if len(learn_r) > 1 else 0.0
+
+                rows_metrics.append(
+                    {
+                        "w_big": int(wb),
+                        "method": "rect_learn",
+                        "setting": f"Nx={nx_bins},Ny={ny_bins}",
+                        "d": int(d),
+                        "pearson_mean": learn_mean_p,
+                        "pearson_std": learn_std_p,
+                        "relRMSE_mean": learn_mean_r,
+                        "relRMSE_std": learn_std_r,
+                        "gapP": float(learn_mean_p - ceil_mean_p),
+                        "gapR": float(learn_mean_r - ceil_mean_r),
+                        "edges_x": edges_x.tolist(),
+                        "edges_y": edges_y.tolist(),
+                    }
+                )
+                rows_metrics.append(
+                    {
+                        "w_big": int(wb),
+                        "method": "rect_proj",
+                        "setting": f"Nx={nx_bins},Ny={ny_bins}",
+                        "d": int(d),
+                        "pearson_mean": proj_mean_p,
+                        "pearson_std": proj_std_p,
+                        "relRMSE_mean": proj_mean_r,
+                        "relRMSE_std": proj_std_r,
+                        "gapP": float(proj_mean_p - ceil_mean_p),
+                        "gapR": float(proj_mean_r - ceil_mean_r),
+                        "edges_x": edges_x.tolist(),
+                        "edges_y": edges_y.tolist(),
+                    }
+                )
+
+        # Render markdown summary.
+        md_by_wbig: dict[int, list[dict[str, str]]] = {}
+        for r0 in rows_metrics:
+            wb = int(r0["w_big"])
+            if wb not in md_by_wbig:
+                md_by_wbig[wb] = []
+            md_by_wbig[wb].append(
+                {
+                    "method": str(r0["method"]),
+                    "setting": str(r0["setting"]),
+                    "d": str(int(r0.get("d", 0))),
+                    "Pearson mean±std": (
+                        f"{float(r0['pearson_mean']):.4f} ± {float(r0['pearson_std']):.4f}"
+                        if r0["method"] != "ceiling"
+                        else f"{float(r0['pearson_mean']):.4f} ± {float(r0['pearson_std']):.4f}"
+                    ),
+                    "relRMSE mean±std": f"{float(r0['relRMSE_mean']):.4f} ± {float(r0['relRMSE_std']):.4f}",
+                    "gapP vs ceiling": f"{float(r0['gapP']):+.4f}",
+                    "gapR vs ceiling": f"{float(r0['gapR']):+.4f}",
+                }
+            )
+
+        md_krows: list[dict[str, str]] = []
+        for r0 in sorted(rows_kapprox, key=lambda x: (int(x["w_big"]), int(x["d"]))):
+            md_krows.append(
+                {
+                    "w_big": str(r0["w_big"]),
+                    "Nx": str(r0["Nx"]),
+                    "Ny": str(r0["Ny"]),
+                    "d": str(r0["d"]),
+                    "corr(Kapprox,Ktrue)": f"{float(r0['corr_kernel_mean']):.4f}",
+                    "relL2(Kapprox,Ktrue)": f"{float(r0['relL2_kernel_mean']):.4f}",
+                }
+            )
+
+        # Success check for w_big=193 (projection).
+        success_lines: list[str] = []
+        for wb in [w for w in w_bigs if int(w) == 193]:
+            wb = int(wb)
+            proj_rows = [r0 for r0 in rows_metrics if int(r0["w_big"]) == wb and r0["method"] == "rect_proj"]
+            ok = []
+            for r0 in proj_rows:
+                if (float(r0["gapP"]) > gap_pearson_min) and (float(r0["gapR"]) < gap_relrmse_max):
+                    ok.append(r0["setting"])
+            if ok:
+                success_lines.append(f"- w_big=193: projection PASS at {ok[0]}")
+            else:
+                success_lines.append("- w_big=193: projection PASS at (none)")
+
+        summary_parts = [
+            "# E37 — Rectangular dipole basis (low-k)\n",
+            f"- run: `{paths.run_dir}`\n",
+            f"- grid_size={grid_size}, alpha={alpha}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}\n",
+            f"- w_bigs={w_bigs}\n",
+            f"- annulus baseline: M={annulus_M}\n",
+            f"- rect bin_settings={bin_settings}\n",
+            f"- success criteria (w_big=193 proj): gapP > {gap_pearson_min}, gapR < {gap_relrmse_max}\n\n",
+        ]
+        for wb in sorted(md_by_wbig.keys()):
+            rows = md_by_wbig[wb]
+            order = {"ceiling": 0, "annulus_learn": 1, "annulus_proj": 2, "rect_learn": 3, "rect_proj": 4}
+            rows = sorted(rows, key=lambda r: (order.get(r["method"], 99), r["setting"]))
+            summary_parts.append(f"## w_big={wb}\n\n")
+            summary_parts.append(
+                md_table(rows, ["method", "setting", "d", "Pearson mean±std", "relRMSE mean±std", "gapP vs ceiling", "gapR vs ceiling"])
+            )
+            summary_parts.append("\n\n")
+
+        summary_parts.append("## Kernel approximation quality (projection)\n\n")
+        summary_parts.append(md_table(md_krows, ["w_big", "Nx", "Ny", "d", "corr(Kapprox,Ktrue)", "relL2(Kapprox,Ktrue)"]))
+        summary_parts.append("\n\n## PASS check\n\n")
+        summary_parts.append("\n".join(success_lines) + "\n")
+        summary_parts.append("\n## Diagnostics\n\n")
+        summary_parts.append(f"- `mask_rectbins_wbig{diag_wbig}_Nx{diag_setting[0]}_Ny{diag_setting[1]}.png`\n")
+        summary_parts.append(f"- `kernel_rectproj_compare_wbig{diag_wbig}_Nx{diag_setting[0]}_Ny{diag_setting[1]}_Kx.png`\n")
+
+        summary_md = "".join(summary_parts)
+        (paths.run_dir / "summary_e37_rect_dipole_lowk.md").write_text(summary_md, encoding="utf-8")
+
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "alpha": alpha,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_bigs": [int(w) for w in w_bigs],
+                "annulus_M": int(annulus_M),
+                "ring_bin_mode": ring_bin_mode,
+                "ridge_alpha": ridge_alpha,
+                "bin_settings": [(int(a), int(b)) for a, b in bin_settings],
+                "success_criteria": {"gap_pearson_min": gap_pearson_min, "gap_relrmse_max": gap_relrmse_max},
+                "rows_metrics": rows_metrics,
+                "rows_kapprox": rows_kapprox,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))

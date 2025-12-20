@@ -1,0 +1,35 @@
+experiment: e37
+exp_name: e37_rect_dipole_lowk
+seed: 123
+
+grid_size: 256
+alpha: 2.0
+n_fields: 10
+patches_per_field: 10000
+
+# Band split (targets: gx_low, gy_low)
+k0_frac: 0.15
+
+w_bigs: [129, 193]
+
+# Baseline: annulus dipole (dx * f(r))
+annulus_M: 32
+ring_bin_mode: uniform_r   # or: equal_area
+
+# Rectangular bins (dx * f(|dx|,|dy|))
+bin_settings:
+  - [8, 4]     # 32 bins -> 64 features
+  - [12, 6]    # 72 bins -> 144 features
+  - [16, 8]    # 128 bins -> 256 features
+
+# Learned ridge
+ridge_alpha: 1.0
+
+# Success criteria (w_big=193 projection)
+gap_pearson_min: -0.003
+gap_relrmse_max: 0.03
+
+# Diagnostics (use smallest setting)
+diag_wbig: 193
+diag_setting: [8, 4]
+
