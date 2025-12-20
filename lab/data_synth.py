@@ -48,8 +48,8 @@ def generate_1overf_field_2d(
         raise ValueError(f"shape must be 2D, got {shape}")
     if any(s <= 0 for s in shape):
         raise ValueError(f"invalid shape: {shape}")
-    if alpha <= 0:
-        raise ValueError("alpha must be > 0")
+    if alpha < 0:
+        raise ValueError("alpha must be >= 0")
 
     nx, ny = shape
     kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None]
@@ -175,8 +175,8 @@ def generate_1overf_field_3d(
         raise ValueError(f"shape must be 3D, got {shape}")
     if any(s <= 0 for s in shape):
         raise ValueError(f"invalid shape: {shape}")
-    if alpha <= 0:
-        raise ValueError("alpha must be > 0")
+    if alpha < 0:
+        raise ValueError("alpha must be >= 0")
 
     nx, ny, nz = shape
     kx = 2.0 * np.pi * np.fft.fftfreq(nx)[:, None, None]

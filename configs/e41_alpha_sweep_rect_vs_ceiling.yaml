@@ -1,0 +1,19 @@
+experiment: e41
+exp_name: e41_alpha_sweep_rect_vs_ceiling
+seed: 123
+
+grid_size: 256
+n_fields: 10
+patches_per_field: 10000
+k0_frac: 0.15
+
+w_big: 193
+w_local: 33
+
+# Low-k rectangular dipole model (reference)
+rect_nx: 16
+rect_ny: 8
+ridge_alpha: 1.0
+
+# Sweep
+alpha_list: [0.0, 1.0, 1.5, 2.0]

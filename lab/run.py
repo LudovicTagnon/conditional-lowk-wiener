@@ -17279,6 +17279,458 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e41":
+        # E41 — Alpha sweep: does rect_learn beat ceiling only when rho is correlated?
+        #
+        # Hypothesis: rect_learn improves over the truncated impulse-kernel ceiling by conditional inference of
+        # outside-support context via correlations in rho. Therefore, the gain should vanish as alpha -> 0.
+        #
+        # Setup matches E39:
+        # - n=256, k0_frac=0.15, LOFO over 10 fields
+        # - w_big=193 for low-k, w_local=33 for high-k
+        # Models:
+        #  - two_channel_ceiling: low=truncated impulse kernel, high=fixed kernel
+        #  - two_channel_rect_proj: low=projection of kernel onto rect dipole basis (optional, deterministic)
+        #  - two_channel_rect_learn: learned rect dipole low-k (ridge), high=fixed kernel
+        alpha_list = [float(x) for x in cfg.get("alpha_list", [0.0, 1.0, 1.5, 2.0])]
+
+        grid_size = int(cfg.get("grid_size", 256))
+        n_fields = int(cfg.get("n_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        k0_frac = float(cfg.get("k0_frac", 0.15))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        w_local = _require_odd("w_local", int(cfg.get("w_local", 33)))
+
+        rect_nx = int(cfg.get("rect_nx", 16))
+        rect_ny = int(cfg.get("rect_ny", 8))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_fields < 2:
+            raise ValueError("n_fields must be >= 2")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if not (0.0 < float(k0_frac) < 0.5):
+            raise ValueError("k0_frac must be in (0,0.5)")
+        if w_big > grid_size or w_local > grid_size:
+            raise ValueError("w_big/w_local must be <= grid_size")
+        if w_local > w_big:
+            raise ValueError("w_local must be <= w_big")
+        if rect_nx <= 0 or rect_ny <= 0:
+            raise ValueError("rect_nx/rect_ny must be > 0")
+        if ridge_alpha <= 0:
+            raise ValueError("ridge_alpha must be > 0")
+        if not alpha_list:
+            raise ValueError("alpha_list must be non-empty")
+        if any(a < 0 for a in alpha_list):
+            raise ValueError("alpha_list must be >= 0")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def solve_ridge(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+            d = int(A.shape[0])
+            I = np.eye(d, dtype=np.float64)
+            try:
+                return np.linalg.solve(A + ridge_alpha * I, B)
+            except np.linalg.LinAlgError:
+                w, *_ = np.linalg.lstsq(A + ridge_alpha * I, B, rcond=None)
+                return w
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            cx = grid_size // 2
+            cy = grid_size // 2
+            full[cx - r : cx + r + 1, cy - r : cy + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def md_table(rows: list[dict[str, str]], cols: list[str]) -> str:
+            header = "| " + " | ".join(cols) + " |"
+            sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+            out = [header, sep]
+            for r0 in rows:
+                out.append("| " + " | ".join(r0.get(c, "") for c in cols) + " |")
+            return "\n".join(out)
+
+        # Precompute shared patch centers (same across alphas).
+        r_big = w_big // 2
+        centers_by_field: list[np.ndarray] = []
+        centers_idx: list[tuple[np.ndarray, np.ndarray]] = []
+        for field_id in range(n_fields):
+            rng_cent = np.random.default_rng(seed + 555_555 + 10_000 * int(w_big) + 1_000 * field_id)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers = np.column_stack([cx, cy]).astype(np.int64, copy=False)
+            centers_by_field.append(centers)
+            centers_idx.append((cx.astype(np.int64, copy=False), cy.astype(np.int64, copy=False)))
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        # Impulse kernels (independent of alpha).
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        c0 = grid_size // 2
+        rho_delta[c0, c0] = 1.0
+        split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0_frac))
+
+        r_loc = w_local // 2
+        g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+        kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_low_gx = kernel_fft_centered(kcorr_low_gx, grid_size=grid_size)
+        kfft_low_gy = kernel_fft_centered(kcorr_low_gy, grid_size=grid_size)
+
+        g_patch_high_gx = split_delta.high.gx[c0 - r_loc : c0 + r_loc + 1, c0 - r_loc : c0 + r_loc + 1]
+        g_patch_high_gy = split_delta.high.gy[c0 - r_loc : c0 + r_loc + 1, c0 - r_loc : c0 + r_loc + 1]
+        kcorr_high_gx = g_patch_high_gx[::-1, ::-1].astype(np.float64, copy=False)
+        kcorr_high_gy = g_patch_high_gy[::-1, ::-1].astype(np.float64, copy=False)
+        kfft_high_gx = kernel_fft_centered(kcorr_high_gx, grid_size=grid_size)
+        kfft_high_gy = kernel_fft_centered(kcorr_high_gy, grid_size=grid_size)
+
+        # Rect bins + projection coefficients (from low kernel correlation onto basis).
+        def candidate_edges(r: int) -> np.ndarray:
+            base = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, r + 1]
+            base = [int(x) for x in base if 0 <= int(x) <= r + 1]
+            dense = list(range(0, min(16, r + 1) + 1))
+            geom = np.unique(np.rint(np.geomspace(1, r + 1, num=64)).astype(int)).tolist()
+            vals = sorted(set(base + dense + geom + [0, r + 1]))
+            return np.asarray(vals, dtype=np.int64)
+
+        def pick_edges(cand: np.ndarray, n_bins: int) -> np.ndarray:
+            cand = np.asarray(cand, dtype=np.int64)
+            if len(cand) < n_bins + 1:
+                cand = np.arange(int(cand.min()), int(cand.max()) + 1, dtype=np.int64)
+            idx = np.round(np.linspace(0, len(cand) - 1, n_bins + 1)).astype(int)
+            idx[0] = 0
+            idx[-1] = len(cand) - 1
+            edges = np.unique(cand[idx])
+            if len(edges) != n_bins + 1:
+                edges = np.unique(np.rint(np.linspace(int(cand.min()), int(cand.max()), n_bins + 1)).astype(np.int64))
+            edges[0] = int(cand.min())
+            edges[-1] = int(cand.max())
+            return edges
+
+        def build_rect_bins(w: int, *, nx_bins: int, ny_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            w = _require_odd("w_big", int(w))
+            r = w // 2
+            coords = np.arange(w, dtype=np.float64) - float(r)
+            dx, dy = np.meshgrid(coords, coords, indexing="ij")
+            ax = np.abs(dx).astype(np.int64)
+            ay = np.abs(dy).astype(np.int64)
+            cand = candidate_edges(int(r))
+            edges_x = pick_edges(cand, int(nx_bins))
+            edges_y = pick_edges(cand, int(ny_bins))
+            ix = np.digitize(ax, edges_x, right=False) - 1
+            iy = np.digitize(ay, edges_y, right=False) - 1
+            ix = np.clip(ix, 0, int(nx_bins) - 1).astype(np.int32, copy=False)
+            iy = np.clip(iy, 0, int(ny_bins) - 1).astype(np.int32, copy=False)
+            bin_idx = (ix * int(ny_bins) + iy).astype(np.int32, copy=False)
+            return dx.astype(np.float64), dy.astype(np.float64), bin_idx
+
+        dxr, dyr, bin_idx = build_rect_bins(w_big, nx_bins=int(rect_nx), ny_bins=int(rect_ny))
+        n_bins_rect = int(rect_nx) * int(rect_ny)
+
+        bin_flat = bin_idx.reshape(-1).astype(np.int64, copy=False)
+        dx_flat = dxr.reshape(-1).astype(np.float64, copy=False)
+        dy_flat = dyr.reshape(-1).astype(np.float64, copy=False)
+        kx_flat = kcorr_low_gx.reshape(-1).astype(np.float64, copy=False)
+        ky_flat = kcorr_low_gy.reshape(-1).astype(np.float64, copy=False)
+        num_x = np.bincount(bin_flat, weights=kx_flat * dx_flat, minlength=n_bins_rect).astype(np.float64, copy=False)
+        den_x = np.bincount(bin_flat, weights=dx_flat * dx_flat, minlength=n_bins_rect).astype(np.float64, copy=False)
+        coef_rect_x = np.where(den_x > 0, num_x / (den_x + 1e-12), 0.0).astype(np.float64, copy=False)
+        num_y = np.bincount(bin_flat, weights=ky_flat * dy_flat, minlength=n_bins_rect).astype(np.float64, copy=False)
+        den_y = np.bincount(bin_flat, weights=dy_flat * dy_flat, minlength=n_bins_rect).astype(np.float64, copy=False)
+        coef_rect_y = np.where(den_y > 0, num_y / (den_y + 1e-12), 0.0).astype(np.float64, copy=False)
+
+        def fit_predict_low_rect(
+            F_by_field: list[np.ndarray],
+            y_by_field: list[np.ndarray],
+            *,
+            test_field: int,
+        ) -> np.ndarray:
+            sums_F = [np.asarray(F_by_field[fid], dtype=np.float64).sum(axis=0) for fid in range(n_fields)]
+            sums_y = [np.asarray(y_by_field[fid], dtype=np.float64).sum(axis=0) for fid in range(n_fields)]
+            FtF = [(np.asarray(F_by_field[fid], dtype=np.float64).T @ np.asarray(F_by_field[fid], dtype=np.float64)) for fid in range(n_fields)]
+            FtY = [(np.asarray(F_by_field[fid], dtype=np.float64).T @ np.asarray(y_by_field[fid], dtype=np.float64)) for fid in range(n_fields)]
+
+            total_sum_F = np.sum(np.stack(sums_F, axis=0), axis=0)
+            total_sum_y = np.sum(np.stack(sums_y, axis=0), axis=0)
+            total_FtF = np.sum(np.stack(FtF, axis=0), axis=0)
+            total_FtY = np.sum(np.stack(FtY, axis=0), axis=0)
+
+            n_total = int(n_fields) * int(patches_per_field)
+            n_test = int(patches_per_field)
+            n_train = n_total - n_test
+
+            sum_F_tr = total_sum_F - sums_F[test_field]
+            sum_y_tr = total_sum_y - sums_y[test_field]
+            FtF_tr = total_FtF - FtF[test_field]
+            FtY_tr = total_FtY - FtY[test_field]
+
+            mu = sum_F_tr / float(n_train)
+            y_mu = sum_y_tr / float(n_train)
+            var = np.diag(FtF_tr) / float(n_train) - mu * mu
+            var = np.where(var > 1e-12, var, 1e-12)
+            sd = np.sqrt(var, dtype=np.float64)
+
+            FtF_center = FtF_tr - float(n_train) * np.outer(mu, mu)
+            FtY_center = FtY_tr - float(n_train) * (mu[:, None] * y_mu[None, :])
+
+            XtX = FtF_center / (sd[:, None] * sd[None, :])
+            Xty = FtY_center / sd[:, None]
+            w = solve_ridge(XtX, Xty)
+
+            Fte = np.asarray(F_by_field[test_field], dtype=np.float64)
+            Xte = (Fte - mu) / sd
+            return (Xte @ w + y_mu).astype(np.float64, copy=False)
+
+        # Results aggregated by alpha.
+        agg_rows: list[dict[str, str]] = []
+        per_alpha_sections: list[str] = []
+        alpha_metrics: list[dict[str, Any]] = []
+
+        for alpha in alpha_list:
+            rho01_by_field: list[np.ndarray] = []
+            rho0_by_field: list[np.ndarray] = []
+            field_fft0_by_field: list[np.ndarray] = []
+            field_fft_rho01_by_field: list[np.ndarray] = []
+            split_cache: list[BandSplit2D] = []
+
+            # Generate fields (deterministic per field_id; reuse seeds across alphas for comparability).
+            for field_id in range(n_fields):
+                rng_field = np.random.default_rng(seed + field_id)
+                rho01 = generate_1overf_field_2d((grid_size, grid_size), alpha=float(alpha), rng=rng_field)
+                split = band_split_poisson_2d(rho01, k0_frac=float(k0_frac))
+                rho01_by_field.append(rho01.astype(np.float64, copy=False))
+                rho0 = (rho01 - float(rho01.mean())).astype(np.float64, copy=False)
+                rho0_by_field.append(rho0)
+                field_fft0_by_field.append(np.fft.fftn(rho0))
+                field_fft_rho01_by_field.append(np.fft.fftn(rho01))
+                split_cache.append(split)
+
+            y_low_by_field = [sample_vec_at_centers(split_cache[fid].low.gx, split_cache[fid].low.gy, centers_by_field[fid]) for fid in range(n_fields)]
+            y_full_by_field = [
+                sample_vec_at_centers(split_cache[fid].full.gx, split_cache[fid].full.gy, centers_by_field[fid]) for fid in range(n_fields)
+            ]
+
+            # Fixed kernel channels.
+            y_low_ceiling_pred_by_field: list[np.ndarray] = []
+            y_high_pred_by_field: list[np.ndarray] = []
+            for fid in range(n_fields):
+                field_fft0 = field_fft0_by_field[fid]
+                gx_low_pred = np.fft.ifftn(field_fft0 * kfft_low_gx).real
+                gy_low_pred = np.fft.ifftn(field_fft0 * kfft_low_gy).real
+                y_low_ceiling_pred_by_field.append(sample_vec_at_centers(gx_low_pred, gy_low_pred, centers_by_field[fid]))
+
+                gx_high_pred = np.fft.ifftn(field_fft0 * kfft_high_gx).real
+                gy_high_pred = np.fft.ifftn(field_fft0 * kfft_high_gy).real
+                y_high_pred_by_field.append(sample_vec_at_centers(gx_high_pred, gy_high_pred, centers_by_field[fid]))
+
+            # Rect low-k features (FFT correlation with basis kernels).
+            d_rect = 2 * n_bins_rect
+            F_rect_by_field: list[np.ndarray] = [np.zeros((patches_per_field, d_rect), dtype=np.float32) for _ in range(n_fields)]
+            for b in range(n_bins_rect):
+                mask = (bin_idx == int(b)).astype(np.float64, copy=False)
+                kdx = (dxr * mask).astype(np.float64, copy=False)
+                kdy = (dyr * mask).astype(np.float64, copy=False)
+                kfft_dx = kernel_fft_centered(kdx, grid_size=grid_size)
+                kfft_dy = kernel_fft_centered(kdy, grid_size=grid_size)
+                for fid in range(n_fields):
+                    field_fft = field_fft_rho01_by_field[fid]
+                    cx, cy = centers_idx[fid]
+                    dx_grid = np.fft.ifftn(field_fft * kfft_dx).real
+                    dy_grid = np.fft.ifftn(field_fft * kfft_dy).real
+                    F_rect_by_field[fid][:, b] = dx_grid[cx, cy].astype(np.float32, copy=False)
+                    F_rect_by_field[fid][:, n_bins_rect + b] = dy_grid[cx, cy].astype(np.float32, copy=False)
+
+            # Rect-projection low-k predictions (deterministic).
+            y_low_rect_proj_by_field: list[np.ndarray] = []
+            for fid in range(n_fields):
+                F = F_rect_by_field[fid].astype(np.float64, copy=False)
+                y_pred = np.column_stack([F[:, :n_bins_rect] @ coef_rect_x, F[:, n_bins_rect:] @ coef_rect_y]).astype(np.float64, copy=False)
+                y_low_rect_proj_by_field.append(y_pred)
+
+            # LOFO evaluation.
+            p_ceiling: list[float] = []
+            r_ceiling: list[float] = []
+            p_proj: list[float] = []
+            r_proj: list[float] = []
+            p_rect: list[float] = []
+            r_rect: list[float] = []
+            dP_rect: list[float] = []
+            dR_rect: list[float] = []
+
+            for test_field in range(n_fields):
+                y_true = y_full_by_field[test_field]
+                y_high = y_high_pred_by_field[test_field]
+
+                y_pred_ceiling = y_low_ceiling_pred_by_field[test_field] + y_high
+                y_pred_proj = y_low_rect_proj_by_field[test_field] + y_high
+                y_low_rect = fit_predict_low_rect(F_rect_by_field, y_low_by_field, test_field=test_field)
+                y_pred_rect = y_low_rect + y_high
+
+                pc = pearson_mean_2d(y_true, y_pred_ceiling)
+                rc = relrmse_mean_2d(y_true, y_pred_ceiling)
+                pp = pearson_mean_2d(y_true, y_pred_proj)
+                rp = relrmse_mean_2d(y_true, y_pred_proj)
+                pr = pearson_mean_2d(y_true, y_pred_rect)
+                rr = relrmse_mean_2d(y_true, y_pred_rect)
+
+                p_ceiling.append(pc)
+                r_ceiling.append(rc)
+                p_proj.append(pp)
+                r_proj.append(rp)
+                p_rect.append(pr)
+                r_rect.append(rr)
+                dP_rect.append(pr - pc)
+                dR_rect.append(rr - rc)
+
+            pc_m = float(np.mean(p_ceiling))
+            pc_s = float(np.std(p_ceiling, ddof=1))
+            rc_m = float(np.mean(r_ceiling))
+            rc_s = float(np.std(r_ceiling, ddof=1))
+            pp_m = float(np.mean(p_proj))
+            pp_s = float(np.std(p_proj, ddof=1))
+            rp_m = float(np.mean(r_proj))
+            rp_s = float(np.std(r_proj, ddof=1))
+            pr_m = float(np.mean(p_rect))
+            pr_s = float(np.std(p_rect, ddof=1))
+            rr_m = float(np.mean(r_rect))
+            rr_s = float(np.std(r_rect, ddof=1))
+            dp_m = float(np.mean(dP_rect))
+            dp_s = float(np.std(dP_rect, ddof=1))
+            dr_m = float(np.mean(dR_rect))
+            dr_s = float(np.std(dR_rect, ddof=1))
+
+            row = {
+                "alpha": f"{float(alpha):.1f}",
+                "Pearson_ceiling": f"{pc_m:.4f} ± {pc_s:.4f}",
+                "relRMSE_ceiling": f"{rc_m:.4f} ± {rc_s:.4f}",
+                "Pearson_rect_proj": f"{pp_m:.4f} ± {pp_s:.4f}",
+                "relRMSE_rect_proj": f"{rp_m:.4f} ± {rp_s:.4f}",
+                "Pearson_rect_learn": f"{pr_m:.4f} ± {pr_s:.4f}",
+                "relRMSE_rect_learn": f"{rr_m:.4f} ± {rr_s:.4f}",
+                "ΔPearson(rect-ceiling)": f"{dp_m:+.4f} ± {dp_s:.4f}",
+                "ΔrelRMSE(rect-ceiling)": f"{dr_m:+.4f} ± {dr_s:.4f}",
+            }
+            agg_rows.append(row)
+            per_alpha_sections.append(
+                f"## alpha={float(alpha):.1f}\n\n"
+                + md_table(
+                    [row],
+                    [
+                        "alpha",
+                        "Pearson_ceiling",
+                        "relRMSE_ceiling",
+                        "Pearson_rect_proj",
+                        "relRMSE_rect_proj",
+                        "Pearson_rect_learn",
+                        "relRMSE_rect_learn",
+                        "ΔPearson(rect-ceiling)",
+                        "ΔrelRMSE(rect-ceiling)",
+                    ],
+                )
+                + "\n"
+            )
+            alpha_metrics.append(
+                {
+                    "alpha": float(alpha),
+                    "ceiling": {"pearson_mean": pc_m, "pearson_std": pc_s, "relRMSE_mean": rc_m, "relRMSE_std": rc_s},
+                    "rect_proj": {"pearson_mean": pp_m, "pearson_std": pp_s, "relRMSE_mean": rp_m, "relRMSE_std": rp_s},
+                    "rect_learn": {"pearson_mean": pr_m, "pearson_std": pr_s, "relRMSE_mean": rr_m, "relRMSE_std": rr_s},
+                    "delta_rect_vs_ceiling": {"dPearson_mean": dp_m, "dPearson_std": dp_s, "drelRMSE_mean": dr_m, "drelRMSE_std": dr_s},
+                }
+            )
+
+        summary_md = (
+            "# E41 — Alpha sweep (rect_learn vs ceiling)\n\n"
+            f"- run: `{paths.run_dir}`\n"
+            f"- grid_size={grid_size}, k0_frac={k0_frac}, n_fields={n_fields}, patches_per_field={patches_per_field}\n"
+            f"- w_big={w_big}, w_local={w_local}\n"
+            f"- rect: Nx={rect_nx},Ny={rect_ny}, ridge_alpha={ridge_alpha}\n"
+            f"- alpha_list={alpha_list}\n\n"
+            + "\n".join(per_alpha_sections)
+            + "\n## Aggregated table\n\n"
+            + md_table(
+                agg_rows,
+                [
+                    "alpha",
+                    "Pearson_ceiling",
+                    "relRMSE_ceiling",
+                    "Pearson_rect_proj",
+                    "relRMSE_rect_proj",
+                    "Pearson_rect_learn",
+                    "relRMSE_rect_learn",
+                    "ΔPearson(rect-ceiling)",
+                    "ΔrelRMSE(rect-ceiling)",
+                ],
+            )
+            + "\n"
+        )
+
+        (paths.run_dir / "summary_e41_alpha_sweep_rect_vs_ceiling.md").write_text(summary_md, encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "k0_frac": k0_frac,
+                "n_fields": n_fields,
+                "patches_per_field": patches_per_field,
+                "w_big": int(w_big),
+                "w_local": int(w_local),
+                "rect": {"nx": int(rect_nx), "ny": int(rect_ny)},
+                "ridge_alpha": ridge_alpha,
+                "alpha_list": alpha_list,
+                "alpha_metrics": alpha_metrics,
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
