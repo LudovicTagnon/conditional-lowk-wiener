@@ -30167,6 +30167,913 @@ def run_experiment(cfg: dict[str, Any]) -> RunPaths:
         )
         return paths
 
+    if experiment == "e63":
+        # E63 — Stabilize strong-tail magnitude in two-stage model.
+        import matplotlib.pyplot as plt
+        from scipy.stats import spearmanr
+        from sklearn.linear_model import HuberRegressor, LogisticRegression
+        from sklearn.metrics import (
+            accuracy_score,
+            balanced_accuracy_score,
+            roc_auc_score,
+            roc_curve,
+        )
+
+        grid_size = int(cfg.get("grid_size", 256))
+        n_train_fields = int(cfg.get("n_train_fields", 10))
+        n_test_fields = int(cfg.get("n_test_fields", 10))
+        patches_per_field = int(cfg.get("patches_per_field", 10_000))
+        w_big = _require_odd("w_big", int(cfg.get("w_big", 193)))
+        w_in_list = [int(x) for x in cfg.get("w_in_list", [33, 65, 97])]
+
+        alpha_list = [float(x) for x in cfg.get("alpha_list", [0.0, 1.0, 1.5, 2.0])]
+        k0_fracs = [float(x) for x in cfg.get("k0_fracs", [0.20, 0.10, 0.02])]
+        beta_list = [float(x) for x in cfg.get("beta_list", [0.0, 1.0, 2.0])]
+
+        bbks_ext_k0_list = [float(x) for x in cfg.get("bbks_ext_k0_list", [0.005, 0.01, 0.02, 0.05, 0.1])]
+        bbks_ext_beta_list = [float(x) for x in cfg.get("bbks_ext_beta_list", [0.0, 0.5, 1.0, 1.5, 2.0])]
+        bbks_ext_amp_scales = [float(x) for x in cfg.get("bbks_ext_amp_scales", [0.5, 1.0, 2.0, 4.0])]
+
+        bbks_k0 = float(cfg.get("bbks_k0", 0.15 * np.pi))
+        bbks_ns = float(cfg.get("bbks_ns", 1.0))
+        bbks_k_eps = float(cfg.get("bbks_k_eps", 1e-6))
+        bbks_lognormal_sigmas = [float(x) for x in cfg.get("bbks_lognormal_sigmas", [1.0])]
+        norm_mode = str(cfg.get("norm_mode", "delta"))
+        ridge_alpha = float(cfg.get("ridge_alpha", 1.0))
+        ridge_alpha_strong = float(cfg.get("ridge_alpha_strong", 10.0))
+        ridge_alpha_weak = float(cfg.get("ridge_alpha_weak", 1.0))
+        huber_eps = float(cfg.get("huber_eps", 1.35))
+        huber_alpha = float(cfg.get("huber_alpha", 1e-4))
+        clip_log_spec = float(cfg.get("clip_log_spec", 3.0))
+        q_cap = float(cfg.get("q_cap", 0.95))
+
+        lambda_rel = float(cfg.get("lambda_rel", 1e-6))
+        cg_max_iter = int(cfg.get("cg_max_iter", 200))
+        cg_tol = float(cfg.get("cg_tol", 1e-6))
+
+        if grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        if n_train_fields < 1 or n_test_fields < 1:
+            raise ValueError("n_train_fields and n_test_fields must be >= 1")
+        if patches_per_field <= 0:
+            raise ValueError("patches_per_field must be > 0")
+        if w_big > grid_size:
+            raise ValueError("w_big must be <= grid_size")
+        if any((w % 2) == 0 for w in w_in_list):
+            raise ValueError("w_in_list values must be odd")
+        if ridge_alpha <= 0 or ridge_alpha_strong <= 0 or ridge_alpha_weak <= 0:
+            raise ValueError("ridge_alpha values must be > 0")
+        if bbks_k0 <= 0:
+            raise ValueError("bbks_k0 must be > 0")
+        if bbks_k_eps <= 0:
+            raise ValueError("bbks_k_eps must be > 0")
+        if norm_mode not in {"delta", "zscore"}:
+            raise ValueError("norm_mode must be delta or zscore (no minmax_01)")
+        if lambda_rel <= 0:
+            raise ValueError("lambda_rel must be > 0")
+        if cg_max_iter <= 0:
+            raise ValueError("cg_max_iter must be > 0")
+        if cg_tol <= 0:
+            raise ValueError("cg_tol must be > 0")
+        if clip_log_spec <= 0:
+            raise ValueError("clip_log_spec must be > 0")
+        if not (0.0 < q_cap < 1.0):
+            raise ValueError("q_cap must be in (0,1)")
+
+        for k0 in k0_fracs:
+            if not (0.0 < float(k0) < 0.5):
+                raise ValueError("k0_fracs entries must be in (0,0.5)")
+
+        def safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64).reshape(-1)
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            am = a - float(a.mean())
+            bm = b - float(b.mean())
+            denom = float(np.linalg.norm(am) * np.linalg.norm(bm)) + 1e-12
+            return float((am @ bm) / denom)
+
+        def relrmse_1d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            e = y_pred - y_true
+            rmse = float(np.sqrt(np.mean(e * e)))
+            sd = float(np.std(y_true))
+            return rmse / (sd + 1e-12)
+
+        def pearson_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            px = safe_corr_1d(y_true[:, 0], y_pred[:, 0])
+            py = safe_corr_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (px + py)
+
+        def relrmse_mean_2d(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            rx = relrmse_1d(y_true[:, 0], y_pred[:, 0])
+            ry = relrmse_1d(y_true[:, 1], y_pred[:, 1])
+            return 0.5 * (rx + ry)
+
+        def kernel_fft_centered(kernel: np.ndarray, *, grid_size: int) -> np.ndarray:
+            kernel = np.asarray(kernel, dtype=np.float64)
+            if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+                raise ValueError(f"kernel must be square 2D, got {kernel.shape}")
+            w = int(kernel.shape[0])
+            if (w % 2) == 0:
+                raise ValueError(f"kernel size must be odd, got {w}")
+            if w > grid_size:
+                raise ValueError(f"kernel size {w} exceeds grid_size {grid_size}")
+            r = w // 2
+            kr = np.flip(kernel, axis=(0, 1))
+            full = np.zeros((grid_size, grid_size), dtype=np.float64)
+            c0 = grid_size // 2
+            full[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = kr
+            full0 = np.fft.ifftshift(full)
+            return np.fft.fftn(full0)
+
+        def cg_solve(
+            apply_A: Any,
+            b: np.ndarray,
+            *,
+            max_iter: int,
+            tol: float,
+        ) -> tuple[np.ndarray, int, float]:
+            b = np.asarray(b, dtype=np.float64).reshape(-1)
+            x = np.zeros_like(b)
+            r = b - apply_A(x)
+            p = r.copy()
+            rs0 = float(r @ r)
+            rs = rs0
+            bnorm = float(np.sqrt(float(b @ b))) + 1e-12
+            if bnorm == 0:
+                return x, 0, 0.0
+            for it in range(1, int(max_iter) + 1):
+                Ap = apply_A(p)
+                denom = float(p @ Ap) + 1e-18
+                alpha = rs / denom
+                x = x + alpha * p
+                r = r - alpha * Ap
+                rs_new = float(r @ r)
+                if float(np.sqrt(rs_new)) <= float(tol) * bnorm:
+                    return x, it, float(np.sqrt(rs_new)) / bnorm
+                beta = rs_new / (rs + 1e-18)
+                p = r + beta * p
+                rs = rs_new
+            return x, int(max_iter), float(np.sqrt(rs)) / bnorm
+
+        def sample_vec_at_centers(gx: np.ndarray, gy: np.ndarray, centers: np.ndarray) -> np.ndarray:
+            cx = centers[:, 0].astype(np.int64)
+            cy = centers[:, 1].astype(np.int64)
+            return np.column_stack([gx[cx, cy], gy[cx, cy]]).astype(np.float64, copy=False)
+
+        # Centers (shared).
+        r_big = w_big // 2
+        centers_by_train_field: list[np.ndarray] = []
+        for fid in range(n_train_fields):
+            rng_cent = np.random.default_rng(seed + 111_111 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_train_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        centers_by_test_field: list[np.ndarray] = []
+        for fid in range(n_test_fields):
+            rng_cent = np.random.default_rng(seed + 222_222 + 10_000 * int(w_big) + 1_000 * fid)
+            cx = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            cy = rng_cent.integers(r_big, grid_size - r_big, size=patches_per_field, dtype=np.int64)
+            centers_by_test_field.append(np.column_stack([cx, cy]).astype(np.int64, copy=False))
+
+        # Ceiling kernels for each k0_frac.
+        c0 = grid_size // 2
+        rho_delta = np.zeros((grid_size, grid_size), dtype=np.float64)
+        rho_delta[c0, c0] = 1.0
+        kfft_low_ceiling: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        kcorr_low: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for k0 in k0_fracs:
+            split_delta = band_split_poisson_2d(rho_delta, k0_frac=float(k0), validate_range=False)
+            g_patch_low_gx = split_delta.low.gx[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            g_patch_low_gy = split_delta.low.gy[c0 - r_big : c0 + r_big + 1, c0 - r_big : c0 + r_big + 1]
+            kcorr_low_gx = g_patch_low_gx[::-1, ::-1].astype(np.float64, copy=False)
+            kcorr_low_gy = g_patch_low_gy[::-1, ::-1].astype(np.float64, copy=False)
+            kcorr_low[float(k0)] = (kcorr_low_gx, kcorr_low_gy)
+            kfft_low_ceiling[float(k0)] = (
+                kernel_fft_centered(kcorr_low_gx, grid_size=grid_size),
+                kernel_fft_centered(kcorr_low_gy, grid_size=grid_size),
+            )
+
+        # Fourier-domain transfer H_low for each k0.
+        nx = grid_size
+        kx1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        ky1 = 2.0 * np.pi * np.fft.fftfreq(nx).astype(np.float64)
+        kx = kx1[:, None]
+        ky = ky1[None, :]
+        k2 = kx * kx + ky * ky
+        k = np.sqrt(k2, dtype=np.float64)
+        k_ny = np.pi
+        nonzero = k2 > 0
+        kx2 = np.broadcast_to(kx, (nx, nx))
+        ky2 = np.broadcast_to(ky, (nx, nx))
+        H_low_by_k0: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for k0 in k0_fracs:
+            mask_low = k <= float(k0) * k_ny
+            H_gx = np.zeros((nx, nx), dtype=np.complex128)
+            H_gy = np.zeros((nx, nx), dtype=np.complex128)
+            H_gx[nonzero] = -(1j * kx2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gy[nonzero] = -(1j * ky2[nonzero] / k2[nonzero]) * mask_low[nonzero]
+            H_gx[0, 0] = 0.0 + 0.0j
+            H_gy[0, 0] = 0.0 + 0.0j
+            H_low_by_k0[float(k0)] = (H_gx, H_gy)
+
+        def wiener_fit_weights_window(
+            rho0_train_fft: list[np.ndarray],
+            k0_frac: float,
+            H_pair: tuple[np.ndarray, np.ndarray],
+            r_win: int,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            acc = np.zeros((grid_size, grid_size), dtype=np.float64)
+            var_acc = 0.0
+            for R in rho0_train_fft:
+                acc += (R * np.conj(R)).real
+            for R in rho0_train_fft:
+                rho0 = np.fft.ifftn(R).real
+                var_acc += float(np.mean(rho0 * rho0))
+            S_rr = (acc / float(len(rho0_train_fft))) / float(grid_size * grid_size)
+            var0 = var_acc / float(len(rho0_train_fft))
+            lam = float(lambda_rel) * float(var0)
+
+            H_gx, H_gy = H_pair
+            r_rgx = np.fft.ifftn(S_rr * np.conj(H_gx)).real
+            r_rgy = np.fft.ifftn(S_rr * np.conj(H_gy)).real
+            r_rgx_c = np.fft.fftshift(r_rgx)
+            r_rgy_c = np.fft.fftshift(r_rgy)
+            sx = slice(c0 - r_win, c0 + r_win + 1)
+            sy = slice(c0 - r_win, c0 + r_win + 1)
+            b_gx = r_rgx_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+            b_gy = r_rgy_c[sx, sy].reshape(-1).astype(np.float64, copy=False)
+
+            V = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+            def apply_A(v: np.ndarray, *, r: int = r_win, lam: float = lam) -> np.ndarray:
+                vv = v.reshape(2 * r + 1, 2 * r + 1)
+                V.fill(0.0)
+                V[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1] = vv
+                prod = np.fft.ifftn(np.fft.fftn(V) * S_rr).real
+                out = prod[c0 - r : c0 + r + 1, c0 - r : c0 + r + 1]
+                out = out + lam * vv
+                return out.reshape(-1)
+
+            w_gx, _, _ = cg_solve(apply_A, b_gx, max_iter=cg_max_iter, tol=cg_tol)
+            w_gy, _, _ = cg_solve(apply_A, b_gy, max_iter=cg_max_iter, tol=cg_tol)
+            return w_gx.reshape(2 * r_win + 1, 2 * r_win + 1), w_gy.reshape(2 * r_win + 1, 2 * r_win + 1)
+
+        def eval_relrmse_low(
+            kfft_low_gx: np.ndarray,
+            kfft_low_gy: np.ndarray,
+            rho0_test_fft: list[np.ndarray],
+            y_low_test: list[np.ndarray],
+        ) -> float:
+            rels: list[float] = []
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_low_test[fid]
+                rels.append(relrmse_mean_2d(y_true, y_pred))
+            return float(np.mean(rels))
+
+        def generate_field(
+            *,
+            rng: np.random.Generator,
+            spectrum: str,
+            alpha: float,
+            beta: float,
+            lognormal: bool,
+            lognormal_sigma: float,
+            bbks_k0_val: float,
+            amp_scale: float,
+        ) -> np.ndarray:
+            if spectrum == "bbks_tilt_ext":
+                raw = generate_1overf_field_2d(
+                    (grid_size, grid_size),
+                    alpha=0.0,
+                    rng=rng,
+                    spectrum="bbks_tilt",
+                    bbks_k0=bbks_k0_val,
+                    bbks_ns=bbks_ns,
+                    bbks_beta=beta,
+                    bbks_k_eps=bbks_k_eps,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                    norm_mode="none",
+                )
+                raw = float(amp_scale) * raw
+                return normalize_rho(raw, mode=norm_mode)
+
+            return generate_1overf_field_2d(
+                (grid_size, grid_size),
+                alpha=alpha,
+                rng=rng,
+                spectrum=spectrum,
+                bbks_k0=bbks_k0_val,
+                bbks_ns=bbks_ns,
+                bbks_beta=beta,
+                bbks_k_eps=bbks_k_eps,
+                lognormal=lognormal,
+                lognormal_sigma=lognormal_sigma,
+                norm_mode=norm_mode,
+            )
+
+        def run_condition(
+            *,
+            family: str,
+            scenario: str,
+            spectrum: str,
+            alpha: float,
+            beta: float,
+            k0_frac: float,
+            bbks_k0_val: float,
+            amp_scale: float,
+            lognormal: bool,
+            lognormal_sigma: float,
+        ) -> dict[str, Any]:
+            rho0_train_fft: list[np.ndarray] = []
+            y_res_train: list[np.ndarray] = []
+
+            rho0_test_fft: list[np.ndarray] = []
+            y_res_test_by_field: list[np.ndarray] = []
+            y_low_test: list[np.ndarray] = []
+
+            resid_var_frac: list[float] = []
+            spec_ratio: list[float] = []
+
+            kfft_low_gx, kfft_low_gy = kfft_low_ceiling[float(k0_frac)]
+            H_low = H_low_by_k0[float(k0_frac)]
+            H_res = (H_low[0] - kfft_low_gx, H_low[1] - kfft_low_gy)
+            mask_low = k <= float(k0_frac) * np.pi
+            mask_high = ~mask_low
+
+            for fid in range(n_train_fields):
+                rng_field = np.random.default_rng(seed + fid)
+                rho = generate_field(
+                    rng=rng_field,
+                    spectrum=spectrum,
+                    alpha=alpha,
+                    beta=beta,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                    bbks_k0_val=bbks_k0_val,
+                    amp_scale=amp_scale,
+                )
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=False)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_train_fft.append(rho0_fft)
+
+                pow_spec = (rho0_fft * np.conj(rho0_fft)).real
+                e_low = float(pow_spec[mask_low].sum())
+                e_high = float(pow_spec[mask_high].sum())
+                spec_ratio.append(e_low / (e_high + 1e-12))
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                resid_gx = split.low.gx - gx_trunc
+                resid_gy = split.low.gy - gy_trunc
+
+                centers = centers_by_train_field[fid]
+                y_res_train.append(sample_vec_at_centers(resid_gx, resid_gy, centers))
+
+            for fid in range(n_test_fields):
+                rng_field = np.random.default_rng(seed + n_train_fields + fid)
+                rho = generate_field(
+                    rng=rng_field,
+                    spectrum=spectrum,
+                    alpha=alpha,
+                    beta=beta,
+                    lognormal=lognormal,
+                    lognormal_sigma=lognormal_sigma,
+                    bbks_k0_val=bbks_k0_val,
+                    amp_scale=amp_scale,
+                )
+                split = band_split_poisson_2d(rho, k0_frac=float(k0_frac), validate_range=False)
+                rho0 = rho - float(rho.mean())
+                rho0_fft = np.fft.fftn(rho0)
+                rho0_test_fft.append(rho0_fft)
+
+                gx_trunc = np.fft.ifftn(rho0_fft * kfft_low_gx).real
+                gy_trunc = np.fft.ifftn(rho0_fft * kfft_low_gy).real
+                resid_gx = split.low.gx - gx_trunc
+                resid_gy = split.low.gy - gy_trunc
+
+                frac_gx = float(np.var(resid_gx) / (np.var(split.low.gx) + 1e-12))
+                frac_gy = float(np.var(resid_gy) / (np.var(split.low.gy) + 1e-12))
+                resid_var_frac.append(0.5 * (frac_gx + frac_gy))
+
+                centers = centers_by_test_field[fid]
+                y_res_test_by_field.append(sample_vec_at_centers(resid_gx, resid_gy, centers))
+                y_low_test.append(sample_vec_at_centers(split.low.gx, split.low.gy, centers))
+
+            # Inside->residual predictor via Wiener weights (train only) for w_big.
+            w_res_gx, w_res_gy = wiener_fit_weights_window(rho0_train_fft, k0_frac, H_res, r_big)
+            kfft_res_gx = kernel_fft_centered(w_res_gx, grid_size=grid_size)
+            kfft_res_gy = kernel_fft_centered(w_res_gy, grid_size=grid_size)
+            resid_p: list[float] = []
+            resid_r: list[float] = []
+            mse_pred = np.zeros(2, dtype=np.float64)
+            mse_base = np.zeros(2, dtype=np.float64)
+            y_res_train_all = np.concatenate(y_res_train, axis=0)
+            baseline = y_res_train_all.mean(axis=0)
+
+            for fid in range(n_test_fields):
+                gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_res_gx).real
+                gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_res_gy).real
+                y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                y_true = y_res_test_by_field[fid]
+                resid_p.append(pearson_mean_2d(y_true, y_pred))
+                resid_r.append(relrmse_mean_2d(y_true, y_pred))
+                mse_pred += np.mean((y_true - y_pred) ** 2, axis=0)
+                mse_base += np.mean((y_true - baseline) ** 2, axis=0)
+
+            mse_pred /= float(n_test_fields)
+            mse_base /= float(n_test_fields)
+            r2 = 0.5 * ((1.0 - mse_pred[0] / (mse_base[0] + 1e-12)) + (1.0 - mse_pred[1] / (mse_base[1] + 1e-12)))
+
+            # Multi-scale R2 (includes w_big).
+            r2_scales: dict[int, float] = {w_big: float(r2)}
+            for w_in in w_in_list:
+                r_in = w_in // 2
+                w_res_gx_s, w_res_gy_s = wiener_fit_weights_window(rho0_train_fft, k0_frac, H_res, r_in)
+                kfft_res_gx_s = kernel_fft_centered(w_res_gx_s, grid_size=grid_size)
+                kfft_res_gy_s = kernel_fft_centered(w_res_gy_s, grid_size=grid_size)
+                mse_pred_s = np.zeros(2, dtype=np.float64)
+                mse_base_s = np.zeros(2, dtype=np.float64)
+                for fid in range(n_test_fields):
+                    gx_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_res_gx_s).real
+                    gy_pred = np.fft.ifftn(rho0_test_fft[fid] * kfft_res_gy_s).real
+                    y_pred = sample_vec_at_centers(gx_pred, gy_pred, centers_by_test_field[fid])
+                    y_true = y_res_test_by_field[fid]
+                    mse_pred_s += np.mean((y_true - y_pred) ** 2, axis=0)
+                    mse_base_s += np.mean((y_true - baseline) ** 2, axis=0)
+                mse_pred_s /= float(n_test_fields)
+                mse_base_s /= float(n_test_fields)
+                r2_s = 0.5 * (
+                    (1.0 - mse_pred_s[0] / (mse_base_s[0] + 1e-12)) + (1.0 - mse_pred_s[1] / (mse_base_s[1] + 1e-12))
+                )
+                r2_scales[w_in] = float(r2_s)
+
+            # Wiener vs ceiling gain on low-k target.
+            w_gx, w_gy = wiener_fit_weights_window(rho0_train_fft, k0_frac, H_low, r_big)
+            kfft_w_gx = kernel_fft_centered(w_gx, grid_size=grid_size)
+            kfft_w_gy = kernel_fft_centered(w_gy, grid_size=grid_size)
+            r_ceiling = eval_relrmse_low(kfft_low_gx, kfft_low_gy, rho0_test_fft, y_low_test)
+            r_wiener = eval_relrmse_low(kfft_w_gx, kfft_w_gy, rho0_test_fft, y_low_test)
+            p_ceiling = []
+            p_wiener = []
+            for fid in range(n_test_fields):
+                gx_c = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gx).real
+                gy_c = np.fft.ifftn(rho0_test_fft[fid] * kfft_low_gy).real
+                gx_w = np.fft.ifftn(rho0_test_fft[fid] * kfft_w_gx).real
+                gy_w = np.fft.ifftn(rho0_test_fft[fid] * kfft_w_gy).real
+                y_true = y_low_test[fid]
+                p_ceiling.append(pearson_mean_2d(y_true, sample_vec_at_centers(gx_c, gy_c, centers_by_test_field[fid])))
+                p_wiener.append(pearson_mean_2d(y_true, sample_vec_at_centers(gx_w, gy_w, centers_by_test_field[fid])))
+
+            # Weight deviation metrics.
+            kcorr_gx, kcorr_gy = kcorr_low[float(k0_frac)]
+            def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+                num = float(np.linalg.norm(a - b))
+                den = float(np.linalg.norm(b)) + 1e-12
+                return num / den
+            corr_wx = safe_corr_1d(w_gx, kcorr_gx)
+            corr_wy = safe_corr_1d(w_gy, kcorr_gy)
+            rel_wx = rel_l2(w_gx, kcorr_gx)
+            rel_wy = rel_l2(w_gy, kcorr_gy)
+            corr_wk = 0.5 * (corr_wx + corr_wy)
+            rel_wk = 0.5 * (rel_wx + rel_wy)
+
+            return {
+                "family": family,
+                "scenario": scenario,
+                "alpha": float(alpha),
+                "beta": float(beta),
+                "k0_frac": float(k0_frac),
+                "bbks_k0": float(bbks_k0_val),
+                "amp_scale": float(amp_scale),
+                "lognormal": bool(lognormal),
+                "lognormal_sigma": float(lognormal_sigma),
+                "resid_var_frac": float(np.mean(resid_var_frac)),
+                "pearson_resid_pred": float(np.mean(resid_p)),
+                "r2_resid_pred": float(r2),
+                "relrmse_resid_pred": float(np.mean(resid_r)),
+                "r2_scales": {int(k): float(v) for k, v in r2_scales.items()},
+                "delta_relrmse": float(r_wiener - r_ceiling),
+                "delta_pearson": float(np.mean(p_wiener) - np.mean(p_ceiling)),
+                "corr_wk": float(corr_wk),
+                "relL2_wk": float(rel_wk),
+                "spec_ratio": float(np.mean(spec_ratio)),
+            }
+
+        results: list[dict[str, Any]] = []
+
+        # Alpha family (powerlaw).
+        for a in alpha_list:
+            for k0 in k0_fracs:
+                results.append(
+                    run_condition(
+                        family="alpha",
+                        scenario="powerlaw",
+                        spectrum="powerlaw",
+                        alpha=float(a),
+                        beta=0.0,
+                        k0_frac=float(k0),
+                        bbks_k0_val=bbks_k0,
+                        amp_scale=1.0,
+                        lognormal=False,
+                        lognormal_sigma=1.0,
+                    )
+                )
+
+        # BBKS base + lognormal for reference.
+        for k0 in k0_fracs:
+            results.append(
+                run_condition(
+                    family="bbks",
+                    scenario="bbks",
+                    spectrum="bbks",
+                    alpha=0.0,
+                    beta=0.0,
+                    k0_frac=float(k0),
+                    bbks_k0_val=bbks_k0,
+                    amp_scale=1.0,
+                    lognormal=False,
+                    lognormal_sigma=1.0,
+                )
+            )
+        for sig in bbks_lognormal_sigmas:
+            for k0 in k0_fracs:
+                results.append(
+                    run_condition(
+                        family="bbks",
+                        scenario="bbks_lognormal",
+                        spectrum="bbks",
+                        alpha=0.0,
+                        beta=0.0,
+                        k0_frac=float(k0),
+                        bbks_k0_val=bbks_k0,
+                        amp_scale=1.0,
+                        lognormal=True,
+                        lognormal_sigma=float(sig),
+                    )
+                )
+
+        # BBKS-tilt family.
+        for beta in beta_list:
+            for k0 in k0_fracs:
+                results.append(
+                    run_condition(
+                        family="bbks_tilt",
+                        scenario="bbks_tilt",
+                        spectrum="bbks_tilt",
+                        alpha=0.0,
+                        beta=float(beta),
+                        k0_frac=float(k0),
+                        bbks_k0_val=bbks_k0,
+                        amp_scale=1.0,
+                        lognormal=False,
+                        lognormal_sigma=1.0,
+                    )
+                )
+
+        # BBKS-extended manifold.
+        for k0b in bbks_ext_k0_list:
+            for beta in bbks_ext_beta_list:
+                for amp in bbks_ext_amp_scales:
+                    for k0 in k0_fracs:
+                        results.append(
+                            run_condition(
+                                family="bbks_ext",
+                                scenario="bbks_ext",
+                                spectrum="bbks_tilt_ext",
+                                alpha=0.0,
+                                beta=float(beta),
+                                k0_frac=float(k0),
+                                bbks_k0_val=float(k0b),
+                                amp_scale=float(amp),
+                                lognormal=False,
+                                lognormal_sigma=1.0,
+                            )
+                        )
+
+        # Predictor features.
+        for r in results:
+            gain = -float(r["delta_relrmse"])
+            r["gain"] = gain
+            r["predR2"] = float(r["resid_var_frac"]) * max(0.0, float(r["r2_resid_pred"]))
+            r["predP"] = float(r["resid_var_frac"]) * max(0.0, float(r["pearson_resid_pred"]))
+            r2_max = max([float(v) for v in r["r2_scales"].values()])
+            r["predR2_ms"] = float(r["resid_var_frac"]) * max(0.0, r2_max)
+            r["log_spec"] = float(np.log10(float(r["spec_ratio"]) + 1e-12))
+            r["clip_log_spec"] = float(np.clip(r["log_spec"], -clip_log_spec, clip_log_spec))
+
+        features = ["predR2", "predP", "predR2_ms", "relL2_wk", "corr_wk", "clip_log_spec"]
+
+        def zscore(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            mu = X.mean(axis=0)
+            sd = X.std(axis=0)
+            sd[sd == 0] = 1.0
+            return (X - mu) / sd, mu, sd
+
+        def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            y_true = np.asarray(y_true, dtype=np.float64)
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+            ss_res = float(np.sum((y_true - y_pred) ** 2))
+            ss_tot = float(np.sum((y_true - float(np.mean(y_true))) ** 2)) + 1e-12
+            return 1.0 - ss_res / ss_tot
+
+        def mae_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+            return float(np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred))))
+
+        def calib_curve(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 10) -> tuple[np.ndarray, np.ndarray, float]:
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            idx = np.digitize(probs, bins) - 1
+            acc = []
+            conf = []
+            ece = 0.0
+            n = len(y_true)
+            for b in range(n_bins):
+                mask = idx == b
+                if not np.any(mask):
+                    continue
+                p_mean = float(np.mean(probs[mask]))
+                y_mean = float(np.mean(y_true[mask]))
+                acc.append(y_mean)
+                conf.append(p_mean)
+                ece += float(np.abs(p_mean - y_mean)) * float(np.sum(mask)) / float(n)
+            return np.array(conf), np.array(acc), float(ece)
+
+        def holdout_split(hold_family: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            train = [r for r in results if r["family"] in {"alpha", "bbks_tilt", "bbks_ext"} and r["family"] != hold_family]
+            test = [r for r in results if r["family"] == hold_family]
+            return train, test
+
+        def fit_logistic(train: list[dict[str, Any]], keys: list[str], y_label: np.ndarray) -> tuple[np.ndarray, np.ndarray, LogisticRegression]:
+            Xtr = np.column_stack([np.array([r[k] for r in train], dtype=np.float64) for k in keys])
+            Xtr_n, mu, sd = zscore(Xtr)
+            clf = LogisticRegression(penalty="l2", C=1.0, max_iter=1000)
+            clf.fit(Xtr_n, y_label)
+            return mu, sd, clf
+
+        def predict_logistic(test: list[dict[str, Any]], keys: list[str], mu: np.ndarray, sd: np.ndarray, clf: LogisticRegression) -> np.ndarray:
+            Xte = np.column_stack([np.array([r[k] for r in test], dtype=np.float64) for k in keys])
+            Xte_n = (Xte - mu) / sd
+            return clf.predict_proba(Xte_n)[:, 1]
+
+        def fit_regressor(train: list[dict[str, Any]], keys: list[str], y: np.ndarray, *, method: str, alpha: float) -> tuple[np.ndarray, np.ndarray, Any]:
+            Xtr = np.column_stack([np.array([r[k] for r in train], dtype=np.float64) for k in keys])
+            Xtr_n, mu, sd = zscore(Xtr)
+            if method == "ridge":
+                XT = Xtr_n.T
+                A = XT @ Xtr_n + float(alpha) * np.eye(Xtr_n.shape[1])
+                coef = np.linalg.solve(A, XT @ y)
+                return mu, sd, coef
+            if method == "huber":
+                model = HuberRegressor(epsilon=huber_eps, alpha=huber_alpha, fit_intercept=True)
+                model.fit(Xtr_n, y)
+                return mu, sd, model
+            raise ValueError(f"unknown method: {method}")
+
+        def predict_regressor(test: list[dict[str, Any]], keys: list[str], mu: np.ndarray, sd: np.ndarray, model: Any, *, method: str) -> np.ndarray:
+            Xte = np.column_stack([np.array([r[k] for r in test], dtype=np.float64) for k in keys])
+            Xte_n = (Xte - mu) / sd
+            if method == "ridge":
+                return Xte_n @ model
+            if method == "huber":
+                return model.predict(Xte_n)
+            raise ValueError(f"unknown method: {method}")
+
+        variants = {
+            "base": {"mode": "huber", "cap": False, "weak": False},
+            "cap": {"mode": "huber", "cap": True, "weak": False},
+            "shrink": {"mode": "ridge", "cap": False, "weak": False},
+            "weak": {"mode": "huber", "cap": False, "weak": True},
+        }
+
+        holdout_metrics: dict[str, dict[str, Any]] = {}
+        calib_data: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        alpha_scatter: dict[str, list[tuple[float, float, int]]] = {}
+        for hold in ["bbks_ext", "alpha", "bbks_tilt"]:
+            train, test = holdout_split(hold)
+            if len(train) < 2 or len(test) < 2:
+                continue
+            y_train = np.array([r["gain"] for r in train], dtype=np.float64)
+            y_test = np.array([r["gain"] for r in test], dtype=np.float64)
+            y_strong_train = (y_train > 0.03).astype(np.int64)
+            y_strong_test = (y_test > 0.03).astype(np.int64)
+
+            mu_c, sd_c, clf = fit_logistic(train, features, y_strong_train)
+            p_strong = predict_logistic(test, features, mu_c, sd_c, clf)
+            auc = float("nan")
+            if len(np.unique(y_strong_test)) > 1:
+                auc = float(roc_auc_score(y_strong_test, p_strong))
+            brier = float(np.mean((p_strong - y_strong_test) ** 2))
+            conf, acc, ece = calib_curve(p_strong, y_strong_test, n_bins=10)
+            calib_data[hold] = (conf, acc)
+
+            strong_train = [r for r in train if r["gain"] > 0.03]
+            weak_train = [r for r in train if r["gain"] <= 0.03]
+            y_strong_vals = np.array([r["gain"] for r in strong_train], dtype=np.float64)
+            q_cap_val = float(np.quantile(y_strong_vals, q_cap)) if len(y_strong_vals) > 0 else 0.0
+
+            variant_out: dict[str, dict[str, float]] = {}
+            strong_out: dict[str, dict[str, float]] = {}
+
+            for name, cfgv in variants.items():
+                if cfgv["mode"] == "ridge":
+                    mu_s, sd_s, reg_s = fit_regressor(strong_train, features, y_strong_vals, method="ridge", alpha=ridge_alpha_strong)
+                    gain_hat_strong = predict_regressor(test, features, mu_s, sd_s, reg_s, method="ridge")
+                else:
+                    mu_s, sd_s, reg_s = fit_regressor(strong_train, features, y_strong_vals, method="huber", alpha=ridge_alpha)
+                    gain_hat_strong = predict_regressor(test, features, mu_s, sd_s, reg_s, method="huber")
+
+                if cfgv["cap"]:
+                    gain_hat_strong = np.clip(gain_hat_strong, 0.0, q_cap_val)
+
+                if cfgv["weak"] and len(weak_train) >= 2:
+                    y_weak_vals = np.array([r["gain"] for r in weak_train], dtype=np.float64)
+                    mu_w, sd_w, reg_w = fit_regressor(weak_train, features, y_weak_vals, method="ridge", alpha=ridge_alpha_weak)
+                    gain_hat_weak = predict_regressor(test, features, mu_w, sd_w, reg_w, method="ridge")
+                else:
+                    gain_hat_weak = np.zeros_like(y_test)
+
+                gain_pred = p_strong * gain_hat_strong + (1.0 - p_strong) * gain_hat_weak
+
+                def eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+                    sp = float(spearmanr(y_true, y_pred).correlation) if len(y_true) > 1 else float("nan")
+                    return {
+                        "r2": r2_score(y_true, y_pred),
+                        "mae": mae_score(y_true, y_pred),
+                        "spearman": sp,
+                    }
+
+                variant_out[name] = eval_metrics(y_test, gain_pred)
+
+                if np.any(y_strong_test == 1):
+                    idx = y_strong_test == 1
+                    strong_out[name] = eval_metrics(y_test[idx], gain_pred[idx])
+                else:
+                    strong_out[name] = {"r2": float("nan"), "mae": float("nan"), "spearman": float("nan")}
+
+                if hold == "alpha":
+                    alpha_scatter.setdefault(name, [])
+                    for yt, yp, ys in zip(y_test, gain_pred, y_strong_test):
+                        alpha_scatter[name].append((float(yt), float(yp), int(ys)))
+
+            holdout_metrics[hold] = {
+                "cls": {"auc": auc, "brier": brier, "ece": ece},
+                "acc": float(accuracy_score(y_strong_test, (p_strong >= 0.5).astype(np.int64))),
+                "bacc": float(balanced_accuracy_score(y_strong_test, (p_strong >= 0.5).astype(np.int64))),
+                "global": variant_out,
+                "strong": strong_out,
+                "q_cap": q_cap_val,
+            }
+
+            if len(np.unique(y_strong_test)) > 1:
+                fpr, tpr, _ = roc_curve(y_strong_test, p_strong)
+                fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+                ax.plot(fpr, tpr, label=f"{hold} (AUC={auc:.3f})")
+                ax.plot([0, 1], [0, 1], "k--", alpha=0.5)
+                ax.set_xlabel("FPR")
+                ax.set_ylabel("TPR")
+                ax.set_title(f"ROC y_strong holdout {hold}")
+                ax.legend()
+                fig.tight_layout()
+                fig.savefig(paths.run_dir / f"roc_y_strong_{hold}.png", dpi=150)
+                plt.close(fig)
+
+        # Calibration plot.
+        fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+        for hold, (conf, acc) in calib_data.items():
+            ax.plot(conf, acc, marker="o", label=hold)
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.5)
+        ax.set_xlabel("Mean predicted p_strong")
+        ax.set_ylabel("Empirical freq")
+        ax.set_title("E63 calibration (y_strong)")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(paths.run_dir / "calibration_curve.png", dpi=150)
+        plt.close(fig)
+
+        # Scatter plots for alpha holdout.
+        fig, axes = plt.subplots(2, 2, figsize=(8, 6), sharex=True, sharey=True)
+        axes = axes.reshape(-1)
+        for ax, name in zip(axes, ["base", "cap", "shrink", "weak"]):
+            pts = alpha_scatter.get(name, [])
+            if not pts:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            colors = ["tab:red" if p[2] == 1 else "tab:blue" for p in pts]
+            ax.scatter(xs, ys, c=colors, alpha=0.7, s=25)
+            ax.set_title(name)
+            ax.axline((0, 0), slope=1.0, color="k", linestyle="--", alpha=0.4)
+        fig.suptitle("E63 alpha holdout: gain_true vs gain_pred")
+        fig.tight_layout()
+        fig.savefig(paths.run_dir / "alpha_gain_scatter_variants.png", dpi=150)
+        plt.close(fig)
+
+        # Barplot R2/MAE for alpha holdout.
+        if "alpha" in holdout_metrics:
+            fig, ax = plt.subplots(1, 1, figsize=(7, 3))
+            labels = []
+            vals = []
+            for name in ["base", "cap", "shrink", "weak"]:
+                m = holdout_metrics["alpha"]["global"][name]
+                labels.extend([f"{name}:R2", f"{name}:MAE"])
+                vals.extend([m["r2"], m["mae"]])
+            ax.bar(np.arange(len(vals)), vals)
+            ax.set_xticks(np.arange(len(vals)))
+            ax.set_xticklabels(labels, rotation=45, ha="right")
+            ax.set_ylabel("metric value")
+            ax.set_title("E63 alpha holdout (global)")
+            fig.tight_layout()
+            fig.savefig(paths.run_dir / "alpha_holdout_R2_MAE.png", dpi=150)
+            plt.close(fig)
+
+        summary_lines = [
+            "# E63 — Two-stage tail stabilization\n",
+            f"- run: `{paths.run_dir}`",
+            f"- grid_size={grid_size}, w_big={w_big}, patches_per_field={patches_per_field}",
+            f"- n_train_fields={n_train_fields}, n_test_fields={n_test_fields}",
+            f"- k0_fracs={k0_fracs}",
+            f"- w_in_list={w_in_list}",
+            f"- q_cap={q_cap}, ridge_alpha_strong={ridge_alpha_strong}, ridge_alpha_weak={ridge_alpha_weak}",
+            "",
+            "## Holdout classification (y_strong)",
+        ]
+        for hold in ["bbks_ext", "alpha", "bbks_tilt"]:
+            if hold not in holdout_metrics:
+                continue
+            m = holdout_metrics[hold]["cls"]
+            summary_lines.append(
+                f"- {hold}: AUROC={m['auc']:.3f}, Brier={m['brier']:.3f}, ECE={m['ece']:.3f}, "
+                f"acc={holdout_metrics[hold]['acc']:.3f}, bacc={holdout_metrics[hold]['bacc']:.3f}"
+            )
+        summary_lines.append("\n## Holdout magnitude (global)")
+        for hold in ["bbks_ext", "alpha", "bbks_tilt"]:
+            if hold not in holdout_metrics:
+                continue
+            m = holdout_metrics[hold]["global"]
+            summary_lines.append(
+                f"- {hold}: "
+                + ", ".join([f"{name} R2={m[name]['r2']:.3f}, MAE={m[name]['mae']:.3f}" for name in variants])
+            )
+        summary_lines.append("\n## Holdout magnitude (strong subset)")
+        for hold in ["bbks_ext", "alpha", "bbks_tilt"]:
+            if hold not in holdout_metrics:
+                continue
+            m = holdout_metrics[hold]["strong"]
+            summary_lines.append(
+                f"- {hold}: "
+                + ", ".join([f"{name} R2={m[name]['r2']:.3f}, MAE={m[name]['mae']:.3f}" for name in variants])
+            )
+
+        (paths.run_dir / "summary_e63_two_stage_tail_stabilization.md").write_text("\n".join(summary_lines), encoding="utf-8")
+        write_json(
+            paths.metrics_json,
+            {
+                "experiment": experiment,
+                "exp_name": exp_name,
+                "seed": seed,
+                "grid_size": grid_size,
+                "w_big": int(w_big),
+                "w_in_list": w_in_list,
+                "n_train_fields": n_train_fields,
+                "n_test_fields": n_test_fields,
+                "patches_per_field": patches_per_field,
+                "alpha_list": alpha_list,
+                "beta_list": beta_list,
+                "k0_fracs": k0_fracs,
+                "bbks_ext_k0_list": bbks_ext_k0_list,
+                "bbks_ext_beta_list": bbks_ext_beta_list,
+                "bbks_ext_amp_scales": bbks_ext_amp_scales,
+                "bbks_k0": float(bbks_k0),
+                "bbks_ns": float(bbks_ns),
+                "bbks_k_eps": float(bbks_k_eps),
+                "bbks_lognormal_sigmas": bbks_lognormal_sigmas,
+                "norm_mode": norm_mode,
+                "ridge_alpha": float(ridge_alpha),
+                "ridge_alpha_strong": float(ridge_alpha_strong),
+                "ridge_alpha_weak": float(ridge_alpha_weak),
+                "clip_log_spec": clip_log_spec,
+                "q_cap": q_cap,
+                "holdout_metrics": holdout_metrics,
+                "plots": {
+                    "calibration_curve": str(paths.run_dir / "calibration_curve.png"),
+                    "alpha_scatter": str(paths.run_dir / "alpha_gain_scatter_variants.png"),
+                    "alpha_holdout_bar": str(paths.run_dir / "alpha_holdout_R2_MAE.png"),
+                },
+            },
+        )
+        return paths
+
     if experiment == "e3":
         sigma_path = Path(str(cfg.get("sigma_path", "")))
         g_path = Path(str(cfg.get("g_path", "")))
