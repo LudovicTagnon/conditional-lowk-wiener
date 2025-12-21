@@ -78,6 +78,14 @@ if [[ -s "$schematic_svg" ]]; then
 fi
 if [[ -s "$submission_dir/draft.pdf" ]]; then
   print_file "$submission_dir/draft.pdf"
+else
+  html_path="outputs/paper/draft.html"
+  if [[ -s "$html_path" ]]; then
+    print_file "$html_path"
+  else
+    echo "missing: $html_path"
+    exit 1
+  fi
 fi
 if [[ -s "$submission_dir/SUBMISSION_METADATA.md" ]]; then
   print_file "$submission_dir/SUBMISSION_METADATA.md"

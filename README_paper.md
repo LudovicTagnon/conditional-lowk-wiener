@@ -33,8 +33,10 @@ Run:
 scripts/build_pdf.sh
 ```
 
-This attempts to generate `outputs/paper/draft.pdf` via pandoc or wkhtmltopdf (with an HTML fallback if needed).
+This attempts to generate `outputs/paper/draft.pdf` using pandoc + pdflatex with a Unicode sanitizer step.
+If pdflatex is not available or sanitization fails, the script falls back to HTML (`outputs/paper/draft.html`).
 If a PDF is created, it is also copied into `outputs/paper/submission/`.
+No new experiments are run during PDF generation.
 
 ## Pre-submission audit
 

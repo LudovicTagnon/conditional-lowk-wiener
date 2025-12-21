@@ -7,6 +7,7 @@ cd "$root_dir"
 md="outputs/paper/draft.md"
 pdf="outputs/paper/draft.pdf"
 html="outputs/paper/draft.html"
+sanitized="outputs/paper/draft_sanitized.md"
 submission_dir="outputs/paper/submission"
 
 if [[ ! -f "$md" ]]; then
@@ -16,9 +17,13 @@ fi
 
 generated=0
 
-if command -v pandoc >/dev/null 2>&1; then
-  if pandoc "$md" -o "$pdf"; then
-    generated=1
+if command -v pandoc >/dev/null 2>&1 && command -v pdflatex >/dev/null 2>&1; then
+  if python3 scripts/sanitize_md_for_latex.py "$md" "$sanitized"; then
+    if pandoc --from=markdown+raw_tex "$sanitized" --pdf-engine=pdflatex -o "$pdf"; then
+      generated=1
+    fi
+  else
+    echo "sanitize failed; skipping pdflatex path"
   fi
 fi
 
