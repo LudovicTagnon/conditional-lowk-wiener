@@ -48,6 +48,9 @@ Suggested categories: signal processing / statistical inference / computational 
 Abstract:
 {abstract}
 
+Acknowledgment:
+Assistance from OpenAI ChatGPT (GPT-5.2 Thinking) and ChatGPT Codex (OpenAI) supported experimental orchestration, writing, and revision.
+
 Plain-language summary:
 We estimate a gravitational field from density using a physics-derived kernel baseline and a conditional (Wiener) predictor
 that exploits correlations. We test out-of-sample generalization and show a consistent relRMSE gain over the baseline,

@@ -216,6 +216,12 @@ def main() -> None:
         "Strong-subset metrics are only considered when n_strong>=30 to avoid unstable estimates."
     )
 
+    acknowledgments = (
+        "Acknowledgment:\n\n"
+        "Assistance from OpenAI ChatGPT (GPT-5.2 Thinking) and ChatGPT Codex (OpenAI) supported experimental "
+        "orchestration, writing, and revision."
+    )
+
     limits = (
         "Limitations & scope:\n\n"
         "All estimators are linear and tied to FFT/Poisson physics; nonlinear or nonstationary effects are not "
@@ -241,6 +247,7 @@ def main() -> None:
     draft = "\n\n".join(
         [
             "# Conditional low-k prediction beyond a truncated-kernel ceiling",
+            "Authors: Ludovic Tagnon",
             "## Abstract",
             abstract,
             "## 1 Introduction",
@@ -255,6 +262,8 @@ def main() -> None:
             related,
             "## 5 Regime→magnitude model",
             regime,
+            "## Acknowledgment",
+            acknowledgments,
             "## 6 Limitations & scope",
             limits,
             "## 7 Reproducibility & Compute",

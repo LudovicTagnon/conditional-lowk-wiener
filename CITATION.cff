@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it."
+message: "If you use this software, please cite it. Assistance from OpenAI ChatGPT (GPT-5.2 Thinking) and ChatGPT Codex (OpenAI) supported this work."
 type: software
 title: "Mini-lab topo gravity"
 version: "0.1.0"
