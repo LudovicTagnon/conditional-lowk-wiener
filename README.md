@@ -10,6 +10,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Optionnel (versions figées):
+
+```bash
+python3 -m pip install -r requirements.lock
+```
+
 ## Lancer une expérience (commande unique)
 
 ```bash
@@ -59,3 +65,23 @@ python3 -m lab.run --config configs/e3_real2d_example.yaml  # nécessite de rens
 
 - Les features sont standardisées avant Ridge.
 - `pred_vs_true.csv` contient `y_true`, `split`, `mass`, et `y_pred_A/B/C` (une ligne par patch).
+
+## Artefacts de soumission (release + bundle)
+
+- **Release GitHub**: `submission-v1` contient l’archive `submission_bundle.zip`.
+- **Artefacts locaux**: `outputs/paper/` (bundle) et `outputs/paper/submission/` (pack prêt à upload).
+
+## Régénérer le bundle papier (sans nouvelles expériences)
+
+```bash
+scripts/reproduce_paper.sh
+scripts/build_pdf.sh
+scripts/make_submission_bundle.sh
+scripts/pre_submission_audit.sh
+```
+
+Ces scripts:
+- régénèrent le bundle dans `outputs/paper/`,
+- génèrent `outputs/paper/draft.pdf` (ou HTML fallback),
+- construisent le pack `outputs/paper/submission/`,
+- vérifient les empreintes + la provenance PDF.
