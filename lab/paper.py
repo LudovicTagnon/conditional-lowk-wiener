@@ -455,6 +455,7 @@ def main() -> None:
 
     fig.tight_layout()
     fig.savefig(out_dir / "method_schematic.png", dpi=150)
+    fig.savefig(out_dir / "method_schematic.svg")
     plt.close(fig)
 
     # SparseFFT compressibility appendix (E70).

@@ -214,10 +214,13 @@ def main() -> None:
     )
 
     repro = (
-        "Reproducibility:\n\n"
-        "The paper bundle is in outputs/paper/ (main_table.md, main_figure.png, short_results.md). The synthesis "
-        "script is lab/paper.py, and the threshold policy is configured in configs/e68_threshold_policy.yaml. "
-        "All referenced run directories are listed in the config file."
+        "Reproducibility & Compute:\n\n"
+        "This draft is generated from the paper bundle in outputs/paper/ and does not run new experiments. "
+        "The synthesis scripts are lab/paper.py and lab/draft.py, with run paths specified in "
+        "configs/e68_threshold_policy.yaml. To rebuild the bundle and draft, run scripts/reproduce_paper.sh. "
+        "That script checks for required artifacts (tables, figures, schematic, sparseFFT appendix) and fails if "
+        "any are missing. No new runs are executed for E70/E71; these steps only aggregate existing summaries. "
+        "Runtime is dominated by file I/O and plotting, and the stored run directories encode all numeric values."
     )
 
     draft = "\n\n".join(
@@ -239,7 +242,7 @@ def main() -> None:
             regime,
             "## 6 Limitations & scope",
             limits,
-            "## 7 Reproducibility",
+            "## 7 Reproducibility & Compute",
             repro,
         ]
     )
