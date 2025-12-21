@@ -1,0 +1,12 @@
+runs_root: outputs/runs
+out_dir: outputs/paper
+
+run_map:
+  e48: outputs/runs/20251220_123326_e48_oos_sparsefft_vs_wiener_alpha2
+  e49: outputs/runs/20251220_124104_e49_oos_twochannel_fullg_wiener_sparsefft
+  e50: outputs/runs/20251220_125130_e50_oos_twochannel_fullg_wiener_sparsefft_highkpixels
+  e61: outputs/runs/20251220_215420_e61_regime_gainlaw_stable
+  e62: outputs/runs/20251220_222548_e62_two_stage_gain_model
+  e65: outputs/runs/20251221_004201_e65_blend_stability_thresholds
+  e66: outputs/runs/20251221_021252_e66_alpha_tail_power
+  e64_roc: outputs/runs/20251221_001325_e64_capped_weak_blend
