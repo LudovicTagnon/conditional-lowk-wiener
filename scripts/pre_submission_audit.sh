@@ -21,7 +21,7 @@ required_files=(
   "references.bib"
   "CITATION.cff"
   "LICENSE"
-  "README_paper.md"
+  "README.md"
   "CHECKLIST_REVIEW.md"
 )
 
