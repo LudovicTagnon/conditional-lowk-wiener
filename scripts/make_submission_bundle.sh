@@ -5,6 +5,7 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
 scripts/reproduce_paper.sh
+scripts/build_pdf.sh
 
 submission_dir="outputs/paper/submission"
 mkdir -p "$submission_dir"
@@ -62,13 +63,29 @@ out_path.write_text(content.format(abstract=abstract), encoding="utf-8")
 print(str(out_path))
 PY
 
+draft_pdf="outputs/paper/draft.pdf"
+draft_html="outputs/paper/draft.html"
+draft_format=""
+
+if [[ -s "$draft_pdf" ]]; then
+  draft_format="pdf"
+  draft_file="$draft_pdf"
+elif [[ -s "$draft_html" ]]; then
+  draft_format="html"
+  draft_file="$draft_html"
+else
+  echo "missing: $draft_pdf or $draft_html"
+  exit 1
+fi
+
 files=(
   "outputs/paper/draft.md"
+  "$draft_file"
+  "outputs/paper/main_table.md"
   "outputs/paper/main_figure.png"
   "outputs/paper/method_schematic.png"
   "outputs/paper/method_schematic.svg"
   "outputs/paper/sparsefft_curve.png"
-  "outputs/paper/main_table.md"
   "outputs/paper/sparsefft_table.md"
   "outputs/paper/sparsefft_stability.md"
   "outputs/paper/short_results.md"
@@ -78,43 +95,67 @@ files=(
   "LICENSE"
   "README_paper.md"
   "CHECKLIST_REVIEW.md"
+  "requirements.lock"
+  "scripts/reproduce_paper.sh"
+  "scripts/build_pdf.sh"
+  "scripts/pre_submission_audit.sh"
 )
 
 missing=0
-optional_files=()
-if [[ -f "outputs/paper/draft.pdf" ]]; then
-  optional_files+=("outputs/paper/draft.pdf")
-fi
-
 for f in "${files[@]}"; do
   if [[ ! -f "$f" ]]; then
     echo "missing: $f"
     missing=1
   fi
 done
-for f in "${optional_files[@]}"; do
-  if [[ ! -f "$f" ]]; then
-    echo "optional missing: $f"
-  fi
-done
-
 if [[ "$missing" -ne 0 ]]; then
   echo "submission bundle incomplete"
   exit 1
 fi
 
+SUBMISSION_FORMAT="$draft_format" python3 - <<'PY'
+from pathlib import Path
+import os
+
+meta_path = Path("outputs/paper/SUBMISSION_METADATA.md")
+fmt = os.environ.get("SUBMISSION_FORMAT", "")
+format_line = f"Bundle format: draft.{fmt}" if fmt else "Bundle format: unknown"
+lines = meta_path.read_text(encoding="utf-8").splitlines()
+lines = [ln for ln in lines if not ln.startswith("Bundle format:")]
+lines.append(format_line)
+meta_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+mkdir -p "$submission_dir/scripts"
 for f in "${files[@]}"; do
-  cp -f "$f" "$submission_dir/"
+  if [[ "$f" == scripts/* ]]; then
+    cp -f "$f" "$submission_dir/scripts/"
+  else
+    cp -f "$f" "$submission_dir/"
+  fi
 done
-for f in "${optional_files[@]}"; do
-  cp -f "$f" "$submission_dir/"
+
+essential=(
+  "$submission_dir/draft.md"
+  "$submission_dir/$(basename "$draft_file")"
+  "$submission_dir/main_figure.png"
+)
+for f in "${essential[@]}"; do
+  if [[ ! -s "$f" ]]; then
+    echo "empty: $f"
+    exit 1
+  fi
 done
 
 echo "submission bundle:"
-for f in "${files[@]}" "${optional_files[@]}"; do
-  base="$(basename "$f")"
-  if [[ -f "$submission_dir/$base" ]]; then
-    size_bytes="$(wc -c < "$submission_dir/$base" | tr -d ' ')"
-    echo "- $submission_dir/$base ($size_bytes bytes)"
+for f in "${files[@]}"; do
+  if [[ "$f" == scripts/* ]]; then
+    base="$submission_dir/$f"
+  else
+    base="$submission_dir/$(basename "$f")"
+  fi
+  if [[ -f "$base" ]]; then
+    size_bytes="$(wc -c < "$base" | tr -d ' ')"
+    echo "- $base ($size_bytes bytes)"
   fi
 done
