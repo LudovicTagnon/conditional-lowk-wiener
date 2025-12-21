@@ -82,7 +82,7 @@ if not text.strip():
     raise SystemExit("PDF provenance check failed: empty text extracted from PDF")
 
 norm = re.sub(r"\s+", " ", text).strip().lower()
-required = ["ceiling =", "wiener ="]
+required = ["ceiling =", "wiener =", "information-theoretic", "sanity checks"]
 missing = [m for m in required if m not in norm]
 has_dup = "key quantified results" in norm
 has_draft_tag = "draft (e" in norm

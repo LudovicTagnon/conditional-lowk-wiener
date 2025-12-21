@@ -79,6 +79,8 @@ def main() -> None:
         main_table.replace("wiener", "Wiener")
         .replace("highk_kernel", "high-k kernel")
         .replace("highk_pixels", "high-k pixels")
+        .replace("ceiling", "local ceiling")
+        .replace("local local", "local")
     )
     short_lines = _read_lines(short_results_path)
 
@@ -105,8 +107,8 @@ def main() -> None:
             + " No new experiments were run for this appendix."
         )
 
-    line1 = _extract_line(short_lines, "1)").replace("wiener", "Wiener")
-    line2 = _extract_line(short_lines, "2)").replace("wiener", "Wiener")
+    line1 = _extract_line(short_lines, "1)").replace("wiener", "Wiener").replace("ceiling", "local ceiling")
+    line2 = _extract_line(short_lines, "2)").replace("wiener", "Wiener").replace("ceiling", "local ceiling")
     line3 = _extract_line(short_lines, "3)")
     line5 = _extract_line(short_lines, "5)")
     line6 = _extract_line(short_lines, "6)")
@@ -118,11 +120,12 @@ def main() -> None:
     main_thresh, sens = _parse_threshold_policy(short_lines)
 
     abstract = (
-        "We test whether conditional predictors improve gravitational-field estimation beyond a truncated-kernel "
-        "ceiling in controlled synthetic data.\n"
+        "We test whether conditional predictors improve gravitational-field estimation beyond a "
+        "local/truncated-kernel ceiling in controlled synthetic data.\n"
         "Ceiling = a finite-support, truncated-kernel estimator (no conditional inference outside the window).\n"
         "Wiener = conditional linear prediction of g_low at the center from rho in a window, using train "
         "covariances.\n"
+        "This is a ceiling only within finite-support/local estimators; it is not an information-theoretic ceiling.\n"
         "Mechanism: inside contains information about outside when the field is correlated; for alpha≈0 "
         "(white-ish), correlations vanish and gains disappear.\n"
         "OOS protocol: all metrics use independent train/test fields (relRMSE and Pearson).\n"
@@ -133,8 +136,9 @@ def main() -> None:
 
     intro = (
         "Predicting the gravitational field from local density information blends physics (Poisson/FFT) with "
-        "statistical learning. We compare a ceiling baseline (truncated kernel with finite support, no conditional "
+        "statistical learning. We compare a truncated-kernel baseline (local ceiling, finite support, no conditional "
         "inference beyond the window) to a Wiener predictor (conditional linear estimate from rho in a window). "
+        "This is a ceiling only within finite-support/local estimators; it is not an information-theoretic ceiling. "
         "When rho is correlated, inside samples carry information about outside; this breaks down for alpha≈0, "
         "where correlations are near zero. Our goal is to quantify OOS gains, characterize when they occur, "
         "and connect them to a regime→magnitude model that predicts when gains appear.\n\n"
@@ -145,17 +149,18 @@ def main() -> None:
     )
 
     setup = (
-        "We define three estimators for the low-k component of the field: (i) a truncated-kernel ceiling that "
-        "applies the impulse-response kernel limited to a finite support, (ii) a Wiener estimator that solves a "
-        "conditional linear prediction using the empirical covariance of the density field, and (iii) a sparse-FFT "
-        "approximation that keeps the top-K Fourier modes of the Wiener-symmetrized kernel. We evaluate a two-channel "
-        "decomposition in which g_full = g_low + g_high, with g_low predicted by ceiling/Wiener/sparseFFT and g_high "
-        "predicted by a fixed local block (kernel or pixels). This isolates how much the low-k predictor contributes "
-        "to full-g accuracy.\n\n"
+        "We define three estimators for the low-k component of the field: (i) a truncated-kernel baseline (local "
+        "ceiling) that applies the impulse-response kernel limited to a finite support, (ii) a Wiener estimator that "
+        "solves a conditional linear prediction using the empirical covariance of the density field, and (iii) a "
+        "sparse-FFT approximation that keeps the top-K Fourier modes of the Wiener-symmetrized kernel. We evaluate a "
+        "two-channel decomposition in which g_full = g_low + g_high, with g_low predicted by the "
+        "local/truncated-kernel ceiling, Wiener, or sparseFFT and g_high predicted by a fixed local block (kernel or "
+        "pixels). This isolates how much the low-k predictor contributes to full-g accuracy.\n\n"
         "Mini-box: What is Wiener here?\n"
         "It is the linear predictor of g_low at the patch center from rho in a finite window, estimated from "
-        "training covariances. If correlations vanish (alpha≈0), the predictor collapses to the ceiling kernel.\n\n"
-        "Compute: the ceiling convolution is O(w^2) per patch (or FFT for full fields), the Wiener solve uses a "
+        "training covariances. If correlations vanish (alpha≈0), the predictor collapses to the local/truncated-kernel "
+        "ceiling.\n\n"
+        "Compute: the local ceiling convolution is O(w^2) per patch (or FFT for full fields), the Wiener solve uses a "
         "covariance-driven linear system, and the sparse-FFT variant reduces the representation to K modes with "
         "explicit truncation. All models use training-only information; test fields are untouched by fitting."
     )
@@ -165,8 +170,9 @@ def main() -> None:
         "regime modeling, and metrics include Pearson correlation and relRMSE (RMSE / std(y_test)). For two-stage "
         "models, we define a strong-tail threshold and report strong-subset metrics only when n_strong is "
         "sufficiently large. E62 is a single-seed dev baseline; E65/E66 are multi-seed runs that support the main "
-        "claims and threshold policy. No-leakage is enforced by fitting on training fields only and evaluating "
-        "exclusively on held-out fields. See method schematic (outputs/paper/method_schematic.png)."
+        "claims and threshold policy. E66 expands the alpha grid to increase n_strong; the evaluation protocol is "
+        "unchanged. No-leakage is enforced by fitting on training fields only and evaluating exclusively on "
+        "held-out fields. See method schematic (outputs/paper/method_schematic.png)."
     )
 
     results = (
@@ -175,8 +181,16 @@ def main() -> None:
         f"Compact synthesis (OOS): {line1} {line2} {line3}\n"
         f"Threshold policy: main thresh={main_thresh}; sensitivity reported for {sens}. "
         "Multi-seed results (E65/E66) support the main claims; E62 is a single-seed dev baseline.\n"
-        "See outputs/paper/main_figure.png for deltas and ROC, and outputs/paper/sparsefft_table.md for the "
-        "sparseFFT appendix."
+        "See outputs/paper/main_figure.png for deltas and ROC, outputs/paper/sparsefft_table.md for the "
+        "sparseFFT appendix, and outputs/paper/compute_cost.md for a compute snapshot."
+    )
+
+    sanity = (
+        "Why AUROC is near-perfect / Sanity checks:\n\n"
+        "AUROC is high because regime separation is driven by multi-scale predictability signals and spectral "
+        "structure (e.g., predR2_ms, log_spec, and kernel-deviation features). The split is by fields (OOS), not "
+        "by patches. Sanity checks on the condition-level feature table show AUROC≈1.0 nominal and ≈0.5 under "
+        "label shuffling or feature permutation; see outputs/paper/sanity_checks.md."
     )
     if sparse_para:
         results += "\n\n" + sparse_para
@@ -258,6 +272,8 @@ def main() -> None:
             protocol,
             "## 4 Results",
             results,
+            "## 4.1 Why AUROC is near-perfect / Sanity checks",
+            sanity,
             "## Related Work",
             related,
             "## 5 Regime→magnitude model",

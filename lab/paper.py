@@ -572,7 +572,7 @@ def main() -> None:
     # Short results text.
     short_lines = [
         "Results (paper-ready):",
-        f"1) OOS low-k gain: ΔrelRMSE(wiener-ceiling)≈{_format_mean(e48_rel_wiener - e48_rel_ceiling)} and ΔrelRMSE(FFT800-ceiling)≈{_format_mean(e48_rel_fft - e48_rel_ceiling)}.",
+        f"1) OOS low-k gain: ΔrelRMSE(Wiener-local ceiling)≈{_format_mean(e48_rel_wiener - e48_rel_ceiling)} and ΔrelRMSE(FFT800-local ceiling)≈{_format_mean(e48_rel_fft - e48_rel_ceiling)}.",
         f"2) OOS full-g two-channel: ΔrelRMSE(B-A)≈{_format_mean(e49_rel_b - e49_rel_a)} (high-k kernel) and ΔrelRMSE≈{_format_mean(e50_rel_b - e50_rel_a)} (high-k pixels).",
         f"3) Regime AUROC at thresh={thr_main:.2f}: alpha={_format_mean(auc_alpha, digits=3)}, bbks_ext={_format_mean(auc_bbks, digits=3)}, bbks_tilt={_format_mean(auc_tilt, digits=3)}.",
         f"4) Threshold policy: main thresh={thr_main:.2f}; sensitivity reported for {', '.join([f'{t:.2f}' for t in sens_thresholds])}.",
@@ -585,6 +585,7 @@ def main() -> None:
         "11) ROC example (E64, alpha holdout) shows AUROC≈1.0; sensitivity plots show stable n_strong and strong_MAE for alpha.",
         "12) Baseline two-stage (E62) global R2: bbks_ext=0.560, alpha=0.437, bbks_tilt=0.905.",
         f"13) E61 y_strong AUROC: alpha={_format_mean(e61_auc_alpha, digits=3)}, bbks_ext={_format_mean(e61_auc_bbks, digits=3)}, bbks_tilt={_format_mean(e61_auc_tilt, digits=3)}.",
+        "14) Sanity checks (label shuffle / feature permutation) yield AUROC≈0.5; see outputs/paper/sanity_checks.md.",
     ]
     (out_dir / "short_results.md").write_text("\n".join(short_lines) + "\n", encoding="utf-8")
 
