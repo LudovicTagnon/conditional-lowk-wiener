@@ -422,6 +422,41 @@ def main() -> None:
     fig.savefig(out_dir / "main_figure.png", dpi=150)
     plt.close(fig)
 
+    # Method schematic.
+    fig, ax = plt.subplots(1, 1, figsize=(9, 3))
+    ax.axis("off")
+    box_kw = dict(boxstyle="round,pad=0.3", fc="#f4f6f8", ec="#3a3a3a", lw=1.0)
+    arrow_kw = dict(arrowstyle="->", lw=1.2, color="#3a3a3a")
+
+    def draw_box(text: str, xy: tuple[float, float], w: float = 0.18, h: float = 0.20) -> tuple[float, float, float, float]:
+        x, y = xy
+        rect = plt.Rectangle((x, y), w, h, facecolor="#f4f6f8", edgecolor="#3a3a3a", lw=1.0)
+        ax.add_patch(rect)
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=9)
+        return x, y, w, h
+
+    b_rho = draw_box("rho field", (0.02, 0.40))
+    b_split = draw_box("FFT split\nlow/high-k", (0.24, 0.40))
+    b_low = draw_box("low-k est.\nceiling / wiener / sparseFFT(K)", (0.46, 0.55), w=0.30, h=0.25)
+    b_high = draw_box("high-k block\nkernel or pixels", (0.46, 0.15), w=0.30, h=0.20)
+    b_sum = draw_box("recompose\n g_full", (0.80, 0.35), w=0.17, h=0.20)
+    b_oos = draw_box("OOS eval:\ntrain fields / test fields", (0.24, 0.05), w=0.30, h=0.20)
+
+    def center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+        x, y, w, h = box
+        return (x + w, y + h / 2)
+
+    ax.annotate("", xy=center(b_split), xytext=center(b_rho), arrowprops=arrow_kw)
+    ax.annotate("", xy=(b_low[0], b_low[1] + b_low[3] / 2), xytext=(b_split[0] + b_split[2], b_split[1] + b_split[3] * 0.75), arrowprops=arrow_kw)
+    ax.annotate("", xy=(b_high[0], b_high[1] + b_high[3] / 2), xytext=(b_split[0] + b_split[2], b_split[1] + b_split[3] * 0.25), arrowprops=arrow_kw)
+    ax.annotate("", xy=(b_sum[0], b_sum[1] + b_sum[3] * 0.70), xytext=(b_low[0] + b_low[2], b_low[1] + b_low[3] * 0.70), arrowprops=arrow_kw)
+    ax.annotate("", xy=(b_sum[0], b_sum[1] + b_sum[3] * 0.30), xytext=(b_high[0] + b_high[2], b_high[1] + b_high[3] * 0.30), arrowprops=arrow_kw)
+    ax.annotate("", xy=(b_oos[0] + b_oos[2] * 0.30, b_oos[1] + b_oos[3] * 0.95), xytext=(b_split[0] + b_split[2] * 0.50, b_split[1]), arrowprops=arrow_kw)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "method_schematic.png", dpi=150)
+    plt.close(fig)
+
     # SparseFFT compressibility appendix (E70).
     e46_perf = _parse_table(e46_text, "ΔrelRMSE vs wiener")
     e46_weights = _parse_table(e46_text, "corr(wK,w_sym)")

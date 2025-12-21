@@ -155,7 +155,8 @@ def main() -> None:
         "We use strict out-of-sample (OOS) splits with independent train/test fields. LOFO splits are used for "
         "regime modeling, and metrics include Pearson correlation and relRMSE. For two-stage models, we define "
         "a strong-tail threshold and report strong-subset metrics only when n_strong is sufficiently large. "
-        "No-leakage is enforced by fitting on training fields only and evaluating exclusively on held-out fields."
+        "No-leakage is enforced by fitting on training fields only and evaluating exclusively on held-out fields. "
+        "See method schematic (outputs/paper/method_schematic.png)."
     )
 
     results = (
@@ -168,6 +169,26 @@ def main() -> None:
     )
     if sparse_para:
         results += "\n\n" + sparse_para
+
+    related = (
+        "Related Work:\n\n"
+        "Wiener filtering provides the classical linear MMSE estimator for stationary Gaussian fields and is the "
+        "conceptual basis for the conditional low-k predictor used here. Gaussian process regression and kriging "
+        "formalize conditional expectations in spatial settings, while spectral representations of kernels and "
+        "filters connect to FFT-based accelerations. Sparse spectral approximations and truncation in Fourier space "
+        "are standard compression tactics for smooth operators, and windowing/tapering are common for controlling "
+        "edge artifacts in finite-support kernels. Our approach combines these ideas in a controlled synthetic setup "
+        "with strict OOS evaluation.\n\n"
+        "References:\n"
+        "- Wiener, N. (1949). Extrapolation, Interpolation, and Smoothing of Stationary Time Series.\n"
+        "- Rasmussen, C.E. & Williams, C.K.I. (2006). Gaussian Processes for Machine Learning.\n"
+        "- Cressie, N. (1993). Statistics for Spatial Data (Kriging).\n"
+        "- Kay, S.M. (1993). Fundamentals of Statistical Signal Processing, Vol. I.\n"
+        "- Brigham, E.O. (1988). The Fast Fourier Transform and Its Applications.\n"
+        "- Oppenheim, A.V. & Schafer, R.W. (2009). Discrete-Time Signal Processing.\n"
+        "- Percival, D.B. & Walden, A.T. (1993). Spectral Analysis for Physical Applications.\n"
+        "- Mallat, S. (2008). A Wavelet Tour of Signal Processing.\n"
+    )
 
     regime = (
         "Regime→magnitude model:\n\n"
@@ -212,6 +233,8 @@ def main() -> None:
             protocol,
             "## 4 Results",
             results,
+            "## Related Work",
+            related,
             "## 5 Regime→magnitude model",
             regime,
             "## 6 Limitations & scope",
