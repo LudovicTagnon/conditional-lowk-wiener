@@ -31,6 +31,32 @@ def _parse_threshold_policy(lines: list[str]) -> tuple[str, str]:
     return main, sens
 
 
+def _parse_table(lines: list[str], header_key: str) -> list[dict[str, str]]:
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("|") and header_key in line:
+            header_idx = i
+            break
+    if header_idx is None:
+        return []
+    header = [c.strip() for c in lines[header_idx].strip("|").split("|")]
+    rows: list[dict[str, str]] = []
+    for j in range(header_idx + 2, len(lines)):
+        line = lines[j]
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) != len(header):
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def _extract_float(cell: str) -> str:
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", cell or "")
+    return match.group(0) if match else ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="E69 paper draft generator.")
     parser.add_argument("--paper-dir", default="outputs/paper", help="Paper bundle directory.")
@@ -50,6 +76,29 @@ def main() -> None:
 
     main_table = main_table_path.read_text(encoding="utf-8").strip()
     short_lines = _read_lines(short_results_path)
+
+    sparse_table_path = paper_dir / "sparsefft_table.md"
+    sparse_stability_path = paper_dir / "sparsefft_stability.md"
+    sparse_curve_path = paper_dir / "sparsefft_curve.png"
+
+    sparse_para = ""
+    if sparse_table_path.exists():
+        sparse_lines = _read_lines(sparse_table_path)
+        rows = _parse_table(sparse_lines, "model")
+        k800 = next((r for r in rows if "K=800" in r.get("model", "")), {})
+        delta_w = _extract_float(k800.get("ΔrelRMSE vs wiener", ""))
+        delta_c = _extract_float(k800.get("ΔrelRMSE vs ceiling", ""))
+        stability_note = ""
+        if sparse_stability_path.exists():
+            stability_lines = _read_lines(sparse_stability_path)
+            stability_note = " " + " ".join(stability_lines[:2]).strip()
+        sparse_para = (
+            "Spectral compressibility of Wiener weights: "
+            f"the sparse-FFT sweep (Fig. sparsefft_curve.png, Table sparsefft_table.md) shows K≈800 as a trade-off "
+            f"(ΔrelRMSE vs Wiener≈{delta_w}, ΔrelRMSE vs ceiling≈{delta_c})."
+            + stability_note
+            + " No new experiments were run for this appendix."
+        )
 
     line1 = _extract_line(short_lines, "1)")
     line2 = _extract_line(short_lines, "2)")
@@ -117,6 +166,8 @@ def main() -> None:
         + "\n\n"
         f"Threshold policy: main thresh={main_thresh}; sensitivity reported for {sens}."
     )
+    if sparse_para:
+        results += "\n\n" + sparse_para
 
     regime = (
         "Regime→magnitude model:\n\n"

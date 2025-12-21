@@ -108,6 +108,13 @@ def _build_md_table(rows: list[dict[str, str]], columns: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _parse_table_in_section(text: str, section_header: str, header_key: str) -> list[dict[str, str]]:
+    idx = text.find(section_header)
+    if idx == -1:
+        return []
+    return _parse_table(text[idx:], header_key)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="E67 paper synthesis.")
     parser.add_argument("--config", required=True, help="Path to e67 config YAML.")
@@ -121,6 +128,8 @@ def main() -> None:
     run_e48 = _get_run_path(cfg, "e48", "e48", runs_root)
     run_e49 = _get_run_path(cfg, "e49", "e49", runs_root)
     run_e50 = _get_run_path(cfg, "e50", "e50", runs_root)
+    run_e46 = _get_run_path(cfg, "e46", "e46", runs_root)
+    run_e47 = _get_run_path(cfg, "e47", "e47", runs_root)
     run_e61 = _get_run_path(cfg, "e61", "e61", runs_root)
     run_e62 = _get_run_path(cfg, "e62", "e62", runs_root)
     run_e65 = _get_run_path(cfg, "e65", "e65", runs_root)
@@ -130,6 +139,8 @@ def main() -> None:
     e48_text = _read_text(run_e48 / "summary_e48_oos_sparsefft_vs_wiener_alpha2.md")
     e49_text = _read_text(run_e49 / "summary_e49_oos_twochannel_fullg_wiener_sparsefft.md")
     e50_text = _read_text(run_e50 / "summary_e50_oos_twochannel_fullg_wiener_sparsefft_highkpixels.md")
+    e46_text = _read_text(run_e46 / "summary_e46_sparsefft_to_wiener_alpha2.md")
+    e47_text = _read_text(run_e47 / "summary_e47_sparsefft_mode_stability.md")
     e61_text = _read_text(run_e61 / "summary_e61_regime_gainlaw_stable.md")
     e62_text = _read_text(run_e62 / "summary_e62_two_stage_gain_model.md")
     e65_text = _read_text(run_e65 / "summary_e65_blend_stability_thresholds.md")
@@ -410,6 +421,117 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(out_dir / "main_figure.png", dpi=150)
     plt.close(fig)
+
+    # SparseFFT compressibility appendix (E70).
+    e46_perf = _parse_table(e46_text, "ΔrelRMSE vs wiener")
+    e46_weights = _parse_table(e46_text, "corr(wK,w_sym)")
+    k_vals: list[int] = []
+    rel_vals: list[float] = []
+    corr_vals: list[float] = []
+    for row in e46_perf:
+        k_label = row.get("K", "")
+        if k_label.isdigit():
+            k = int(k_label)
+            rel = _parse_float(row.get("relRMSE mean±std", ""))
+            if rel is not None:
+                k_vals.append(k)
+                rel_vals.append(rel)
+    corr_map: dict[int, float] = {}
+    for row in e46_weights:
+        k_label = row.get("K", "")
+        if k_label.isdigit():
+            corr = _parse_float(row.get("corr(wK,w_sym)", ""))
+            if corr is not None:
+                corr_map[int(k_label)] = corr
+    for k in k_vals:
+        corr_vals.append(corr_map.get(k, float("nan")))
+
+    if k_vals:
+        fig, ax = plt.subplots(1, 1, figsize=(5, 3.5))
+        ax.plot(k_vals, rel_vals, marker="o", label="relRMSE (low-k)")
+        ax.set_xscale("log")
+        ax.set_xlabel("K (sparse FFT modes)")
+        ax.set_ylabel("relRMSE")
+        ax.set_title("SparseFFT compressibility (E46)")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax2 = ax.twinx()
+        ax2.plot(k_vals, corr_vals, marker="s", color="tab:orange", label="corr vs Wiener_sym")
+        ax2.set_ylabel("corr(wK, wiener_sym)")
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc="lower right", fontsize=7)
+        fig.tight_layout()
+        fig.savefig(out_dir / "sparsefft_curve.png", dpi=150)
+        plt.close(fig)
+
+    # SparseFFT OOS table from E48.
+    e48_perf = _parse_table(e48_text, "model")
+    e48_delta = _parse_table(e48_text, "ΔrelRMSE vs wiener")
+    perf_map = {row["model"]: row for row in e48_perf}
+    delta_map = {row["K"]: row for row in e48_delta}
+
+    def rel_mean(row: dict[str, str]) -> float | None:
+        return _parse_float(row.get("relRMSE mean±std", ""))
+
+    ceiling_rel = rel_mean(perf_map.get("ceiling", {}))
+    wiener_rel = rel_mean(perf_map.get("wiener", {}))
+
+    table_rows: list[dict[str, str]] = []
+    models = ["ceiling", "wiener", "sparseFFT K=200", "sparseFFT K=400", "sparseFFT K=800", "sparseFFT K=1600"]
+    for model in models:
+        row = perf_map.get(model)
+        if not row:
+            continue
+        pearson = row.get("Pearson mean±std", "n/a")
+        rel = row.get("relRMSE mean±std", "n/a")
+        delta_w = "n/a"
+        delta_c = "n/a"
+        if model.startswith("sparseFFT"):
+            k_label = model.split("K=")[1]
+            drow = delta_map.get(k_label)
+            if drow:
+                delta_w = drow.get("ΔrelRMSE vs wiener", "n/a")
+                delta_c = drow.get("ΔrelRMSE vs ceiling", "n/a")
+        elif model == "ceiling" and ceiling_rel is not None and wiener_rel is not None:
+            delta_w = f"{ceiling_rel - wiener_rel:+.4f}"
+            delta_c = "+0.0000"
+        elif model == "wiener":
+            delta_w = "+0.0000"
+            if ceiling_rel is not None and wiener_rel is not None:
+                delta_c = f"{wiener_rel - ceiling_rel:+.4f}"
+        table_rows.append(
+            {
+                "model": model,
+                "Pearson": pearson,
+                "relRMSE": rel,
+                "ΔrelRMSE vs wiener": delta_w,
+                "ΔrelRMSE vs ceiling": delta_c,
+            }
+        )
+
+    sparse_table_md = _build_md_table(
+        table_rows,
+        ["model", "Pearson", "relRMSE", "ΔrelRMSE vs wiener", "ΔrelRMSE vs ceiling"],
+    )
+    (out_dir / "sparsefft_table.md").write_text(sparse_table_md + "\n", encoding="utf-8")
+
+    # SparseFFT mode stability summary (E47).
+    gx_rows = _parse_table_in_section(e47_text, "## Stability (gx)", "Jaccard")
+    gy_rows = _parse_table_in_section(e47_text, "## Stability (gy)", "Jaccard")
+    def find_k(rows: list[dict[str, str]], k: str) -> dict[str, str]:
+        for row in rows:
+            if row.get("K", "") == k:
+                return row
+        return {}
+    gx_800 = find_k(gx_rows, "800")
+    gy_800 = find_k(gy_rows, "800")
+    stability_lines = [
+        "SparseFFT mode stability (E47, K=800):",
+        f"- gx: Jaccard={gx_800.get('Jaccard_mean+/-std','n/a')}, IoMin={gx_800.get('IoMin_mean+/-std','n/a')}, overlap={gx_800.get('overlap_vs_global_mean+/-std','n/a')}.",
+        f"- gy: Jaccard={gy_800.get('Jaccard_mean+/-std','n/a')}, IoMin={gy_800.get('IoMin_mean+/-std','n/a')}, overlap={gy_800.get('overlap_vs_global_mean+/-std','n/a')}.",
+        "- Mode selection uses TRAIN-only Wiener weights (no test leakage).",
+    ]
+    (out_dir / "sparsefft_stability.md").write_text("\n".join(stability_lines) + "\n", encoding="utf-8")
 
     # Short results text.
     short_lines = [

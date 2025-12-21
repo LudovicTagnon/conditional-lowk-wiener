@@ -5,6 +5,8 @@ main_thresh: 0.02
 sensitivity_thresholds: [0.02, 0.03, 0.04, 0.05]
 
 run_map:
+  e46: outputs/runs/20251220_121206_e46_sparsefft_to_wiener_alpha2
+  e47: outputs/runs/20251220_122530_e47_sparsefft_mode_stability_alpha2
   e48: outputs/runs/20251220_123326_e48_oos_sparsefft_vs_wiener_alpha2
   e49: outputs/runs/20251220_124104_e49_oos_twochannel_fullg_wiener_sparsefft
   e50: outputs/runs/20251220_125130_e50_oos_twochannel_fullg_wiener_sparsefft_highkpixels
