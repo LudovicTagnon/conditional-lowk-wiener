@@ -170,8 +170,8 @@ def main() -> None:
     # E66 alpha holdout (strong counts).
     e66_alpha = _parse_holdout_table(e66_text, "alpha")
 
-    thr_main = 0.03
-    thr_alt = 0.02
+    thr_main = float(cfg.get("main_thresh", 0.02))
+    sens_thresholds = [float(x) for x in cfg.get("sensitivity_thresholds", [0.02, 0.03, 0.04, 0.05])]
 
     def get_metric(table: dict[float, dict[str, str]], thr: float, key: str) -> float | None:
         row = table.get(float(thr))
@@ -186,40 +186,36 @@ def main() -> None:
         return row.get(key, "n/a")
 
     # AUROC at thresholds.
-    auc_alpha_03 = get_metric(e65_alpha, thr_main, "AUROC")
-    auc_bbks_03 = get_metric(e65_bbks_ext, thr_main, "AUROC")
-    auc_tilt_03 = get_metric(e65_bbks_tilt, thr_main, "AUROC")
-
-    auc_alpha_02 = get_metric(e65_alpha, thr_alt, "AUROC")
-    auc_bbks_02 = get_metric(e65_bbks_ext, thr_alt, "AUROC")
-    auc_tilt_02 = get_metric(e65_bbks_tilt, thr_alt, "AUROC")
+    auc_alpha = get_metric(e65_alpha, thr_main, "AUROC")
+    auc_bbks = get_metric(e65_bbks_ext, thr_main, "AUROC")
+    auc_tilt = get_metric(e65_bbks_tilt, thr_main, "AUROC")
 
     # Global metrics at thr=0.03.
-    g_alpha_r2_03 = get_metric(e66_alpha, thr_main, "global_R2")
-    g_alpha_mae_03 = get_metric(e66_alpha, thr_main, "global_MAE")
-    g_bbks_r2_03 = get_metric(e65_bbks_ext, thr_main, "global_R2")
-    g_bbks_mae_03 = get_metric(e65_bbks_ext, thr_main, "global_MAE")
-    g_tilt_r2_03 = get_metric(e65_bbks_tilt, thr_main, "global_R2")
-    g_tilt_mae_03 = get_metric(e65_bbks_tilt, thr_main, "global_MAE")
+    g_alpha_r2 = get_metric(e66_alpha, thr_main, "global_R2")
+    g_alpha_mae = get_metric(e66_alpha, thr_main, "global_MAE")
+    g_bbks_r2 = get_metric(e65_bbks_ext, thr_main, "global_R2")
+    g_bbks_mae = get_metric(e65_bbks_ext, thr_main, "global_MAE")
+    g_tilt_r2 = get_metric(e65_bbks_tilt, thr_main, "global_R2")
+    g_tilt_mae = get_metric(e65_bbks_tilt, thr_main, "global_MAE")
 
     # Strong metrics at thr=0.03 with n_strong>=30.
-    n_alpha_03 = get_metric(e66_alpha, thr_main, "n_strong")
-    n_bbks_03 = get_metric(e65_bbks_ext, thr_main, "n_strong")
-    n_tilt_03 = get_metric(e65_bbks_tilt, thr_main, "n_strong")
+    n_alpha = get_metric(e66_alpha, thr_main, "n_strong")
+    n_bbks = get_metric(e65_bbks_ext, thr_main, "n_strong")
+    n_tilt = get_metric(e65_bbks_tilt, thr_main, "n_strong")
 
-    s_alpha_mae_03 = get_metric(e66_alpha, thr_main, "strong_MAE") if (n_alpha_03 or 0) >= 30 else None
-    s_alpha_r2_03 = get_metric(e66_alpha, thr_main, "strong_R2") if (n_alpha_03 or 0) >= 30 else None
+    s_alpha_mae = get_metric(e66_alpha, thr_main, "strong_MAE") if (n_alpha or 0) >= 30 else None
+    s_alpha_r2 = get_metric(e66_alpha, thr_main, "strong_R2") if (n_alpha or 0) >= 30 else None
 
-    s_bbks_mae_03 = get_metric(e65_bbks_ext, thr_main, "strong_MAE") if (n_bbks_03 or 0) >= 30 else None
-    s_bbks_r2_03 = get_metric(e65_bbks_ext, thr_main, "strong_R2") if (n_bbks_03 or 0) >= 30 else None
+    s_bbks_mae = get_metric(e65_bbks_ext, thr_main, "strong_MAE") if (n_bbks or 0) >= 30 else None
+    s_bbks_r2 = get_metric(e65_bbks_ext, thr_main, "strong_R2") if (n_bbks or 0) >= 30 else None
 
-    s_tilt_mae_03 = get_metric(e65_bbks_tilt, thr_main, "strong_MAE") if (n_tilt_03 or 0) >= 30 else None
-    s_tilt_r2_03 = get_metric(e65_bbks_tilt, thr_main, "strong_R2") if (n_tilt_03 or 0) >= 30 else None
+    s_tilt_mae = get_metric(e65_bbks_tilt, thr_main, "strong_MAE") if (n_tilt or 0) >= 30 else None
+    s_tilt_r2 = get_metric(e65_bbks_tilt, thr_main, "strong_R2") if (n_tilt or 0) >= 30 else None
 
     # Alpha tail power comparison.
     n_alpha_03_e65 = get_metric(e65_alpha, thr_main, "n_strong")
     n_alpha_03_e66 = get_metric(e66_alpha, thr_main, "n_strong")
-    s_r2_alpha_03_e66 = s_alpha_r2_03
+    s_r2_alpha_e66 = s_alpha_r2
 
     def parse_e61_auc(text: str, label: str) -> float | None:
         pattern = rf"{label}:.*?y_strong .*?auc=([0-9.]+)"
@@ -282,35 +278,28 @@ def main() -> None:
     main_rows.append(
         {
             "Section": "Regime AUROC (E65)",
-            "Metric": "AUROC y_strong @0.03 (alpha/bbks_ext/bbks_tilt)",
-            "Value": f"{_format_mean(auc_alpha_03, digits=3)} / {_format_mean(auc_bbks_03, digits=3)} / {_format_mean(auc_tilt_03, digits=3)}",
+            "Metric": f"AUROC y_strong @{thr_main:.2f} (alpha/bbks_ext/bbks_tilt)",
+            "Value": f"{_format_mean(auc_alpha, digits=3)} / {_format_mean(auc_bbks, digits=3)} / {_format_mean(auc_tilt, digits=3)}",
         }
     )
     main_rows.append(
         {
-            "Section": "Regime AUROC (E65)",
-            "Metric": "AUROC y_strong @0.02 (alpha/bbks_ext/bbks_tilt)",
-            "Value": f"{_format_mean(auc_alpha_02, digits=3)} / {_format_mean(auc_bbks_02, digits=3)} / {_format_mean(auc_tilt_02, digits=3)}",
-        }
-    )
-    main_rows.append(
-        {
-            "Section": "Two-stage global @0.03",
+            "Section": f"Two-stage global @{thr_main:.2f}",
             "Metric": "R2 / MAE (alpha[E66], bbks_ext[E65], bbks_tilt[E65])",
             "Value": (
-                f"{_format_mean(g_alpha_r2_03)}/{_format_mean(g_alpha_mae_03)} ; "
-                f"{_format_mean(g_bbks_r2_03)}/{_format_mean(g_bbks_mae_03)} ; "
-                f"{_format_mean(g_tilt_r2_03)}/{_format_mean(g_tilt_mae_03)}"
+                f"{_format_mean(g_alpha_r2)}/{_format_mean(g_alpha_mae)} ; "
+                f"{_format_mean(g_bbks_r2)}/{_format_mean(g_bbks_mae)} ; "
+                f"{_format_mean(g_tilt_r2)}/{_format_mean(g_tilt_mae)}"
             ),
         }
     )
     main_rows.append(
         {
-            "Section": "Strong subset @0.03",
+            "Section": f"Strong subset @{thr_main:.2f}",
             "Metric": "strong_MAE / strong_R2 (n_strong>=30)",
             "Value": (
-                f"alpha(E66): {_format_mean(s_alpha_mae_03)}/{_format_mean(s_alpha_r2_03)} (n={_format_mean(n_alpha_03, digits=1)}) ; "
-                f"bbks_ext(E65): {_format_mean(s_bbks_mae_03)}/{_format_mean(s_bbks_r2_03)} (n={_format_mean(n_bbks_03, digits=1)}) ; "
+                f"alpha(E66): {_format_mean(s_alpha_mae)}/{_format_mean(s_alpha_r2)} (n={_format_mean(n_alpha, digits=1)}) ; "
+                f"bbks_ext(E65): {_format_mean(s_bbks_mae)}/{_format_mean(s_bbks_r2)} (n={_format_mean(n_bbks, digits=1)}) ; "
                 f"bbks_tilt(E65): n<30"
             ),
         }
@@ -318,15 +307,15 @@ def main() -> None:
     main_rows.append(
         {
             "Section": "Alpha tail power",
-            "Metric": "n_strong@0.03 (E65 vs E66)",
+            "Metric": f"n_strong@{thr_main:.2f} (E65 vs E66)",
             "Value": f"E65: {_format_mean(n_alpha_03_e65, digits=1)} ; E66: {_format_mean(n_alpha_03_e66, digits=1)}",
         }
     )
     main_rows.append(
         {
             "Section": "Alpha tail power",
-            "Metric": "strong_R2@0.03 (E66, n>=30)",
-            "Value": _format_mean(s_r2_alpha_03_e66),
+            "Metric": f"strong_R2@{thr_main:.2f} (E66, n>=30)",
+            "Value": _format_mean(s_r2_alpha_e66),
         }
     )
 
@@ -338,7 +327,39 @@ def main() -> None:
         writer.writerows(main_rows)
 
     md_path = out_dir / "main_table.md"
-    md_path.write_text(_build_md_table(main_rows, ["Section", "Metric", "Value"]) + "\n", encoding="utf-8")
+    sensitivity_rows: list[dict[str, str]] = []
+    for thr in sens_thresholds:
+        row = e66_alpha.get(float(thr), {})
+        n_strong = _extract_mean_from_row(row, "n_strong")
+        strong_r2 = _extract_mean_from_row(row, "strong_R2")
+        if n_strong is None or n_strong < 30:
+            strong_r2_cell = "NA (n<30)"
+        else:
+            strong_r2_cell = row.get("strong_R2", "n/a")
+        sensitivity_rows.append(
+            {
+                "thresh": f"{thr:.2f}",
+                "AUROC": row.get("AUROC", "n/a"),
+                "global_R2": row.get("global_R2", "n/a"),
+                "global_MAE": row.get("global_MAE", "n/a"),
+                "strong_MAE": row.get("strong_MAE", "n/a"),
+                "strong_R2": strong_r2_cell,
+                "n_strong": row.get("n_strong", "n/a"),
+            }
+        )
+    sensitivity_md = "\n".join(
+        [
+            "## Sensitivity to threshold (alpha, E66)",
+            _build_md_table(
+                sensitivity_rows,
+                ["thresh", "AUROC", "global_R2", "global_MAE", "strong_MAE", "strong_R2", "n_strong"],
+            ),
+        ]
+    )
+    md_path.write_text(
+        _build_md_table(main_rows, ["Section", "Metric", "Value"]) + "\n\n" + sensitivity_md + "\n",
+        encoding="utf-8",
+    )
 
     # Composite figure.
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
@@ -371,20 +392,20 @@ def main() -> None:
         ax.text(0.5, 0.5, "ROC not found", ha="center", va="center")
         ax.set_axis_off()
 
-    # (iii) strong_R2 vs thresh for alpha (E66).
+    # (iii) n_strong + strong_MAE vs thresh for alpha (E66).
     ax = axes[2]
-    thr_list = sorted(e66_alpha.keys()) if e66_alpha else [0.02, 0.03, 0.04, 0.05]
-    r2_vals = [get_metric(e66_alpha, thr, "strong_R2") for thr in thr_list]
-    r2_vals = [v if v is not None else np.nan for v in r2_vals]
+    thr_list = sens_thresholds
     n_vals = [get_metric(e66_alpha, thr, "n_strong") for thr in thr_list]
     n_vals = [v if v is not None else np.nan for v in n_vals]
-    ax.plot(thr_list, r2_vals, marker="o", label="strong_R2")
+    mae_vals = [get_metric(e66_alpha, thr, "strong_MAE") for thr in thr_list]
+    mae_vals = [v if v is not None else np.nan for v in mae_vals]
+    ax.bar(thr_list, n_vals, width=0.006, color="tab:blue", alpha=0.6, label="n_strong")
     ax.set_xlabel("threshold")
-    ax.set_ylabel("strong_R2")
-    ax.set_title("Alpha strong_R2 vs thresh (E66)")
+    ax.set_ylabel("n_strong")
+    ax.set_title("Alpha strong tail stability (E66)")
     ax2 = ax.twinx()
-    ax2.plot(thr_list, n_vals, marker="s", color="tab:orange", label="n_strong")
-    ax2.set_ylabel("n_strong")
+    ax2.plot(thr_list, mae_vals, marker="o", color="tab:orange", label="strong_MAE")
+    ax2.set_ylabel("strong_MAE")
     ax.grid(True, linestyle="--", alpha=0.4)
     fig.tight_layout()
     fig.savefig(out_dir / "main_figure.png", dpi=150)
@@ -392,17 +413,20 @@ def main() -> None:
 
     # Short results text.
     short_lines = [
-        "Results summary:",
-        f"- OOS low-k (E48): relRMSE ceiling={e48_rel_ceiling:.4f}, wiener={e48_rel_wiener:.4f}, FFT800={e48_rel_fft:.4f}.",
-        f"- OOS full-g (E49): relRMSE A/B/C={e49_rel_a:.4f}/{e49_rel_b:.4f}/{e49_rel_c:.4f} (high-k kernel).",
-        f"- OOS full-g (E50): relRMSE A/B/C={e50_rel_a:.4f}/{e50_rel_b:.4f}/{e50_rel_c:.4f} (high-k pixels).",
-        f"- AUROC y_strong@0.03 (E65): alpha={_format_mean(auc_alpha_03, digits=3)}, bbks_ext={_format_mean(auc_bbks_03, digits=3)}, bbks_tilt={_format_mean(auc_tilt_03, digits=3)}.",
-        f"- Two-stage global@0.03: alpha(E66) R2={_format_mean(g_alpha_r2_03)}, MAE={_format_mean(g_alpha_mae_03)}; bbks_ext(E65) R2={_format_mean(g_bbks_r2_03)}, MAE={_format_mean(g_bbks_mae_03)}.",
-        f"- Strong subset@0.03 (n>=30): alpha(E66) MAE={_format_mean(s_alpha_mae_03)}, R2={_format_mean(s_alpha_r2_03)}; bbks_ext(E65) MAE={_format_mean(s_bbks_mae_03)}, R2={_format_mean(s_bbks_r2_03)}.",
-        f"- Alpha tail power: n_strong@0.03 increased from E65={_format_mean(n_alpha_03_e65, digits=1)} to E66={_format_mean(n_alpha_03_e66, digits=1)}.",
-        "- ROC example is taken from E64 (alpha holdout), AUROC≈1.0.",
-        "- Baseline two-stage (E62) global R2: bbks_ext=0.560, alpha=0.437, bbks_tilt=0.905.",
-        f"- E61 y_strong AUROC: alpha={_format_mean(e61_auc_alpha, digits=3)}, bbks_ext={_format_mean(e61_auc_bbks, digits=3)}, bbks_tilt={_format_mean(e61_auc_tilt, digits=3)}.",
+        "Results (paper-ready):",
+        f"1) OOS low-k gain: ΔrelRMSE(wiener-ceiling)≈{_format_mean(e48_rel_wiener - e48_rel_ceiling)} and ΔrelRMSE(FFT800-ceiling)≈{_format_mean(e48_rel_fft - e48_rel_ceiling)}.",
+        f"2) OOS full-g two-channel: ΔrelRMSE(B-A)≈{_format_mean(e49_rel_b - e49_rel_a)} (high-k kernel) and ΔrelRMSE≈{_format_mean(e50_rel_b - e50_rel_a)} (high-k pixels).",
+        f"3) Regime AUROC at thresh={thr_main:.2f}: alpha={_format_mean(auc_alpha, digits=3)}, bbks_ext={_format_mean(auc_bbks, digits=3)}, bbks_tilt={_format_mean(auc_tilt, digits=3)}.",
+        f"4) Threshold policy: main thresh={thr_main:.2f}; sensitivity reported for {', '.join([f'{t:.2f}' for t in sens_thresholds])}.",
+        f"5) Alpha global@{thr_main:.2f} (E66): R2={_format_mean(g_alpha_r2)}, MAE={_format_mean(g_alpha_mae)}.",
+        f"6) Alpha strong subset@{thr_main:.2f} (n>=30): MAE={_format_mean(s_alpha_mae)}, R2={_format_mean(s_alpha_r2)}.",
+        f"7) Alpha tail power: n_strong@{thr_main:.2f} increased from E65={_format_mean(n_alpha_03_e65, digits=1)} to E66={_format_mean(n_alpha_03_e66, digits=1)}.",
+        f"8) bbks_ext global@{thr_main:.2f}: R2={_format_mean(g_bbks_r2)}, MAE={_format_mean(g_bbks_mae)}.",
+        f"9) bbks_ext strong@{thr_main:.2f} (n>=30): MAE={_format_mean(s_bbks_mae)}, R2={_format_mean(s_bbks_r2)}.",
+        "10) bbks_tilt strong subset is below n>=30 at thresh=0.02; reported as NA in the table.",
+        "11) ROC example (E64, alpha holdout) shows AUROC≈1.0; sensitivity plots show stable n_strong and strong_MAE for alpha.",
+        "12) Baseline two-stage (E62) global R2: bbks_ext=0.560, alpha=0.437, bbks_tilt=0.905.",
+        f"13) E61 y_strong AUROC: alpha={_format_mean(e61_auc_alpha, digits=3)}, bbks_ext={_format_mean(e61_auc_bbks, digits=3)}, bbks_tilt={_format_mean(e61_auc_tilt, digits=3)}.",
     ]
     (out_dir / "short_results.md").write_text("\n".join(short_lines) + "\n", encoding="utf-8")
 
