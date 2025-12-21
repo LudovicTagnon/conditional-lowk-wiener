@@ -113,40 +113,40 @@ def main() -> None:
     main_thresh, sens = _parse_threshold_policy(short_lines)
 
     abstract = (
-        "We study whether local topological signals and conditional predictors improve gravitational-field "
-        "estimation beyond mass-only baselines in controlled synthetic experiments. We compare a truncated-kernel "
-        "ceiling, Wiener conditioning, and sparse-FFT approximations, and evaluate a two-channel low-k/high-k "
-        "decomposition with strict out-of-sample fields. "
-        f"{line1} {line2} "
-        f"{line3} "
-        f"With the main threshold policy (thresh={main_thresh}), "
-        f"{line6} "
-        "We provide a threshold-sensitivity appendix and a regime→magnitude model summary, and we package all "
-        "results for reproducible post-processing."
+        "We test whether conditional predictors improve gravitational-field estimation beyond a truncated-kernel "
+        "ceiling in controlled synthetic data.\n"
+        "Mechanism: the wiener estimator uses correlations in rho to predict the missing low-k component outside "
+        "the ceiling support.\n"
+        "OOS protocol: all metrics use independent train/test fields (relRMSE and Pearson).\n"
+        f"Key OOS deltas: {line1} {line2}\n"
+        f"Regime/magnitude summary: {line3}\n"
+        f"Compressibility: sparseFFT with K≈800 gives ΔrelRMSE vs wiener≈{delta_w} while beating ceiling by {delta_c}."
     )
 
     intro = (
         "Predicting the gravitational field from local density information blends physics (Poisson/FFT) with "
-        "statistical learning. The ceiling estimator captures the truncated-kernel contribution, while the Wiener "
+        "statistical learning. The ceiling estimator captures the truncated-kernel contribution, while the wiener "
         "estimator exploits conditional correlations and can, in principle, improve over the ceiling when outside "
         "support is predictable. Our goal is to quantify this improvement, characterize when it holds out-of-sample, "
         "and connect it to a regime→magnitude model that predicts when gains occur.\n\n"
         "Contributions:\n"
-        "- We provide OOS benchmarks for low-k and full-g prediction using ceiling, Wiener, and sparse-FFT.\n"
-        "- We document a regime classifier with high AUROC across families and a two-stage magnitude model.\n"
-        "- We introduce a threshold policy and sensitivity appendix to avoid unstable strong-tail metrics.\n"
-        "- We supply a paper-ready bundle and a draft generator for reproducible reporting.\n"
+        "1) OOS benchmarks for low-k and full-g using ceiling, wiener, and sparseFFT.\n"
+        "2) A regime→magnitude model with AUROC and strong-tail metrics under a defined threshold policy.\n"
+        "3) A paper bundle and draft generator with sensitivity tables and reproducible artifacts.\n"
     )
 
     setup = (
         "We define three estimators for the low-k component of the field: (i) a truncated-kernel ceiling that "
-        "applies the impulse-response kernel limited to a finite support, (ii) a Wiener estimator that solves a "
+        "applies the impulse-response kernel limited to a finite support, (ii) a wiener estimator that solves a "
         "conditional linear prediction using the empirical covariance of the density field, and (iii) a sparse-FFT "
-        "approximation that keeps the top-K Fourier modes of the Wiener-symmetrized kernel. We evaluate a two-channel "
-        "decomposition in which g_full = g_low + g_high, with g_low predicted by ceiling/Wiener/sparse-FFT and g_high "
+        "approximation that keeps the top-K Fourier modes of the wiener-symmetrized kernel. We evaluate a two-channel "
+        "decomposition in which g_full = g_low + g_high, with g_low predicted by ceiling/wiener/sparseFFT and g_high "
         "predicted by a fixed local block (kernel or pixels). This isolates how much the low-k predictor contributes "
         "to full-g accuracy.\n\n"
-        "Compute: the ceiling convolution is O(w^2) per patch (or FFT for full fields), the Wiener solve uses a "
+        "Mini-box: What is wiener here?\n"
+        "It is the linear predictor of g_low at the patch center from rho in a finite window, estimated from "
+        "training covariances. If correlations vanish, the predictor collapses to the ceiling kernel.\n\n"
+        "Compute: the ceiling convolution is O(w^2) per patch (or FFT for full fields), the wiener solve uses a "
         "covariance-driven linear system, and the sparse-FFT variant reduces the representation to K modes with "
         "explicit truncation. All models use training-only information; test fields are untouched by fitting."
     )
@@ -162,6 +162,8 @@ def main() -> None:
     results = (
         "Main results:\n\n"
         f"{main_table}\n\n"
+        f"Key deltas (OOS): {line1} {line2}\n"
+        f"Trade-off: sparseFFT K≈800 stays within ΔrelRMSE vs wiener≈{delta_w} while beating ceiling by {delta_c}.\n\n"
         "Key quantified results (from the paper bundle):\n"
         + "\n".join(short_lines)
         + "\n\n"
@@ -207,10 +209,14 @@ def main() -> None:
 
     limits = (
         "Limitations & scope:\n\n"
-        "The Wiener gain depends on the correlation structure of the density field; when correlations are weak or "
-        "the strong tail is rare, gains can be small or noisy. Threshold choice affects strong-tail sample sizes; "
-        "we therefore report a sensitivity appendix and enforce a minimum n_strong before interpreting strong_R2. "
-        "Sparse-FFT approximations inherit the bias/variance trade-off in K and are evaluated in the OOS setting."
+        "All estimators are linear and tied to FFT/Poisson physics; nonlinear or nonstationary effects are not "
+        "modeled.\n"
+        "Results are on synthetic families (alpha, BBKS, BBKS-tilt) with controlled spectra; real data may violate "
+        "these assumptions.\n"
+        "The wiener advantage depends on correlation structure, window choice, and covariance estimation; weakly "
+        "correlated fields show little gain.\n"
+        "Threshold choice affects strong-tail counts, so strong-subset metrics are only reported when n_strong>=30.\n"
+        "SparseFFT compressibility trades bias/variance with K and may require recalibration across datasets."
     )
 
     repro = (
