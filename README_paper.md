@@ -26,6 +26,26 @@ This regenerates:
 
 All run directories used for the synthesis are listed in `configs/e68_threshold_policy.yaml`.
 
+## Build PDF
+
+Run:
+```
+scripts/build_pdf.sh
+```
+
+This attempts to generate `outputs/paper/draft.pdf` via pandoc or wkhtmltopdf (with an HTML fallback if needed).
+If a PDF is created, it is also copied into `outputs/paper/submission/`.
+
+## Pre-submission audit
+
+Run:
+```
+scripts/pre_submission_audit.sh
+```
+
+This regenerates the paper bundle, rebuilds the submission pack, and validates that required files exist and are non-empty.
+It prints file sizes and SHA256 hashes for traceability.
+
 ## License
 
 Code and generated figures are released under the MIT License (see `LICENSE`).
