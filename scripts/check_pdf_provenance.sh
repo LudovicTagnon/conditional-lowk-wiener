@@ -46,13 +46,13 @@ def sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def extract_text_first_page(pdf: Path) -> str:
+def extract_text_full(pdf: Path) -> str:
     if shutil.which("pdftotext"):
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
             subprocess.run(
-                ["pdftotext", "-f", "1", "-l", "1", str(pdf), str(tmp_path)],
+                ["pdftotext", str(pdf), str(tmp_path)],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -72,19 +72,22 @@ def extract_text_first_page(pdf: Path) -> str:
     reader = PdfReader(str(pdf))
     if not reader.pages:
         return ""
-    text = reader.pages[0].extract_text() or ""
-    return text
+    parts = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    return "\n".join(parts)
 
-text = extract_text_first_page(pdf_path)
+text = extract_text_full(pdf_path)
 if not text.strip():
-    raise SystemExit("PDF provenance check failed: empty text extracted from first page")
+    raise SystemExit("PDF provenance check failed: empty text extracted from PDF")
 
 norm = re.sub(r"\s+", " ", text).strip().lower()
 required = ["ceiling =", "wiener ="]
 missing = [m for m in required if m not in norm]
 has_dup = "key quantified results" in norm
+has_draft_tag = "draft (e" in norm
 
-pass_check = (not missing) and (not has_dup)
+pass_check = (not missing) and (not has_dup) and (not has_draft_tag)
 
 md_hash = sha256(md_path)
 pdf_hash = sha256(pdf_path)
@@ -111,6 +114,8 @@ if not pass_check:
         msg += f"; missing markers: {', '.join(missing)}"
     if has_dup:
         msg += "; contains 'Key quantified results'"
+    if has_draft_tag:
+        msg += "; contains 'Draft (E' tag"
     raise SystemExit(msg)
 
 print("PDF provenance check: PASS")

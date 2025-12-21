@@ -175,8 +175,8 @@ def main() -> None:
         f"Compact synthesis (OOS): {line1} {line2} {line3}\n"
         f"Threshold policy: main thresh={main_thresh}; sensitivity reported for {sens}. "
         "Multi-seed results (E65/E66) support the main claims; E62 is a single-seed dev baseline.\n"
-        "See outputs/paper/main_figure.png for deltas and ROC, and outputs/paper/short_results.md for the concise "
-        "summary. SparseFFT trade-offs are in outputs/paper/sparsefft_table.md."
+        "See outputs/paper/main_figure.png for deltas and ROC, and outputs/paper/sparsefft_table.md for the "
+        "sparseFFT appendix."
     )
     if sparse_para:
         results += "\n\n" + sparse_para
@@ -240,7 +240,7 @@ def main() -> None:
 
     draft = "\n\n".join(
         [
-            "# Draft (E69)",
+            "# Conditional low-k prediction beyond a truncated-kernel ceiling",
             "## Abstract",
             abstract,
             "## 1 Introduction",
