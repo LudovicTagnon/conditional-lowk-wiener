@@ -75,6 +75,11 @@ def main() -> None:
         raise FileNotFoundError(f"Missing short results: {short_results_path}")
 
     main_table = main_table_path.read_text(encoding="utf-8").strip()
+    main_table = (
+        main_table.replace("wiener", "Wiener")
+        .replace("highk_kernel", "high-k kernel")
+        .replace("highk_pixels", "high-k pixels")
+    )
     short_lines = _read_lines(short_results_path)
 
     sparse_table_path = paper_dir / "sparsefft_table.md"
@@ -100,8 +105,8 @@ def main() -> None:
             + " No new experiments were run for this appendix."
         )
 
-    line1 = _extract_line(short_lines, "1)")
-    line2 = _extract_line(short_lines, "2)")
+    line1 = _extract_line(short_lines, "1)").replace("wiener", "Wiener")
+    line2 = _extract_line(short_lines, "2)").replace("wiener", "Wiener")
     line3 = _extract_line(short_lines, "3)")
     line5 = _extract_line(short_lines, "5)")
     line6 = _extract_line(short_lines, "6)")
@@ -115,59 +120,63 @@ def main() -> None:
     abstract = (
         "We test whether conditional predictors improve gravitational-field estimation beyond a truncated-kernel "
         "ceiling in controlled synthetic data.\n"
-        "Mechanism: the wiener estimator uses correlations in rho to predict the missing low-k component outside "
-        "the ceiling support.\n"
+        "Ceiling = a finite-support, truncated-kernel estimator (no conditional inference outside the window).\n"
+        "Wiener = conditional linear prediction of g_low at the center from rho in a window, using train "
+        "covariances.\n"
+        "Mechanism: inside contains information about outside when the field is correlated; for alpha≈0 "
+        "(white-ish), correlations vanish and gains disappear.\n"
         "OOS protocol: all metrics use independent train/test fields (relRMSE and Pearson).\n"
         f"Key OOS deltas: {line1} {line2}\n"
         f"Regime/magnitude summary: {line3}\n"
-        f"Compressibility: sparseFFT with K≈800 gives ΔrelRMSE vs wiener≈{delta_w} while beating ceiling by {delta_c}."
+        f"Compressibility: sparseFFT with K≈800 gives ΔrelRMSE vs Wiener≈{delta_w} while beating ceiling by {delta_c}."
     )
 
     intro = (
         "Predicting the gravitational field from local density information blends physics (Poisson/FFT) with "
-        "statistical learning. The ceiling estimator captures the truncated-kernel contribution, while the wiener "
-        "estimator exploits conditional correlations and can, in principle, improve over the ceiling when outside "
-        "support is predictable. Our goal is to quantify this improvement, characterize when it holds out-of-sample, "
-        "and connect it to a regime→magnitude model that predicts when gains occur.\n\n"
+        "statistical learning. We compare a ceiling baseline (truncated kernel with finite support, no conditional "
+        "inference beyond the window) to a Wiener predictor (conditional linear estimate from rho in a window). "
+        "When rho is correlated, inside samples carry information about outside; this breaks down for alpha≈0, "
+        "where correlations are near zero. Our goal is to quantify OOS gains, characterize when they occur, "
+        "and connect them to a regime→magnitude model that predicts when gains appear.\n\n"
         "Contributions:\n"
-        "1) OOS benchmarks for low-k and full-g using ceiling, wiener, and sparseFFT.\n"
+        "1) OOS benchmarks for low-k and full-g using ceiling, Wiener, and sparseFFT.\n"
         "2) A regime→magnitude model with AUROC and strong-tail metrics under a defined threshold policy.\n"
         "3) A paper bundle and draft generator with sensitivity tables and reproducible artifacts.\n"
     )
 
     setup = (
         "We define three estimators for the low-k component of the field: (i) a truncated-kernel ceiling that "
-        "applies the impulse-response kernel limited to a finite support, (ii) a wiener estimator that solves a "
+        "applies the impulse-response kernel limited to a finite support, (ii) a Wiener estimator that solves a "
         "conditional linear prediction using the empirical covariance of the density field, and (iii) a sparse-FFT "
-        "approximation that keeps the top-K Fourier modes of the wiener-symmetrized kernel. We evaluate a two-channel "
-        "decomposition in which g_full = g_low + g_high, with g_low predicted by ceiling/wiener/sparseFFT and g_high "
+        "approximation that keeps the top-K Fourier modes of the Wiener-symmetrized kernel. We evaluate a two-channel "
+        "decomposition in which g_full = g_low + g_high, with g_low predicted by ceiling/Wiener/sparseFFT and g_high "
         "predicted by a fixed local block (kernel or pixels). This isolates how much the low-k predictor contributes "
         "to full-g accuracy.\n\n"
-        "Mini-box: What is wiener here?\n"
+        "Mini-box: What is Wiener here?\n"
         "It is the linear predictor of g_low at the patch center from rho in a finite window, estimated from "
-        "training covariances. If correlations vanish, the predictor collapses to the ceiling kernel.\n\n"
-        "Compute: the ceiling convolution is O(w^2) per patch (or FFT for full fields), the wiener solve uses a "
+        "training covariances. If correlations vanish (alpha≈0), the predictor collapses to the ceiling kernel.\n\n"
+        "Compute: the ceiling convolution is O(w^2) per patch (or FFT for full fields), the Wiener solve uses a "
         "covariance-driven linear system, and the sparse-FFT variant reduces the representation to K modes with "
         "explicit truncation. All models use training-only information; test fields are untouched by fitting."
     )
 
     protocol = (
         "We use strict out-of-sample (OOS) splits with independent train/test fields. LOFO splits are used for "
-        "regime modeling, and metrics include Pearson correlation and relRMSE. For two-stage models, we define "
-        "a strong-tail threshold and report strong-subset metrics only when n_strong is sufficiently large. "
-        "No-leakage is enforced by fitting on training fields only and evaluating exclusively on held-out fields. "
-        "See method schematic (outputs/paper/method_schematic.png)."
+        "regime modeling, and metrics include Pearson correlation and relRMSE (RMSE / std(y_test)). For two-stage "
+        "models, we define a strong-tail threshold and report strong-subset metrics only when n_strong is "
+        "sufficiently large. E62 is a single-seed dev baseline; E65/E66 are multi-seed runs that support the main "
+        "claims and threshold policy. No-leakage is enforced by fitting on training fields only and evaluating "
+        "exclusively on held-out fields. See method schematic (outputs/paper/method_schematic.png)."
     )
 
     results = (
         "Main results:\n\n"
         f"{main_table}\n\n"
-        f"Key deltas (OOS): {line1} {line2}\n"
-        f"Trade-off: sparseFFT K≈800 stays within ΔrelRMSE vs wiener≈{delta_w} while beating ceiling by {delta_c}.\n\n"
-        "Key quantified results (from the paper bundle):\n"
-        + "\n".join(short_lines)
-        + "\n\n"
-        f"Threshold policy: main thresh={main_thresh}; sensitivity reported for {sens}."
+        f"Compact synthesis (OOS): {line1} {line2} {line3}\n"
+        f"Threshold policy: main thresh={main_thresh}; sensitivity reported for {sens}. "
+        "Multi-seed results (E65/E66) support the main claims; E62 is a single-seed dev baseline.\n"
+        "See outputs/paper/main_figure.png for deltas and ROC, and outputs/paper/short_results.md for the concise "
+        "summary. SparseFFT trade-offs are in outputs/paper/sparsefft_table.md."
     )
     if sparse_para:
         results += "\n\n" + sparse_para
@@ -213,7 +222,7 @@ def main() -> None:
         "modeled.\n"
         "Results are on synthetic families (alpha, BBKS, BBKS-tilt) with controlled spectra; real data may violate "
         "these assumptions.\n"
-        "The wiener advantage depends on correlation structure, window choice, and covariance estimation; weakly "
+        "The Wiener advantage depends on correlation structure, window choice, and covariance estimation; weakly "
         "correlated fields show little gain.\n"
         "Threshold choice affects strong-tail counts, so strong-subset metrics are only reported when n_strong>=30.\n"
         "SparseFFT compressibility trades bias/variance with K and may require recalibration across datasets."
