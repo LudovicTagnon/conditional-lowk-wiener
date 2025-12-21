@@ -25,3 +25,7 @@ This regenerates:
 - `outputs/paper/draft.md`
 
 All run directories used for the synthesis are listed in `configs/e68_threshold_policy.yaml`.
+
+## License
+
+Code and generated figures are released under the MIT License (see `LICENSE`).
