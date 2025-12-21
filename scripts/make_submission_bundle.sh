@@ -99,6 +99,7 @@ files=(
   "scripts/reproduce_paper.sh"
   "scripts/build_pdf.sh"
   "scripts/pre_submission_audit.sh"
+  "scripts/check_pdf_provenance.sh"
 )
 
 missing=0

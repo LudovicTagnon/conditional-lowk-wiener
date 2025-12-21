@@ -5,8 +5,9 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
 scripts/reproduce_paper.sh
-scripts/make_submission_bundle.sh
 scripts/build_pdf.sh
+scripts/make_submission_bundle.sh
+scripts/check_pdf_provenance.sh
 
 submission_dir="outputs/paper/submission"
 
