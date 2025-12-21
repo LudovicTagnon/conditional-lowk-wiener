@@ -6,4 +6,6 @@ version: "0.1.0"
 date-released: "2025-12-21"
 repository-code: "local"
 authors:
-  - name: "Repository Contributors"
+  - given-names: Ludovic
+    family-names: Tagnon
+    affiliation: Epitech Nancy
