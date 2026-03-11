@@ -6,6 +6,7 @@ Objectif: tester si des features topologiques locales (`b0` multi-seuils) améli
 
 - **Ligne stabilisée / papier**: bundle reproductible sous `outputs/paper/` et scripts de soumission dans `scripts/`.
 - **Ligne expérimentale locale**: nombreuses configs additionnelles (`E70+`, SPARC, lensing, OOD/safety gates) et sorties d'audit plus récentes dans `outputs/`.
+- **Point d'entrée scientifique**: `SCIENTIFIC_STATUS_2026-03-11.md` sépare la ligne papier stable des extensions locales.
 - **Métadonnées locales**: `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont des artefacts de workspace, pas des sources scientifiques.
 
 ## Installation
