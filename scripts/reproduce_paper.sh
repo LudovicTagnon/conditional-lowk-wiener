@@ -7,6 +7,8 @@ cd "$root_dir"
 
 python3 -m lab.paper --config configs/e68_threshold_policy.yaml
 python3 -m lab.draft --paper-dir outputs/paper
+python3 scripts/sanity_checks.py
+python3 scripts/compute_cost.py
 
 required_files=(
   "outputs/paper/main_table.md"
@@ -17,6 +19,9 @@ required_files=(
   "outputs/paper/sparsefft_table.md"
   "outputs/paper/sparsefft_curve.png"
   "outputs/paper/sparsefft_stability.md"
+  "outputs/paper/sanity_checks.md"
+  "outputs/paper/sanity_checks.png"
+  "outputs/paper/compute_cost.md"
 )
 
 missing=0

@@ -4,9 +4,6 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
-scripts/reproduce_paper.sh
-scripts/build_pdf.sh
-
 submission_dir="outputs/paper/submission"
 mkdir -p "$submission_dir"
 
@@ -49,7 +46,7 @@ Abstract:
 {abstract}
 
 Acknowledgment:
-Assistance from OpenAI ChatGPT (GPT-5.2 Thinking) and ChatGPT Codex (OpenAI) supported experimental orchestration, writing, and revision.
+Generative AI assistance was used for workflow support and editorial revision. Scientific choices, validation, and claims were reviewed by the author.
 
 Plain-language summary:
 We estimate a gravitational field from density using a physics-derived kernel baseline and a conditional (Wiener) predictor

@@ -80,7 +80,7 @@ def main() -> None:
         .replace("highk_kernel", "high-k kernel")
         .replace("highk_pixels", "high-k pixels")
         .replace("ceiling", "local ceiling")
-        .replace("local local", "local")
+        .replace("local local ceiling", "local ceiling")
     )
     short_lines = _read_lines(short_results_path)
 
@@ -107,8 +107,8 @@ def main() -> None:
             + " No new experiments were run for this appendix."
         )
 
-    line1 = _extract_line(short_lines, "1)").replace("wiener", "Wiener").replace("ceiling", "local ceiling")
-    line2 = _extract_line(short_lines, "2)").replace("wiener", "Wiener").replace("ceiling", "local ceiling")
+    line1 = _extract_line(short_lines, "1)").replace("wiener", "Wiener")
+    line2 = _extract_line(short_lines, "2)").replace("wiener", "Wiener")
     line3 = _extract_line(short_lines, "3)")
     line5 = _extract_line(short_lines, "5)")
     line6 = _extract_line(short_lines, "6)")
@@ -131,7 +131,7 @@ def main() -> None:
         "OOS protocol: all metrics use independent train/test fields (relRMSE and Pearson).\n"
         f"Key OOS deltas: {line1} {line2}\n"
         f"Regime/magnitude summary: {line3}\n"
-        f"Compressibility: sparseFFT with K≈800 gives ΔrelRMSE vs Wiener≈{delta_w} while beating ceiling by {delta_c}."
+        f"Compressibility: sparseFFT with K≈800 gives ΔrelRMSE vs Wiener≈{delta_w} while beating the local ceiling by {delta_c}."
     )
 
     intro = (
@@ -232,8 +232,8 @@ def main() -> None:
 
     acknowledgments = (
         "Acknowledgment:\n\n"
-        "Assistance from OpenAI ChatGPT (GPT-5.2 Thinking) and ChatGPT Codex (OpenAI) supported experimental "
-        "orchestration, writing, and revision."
+        "Generative AI assistance was used for workflow support and editorial revision. "
+        "Scientific choices, validation, and claims were reviewed by the author."
     )
 
     limits = (

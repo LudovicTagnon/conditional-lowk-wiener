@@ -9,7 +9,9 @@ Objectif: tester si des features topologiques locales (`b0` multi-seuils) améli
 - **Point d'entrée scientifique**: `SCIENTIFIC_STATUS_2026-03-11.md` sépare la ligne papier stable des extensions locales.
 - **Cartographie des tracks**: `EXPERIMENT_TRACKS_2026-03-11.md` et `OUTPUTS_INDEX_2026-03-11.md`.
 - **Vérification papier**: `PAPER_VERIFICATION_2026-03-11.md`.
-- **Métadonnées locales**: `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont des artefacts de workspace, pas des sources scientifiques.
+- **Reproduction papier**: `PAPER_REPRODUCTION_2026-03-11.md` détaille la chaîne de reconstruction propre du bundle.
+- **Métadonnées locales**: les fichiers de conversation et de statut locaux sont des artefacts de workspace, pas des sources scientifiques.
+- **Provenance papier**: `PAPER_EVIDENCE_MAP_2026-03-11.md` relie chaque claim stable aux runs et scripts exacts.
 
 ## Installation
 
@@ -109,6 +111,7 @@ scripts/pre_submission_audit.sh
 
 Ces scripts:
 - régénèrent le bundle dans `outputs/paper/`,
+- régénèrent aussi `sanity_checks.md` et `compute_cost.md`,
 - génèrent `outputs/paper/draft.pdf` (ou HTML fallback),
 - construisent le pack `outputs/paper/submission/`,
 - vérifient les empreintes + la provenance PDF.
@@ -116,5 +119,5 @@ Ces scripts:
 ## Hygiène du dépôt local
 
 - Les `outputs/` sont volumineux et ignorés par Git.
-- Les fichiers `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont locaux et ignorés.
+- Les fichiers de conversation et de statut locaux sont ignorés.
 - Le fichier parasite `0.03.` était un artefact local accidentel; il n'est pas utilisé par le projet.
