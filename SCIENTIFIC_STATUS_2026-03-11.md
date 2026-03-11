@@ -29,6 +29,8 @@ So the repository name preserves the origin story, but the paper-grade scientifi
 
 - [outputs/paper/draft.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/outputs/paper/draft.md): canonical manuscript source for the stable line.
 - [outputs/paper/main_table.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/outputs/paper/main_table.md): main result table.
+- [PAPER_VERIFICATION_2026-03-11.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/PAPER_VERIFICATION_2026-03-11.md): local verification record for the stable line.
+- [OUTPUTS_INDEX_2026-03-11.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/OUTPUTS_INDEX_2026-03-11.md): versioned guide to the ignored `outputs/` tree.
 - [scripts/reproduce_paper.sh](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/scripts/reproduce_paper.sh): rebuilds the paper bundle from stored artifacts.
 - [scripts/pre_submission_audit.sh](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/scripts/pre_submission_audit.sh): audit layer for submission hygiene.
 - [outputs/E76_20251223_145149_e76_sparc_catalog_ylib/E76_table_models_fixedY.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/outputs/E76_20251223_145149_e76_sparc_catalog_ylib/E76_table_models_fixedY.md): one of the strongest SPARC-side extension artifacts.

@@ -7,6 +7,8 @@ Objectif: tester si des features topologiques locales (`b0` multi-seuils) améli
 - **Ligne stabilisée / papier**: bundle reproductible sous `outputs/paper/` et scripts de soumission dans `scripts/`.
 - **Ligne expérimentale locale**: nombreuses configs additionnelles (`E70+`, SPARC, lensing, OOD/safety gates) et sorties d'audit plus récentes dans `outputs/`.
 - **Point d'entrée scientifique**: `SCIENTIFIC_STATUS_2026-03-11.md` sépare la ligne papier stable des extensions locales.
+- **Cartographie des tracks**: `EXPERIMENT_TRACKS_2026-03-11.md` et `OUTPUTS_INDEX_2026-03-11.md`.
+- **Vérification papier**: `PAPER_VERIFICATION_2026-03-11.md`.
 - **Métadonnées locales**: `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont des artefacts de workspace, pas des sources scientifiques.
 
 ## Installation
@@ -61,6 +63,13 @@ Le dépôt local contient aussi des branches d'exploration supplémentaires, non
 - scripts de post-traitement `postprocess_e1xx.py` pour agréger ces campagnes.
 
 En pratique: la ligne "papier" est la partie la plus propre et la plus stable; la ligne `E70+` est active mais plus mouvante.
+
+## Index utiles par dossier
+
+- `lab/README.md`: rôle des modules Python et des post-processors.
+- `configs/README.md`: regroupement des familles de configs par phase scientifique.
+- `data/README.md`: description des jeux SPARC et lensing.
+- `scripts/README.md`: ordre recommandé des scripts de reproduction / audit.
 
 ## Run sequence (recommandé)
 
