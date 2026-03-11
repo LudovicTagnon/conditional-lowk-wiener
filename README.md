@@ -2,6 +2,12 @@
 
 Objectif: tester si des features topologiques locales (`b0` multi-seuils) améliorent la prédiction du champ gravitationnel `g = ||∇Φ||` au-delà de la masse, sur données synthétiques (3D) et via un loader générique (2D).
 
+## Lecture rapide du projet
+
+- **Ligne stabilisée / papier**: bundle reproductible sous `outputs/paper/` et scripts de soumission dans `scripts/`.
+- **Ligne expérimentale locale**: nombreuses configs additionnelles (`E70+`, SPARC, lensing, OOD/safety gates) et sorties d'audit plus récentes dans `outputs/`.
+- **Métadonnées locales**: `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont des artefacts de workspace, pas des sources scientifiques.
+
 ## Installation
 
 ```bash
@@ -44,6 +50,17 @@ python3 -m lab.report --path outputs/runs/<YYYYMMDD_HHMMSS>_<expname>
 - **E2** (mass-binning): identique à E0 (alpha=2.0) + métriques par quantiles de masse sur le test (`metrics_by_mass_bin.csv`, `metric_vs_mass_bin.png`).
 - **E3** (loader réel 2D): charge `Sigma_norm.npy` et `g_proj.npy`, sample des patches `9×9`, même features/modèles.
 
+## Pistes présentes au-delà du noyau initial
+
+Le dépôt local contient aussi des branches d'exploration supplémentaires, non couvertes par la synthèse minimale ci-dessus:
+
+- comparaisons SPARC / RAR et variantes de lois effectives;
+- tests de weak lensing (`data/lensing/`);
+- familles OOD, conformal, veto, risk-gating et audits holdout plus récents;
+- scripts de post-traitement `postprocess_e1xx.py` pour agréger ces campagnes.
+
+En pratique: la ligne "papier" est la partie la plus propre et la plus stable; la ligne `E70+` est active mais plus mouvante.
+
 ## Run sequence (recommandé)
 
 ```bash
@@ -85,3 +102,9 @@ Ces scripts:
 - génèrent `outputs/paper/draft.pdf` (ou HTML fallback),
 - construisent le pack `outputs/paper/submission/`,
 - vérifient les empreintes + la provenance PDF.
+
+## Hygiène du dépôt local
+
+- Les `outputs/` sont volumineux et ignorés par Git.
+- Les fichiers `CODEX_CONVERSATIONS_BACKUP.txt` et `PROJECT_STATUS_CODEX.txt` sont locaux et ignorés.
+- Le fichier parasite `0.03.` était un artefact local accidentel; il n'est pas utilisé par le projet.
