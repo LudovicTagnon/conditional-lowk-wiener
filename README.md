@@ -8,6 +8,7 @@ Objectif: tester si des features topologiques locales (`b0` multi-seuils) améli
 - **Ligne expérimentale locale**: nombreuses configs additionnelles (`E70+`, SPARC, lensing, OOD/safety gates) et sorties d'audit plus récentes dans `outputs/`.
 - **Point d'entrée scientifique**: `SCIENTIFIC_STATUS_2026-03-11.md` sépare la ligne papier stable des extensions locales.
 - **Cartographie des tracks**: `EXPERIMENT_TRACKS_2026-03-11.md` et `OUTPUTS_INDEX_2026-03-11.md`.
+- **Extensions promues**: `SPARC_RAR_EVIDENCE_MAP_2026-03-12.md`, `WEAK_LENSING_EVIDENCE_MAP_2026-03-12.md` et `SAFETY_AUDIT_EVIDENCE_MAP_2026-03-12.md` cadrent les trois familles les plus solides au-delà du papier.
 - **Vérification papier**: `PAPER_VERIFICATION_2026-03-11.md`.
 - **Reproduction papier**: `PAPER_REPRODUCTION_2026-03-11.md` détaille la chaîne de reconstruction propre du bundle.
 - **Métadonnées locales**: les fichiers de conversation et de statut locaux sont des artefacts de workspace, pas des sources scientifiques.

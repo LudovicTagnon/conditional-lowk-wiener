@@ -32,6 +32,10 @@ So the repository name preserves the origin story, but the paper-grade scientifi
 - [PAPER_VERIFICATION_2026-03-11.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/PAPER_VERIFICATION_2026-03-11.md): local verification record for the stable line.
 - [PAPER_EVIDENCE_MAP_2026-03-11.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/PAPER_EVIDENCE_MAP_2026-03-11.md): provenance map from paper claims to exact runs and generated artifacts.
 - [OUTPUTS_INDEX_2026-03-11.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/OUTPUTS_INDEX_2026-03-11.md): versioned guide to the ignored `outputs/` tree.
+- [SPARC_RAR_EVIDENCE_MAP_2026-03-12.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/SPARC_RAR_EVIDENCE_MAP_2026-03-12.md): evidence map for the strongest galaxy-law extension track.
+- [WEAK_LENSING_EVIDENCE_MAP_2026-03-12.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/WEAK_LENSING_EVIDENCE_MAP_2026-03-12.md): evidence map for the weak-lensing extension track.
+- [SAFETY_AUDIT_EVIDENCE_MAP_2026-03-12.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/SAFETY_AUDIT_EVIDENCE_MAP_2026-03-12.md): evidence map for the 2026 abstention / safety line.
+- [EXTENSION_REPRODUCTION_2026-03-12.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/EXTENSION_REPRODUCTION_2026-03-12.md): practical reading and reproduction guide for the promoted extension tracks.
 - [scripts/reproduce_paper.sh](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/scripts/reproduce_paper.sh): rebuilds the paper bundle from stored artifacts.
 - [scripts/pre_submission_audit.sh](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/scripts/pre_submission_audit.sh): audit layer for submission hygiene.
 - [outputs/E76_20251223_145149_e76_sparc_catalog_ylib/E76_table_models_fixedY.md](/home/kudovic/Desktop/RECHERCHE/projects_active/topological_gravity_minilab/outputs/E76_20251223_145149_e76_sparc_catalog_ylib/E76_table_models_fixedY.md): one of the strongest SPARC-side extension artifacts.
@@ -119,3 +123,5 @@ This is scientifically valuable, but it belongs to a different project phase tha
    - SPARC/RAR,
    - weak lensing,
    - safety audits.
+
+The documentation layer for step 3 now exists; the remaining work is scientific consolidation, not basic repository triage.

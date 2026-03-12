@@ -4,6 +4,13 @@ Date: 2026-03-11
 
 This note groups the main experiment families living inside the `E70+` extension line so the repository can be read as a set of tracks rather than one long undifferentiated chain.
 
+Promotion docs for the strongest extension families now live at project root:
+
+- `SPARC_RAR_EVIDENCE_MAP_2026-03-12.md`
+- `WEAK_LENSING_EVIDENCE_MAP_2026-03-12.md`
+- `SAFETY_AUDIT_EVIDENCE_MAP_2026-03-12.md`
+- `EXTENSION_REPRODUCTION_2026-03-12.md`
+
 ## Track A — Stable paper nucleus
 
 This is the cleanest line and should stay the canonical center of the repository.
